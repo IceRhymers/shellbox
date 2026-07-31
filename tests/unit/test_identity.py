@@ -18,6 +18,7 @@ that the serialized version could never have reached — see
 
 from __future__ import annotations
 
+import errno
 import json
 import multiprocessing
 import os
@@ -26,6 +27,7 @@ import time
 from pathlib import Path
 
 import pytest
+from shellbox_mcp import identity
 from shellbox_mcp.identity import (
     HOST_JSON_NAME,
     KIND_LAKEBOX,
@@ -65,6 +67,18 @@ def _resolve_at_barrier(
         results.append((identity.host_id, identity.assigned, source))  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         results.append(("<error>", False, f"{type(exc).__name__}: {exc}"))  # type: ignore[attr-defined]
+
+
+def _write_property_at_barrier(state_dir: str, barrier: object, index: int) -> None:
+    """Half the processes record a `sandbox_id`, half an `owner_email`. Module-level for spawn."""
+    try:
+        barrier.wait(timeout=30)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+    if index % 2 == 0:
+        resolve_host_id(state_dir, sandbox_id="realistic-phoenix-2742")
+    else:
+        resolve_owner_email(state_dir, credential_email="owner@example.com")
 
 
 def _cache(state_dir: Path) -> dict[str, object]:
@@ -118,15 +132,19 @@ def test_concurrent_first_boot_yields_exactly_one_host_id(tmp_path: Path) -> Non
     session rows for a single shared tmux server land under different hosts, and each process
     rejects its siblings' live session ids as `invalid_name`.
     """
-    adopters_seen = 0
+    # Per-round, not summed. A summed threshold hides a dead round: if a future change made
+    # round 0 race and rounds 1-2 serialize, `sum > 0` still passes and two thirds of the
+    # evidence is gone. So the loop requires RACE_ROUNDS rounds that *actually raced*, and
+    # extends (bounded) if one does not — extending only ever adds evidence, since every
+    # correctness assertion below runs on every round regardless.
+    #
+    # Instrumented floor, measured rather than guessed: 22-29 of 32 workers hit EEXIST on an
+    # idle 12-core machine, and 13-28 under 2x oversubscription. Zero has never been observed,
+    # so the retry is insurance for a 1-2 vCPU runner rather than something expected to trigger.
+    racing_rounds = 0
     rounds_run = 0
 
-    # Extra rounds are allowed *only* to observe a genuine EEXIST, never to get a passing
-    # assertion: every correctness check below runs on every round. On a 1-2 vCPU runner the
-    # winner can finish before the next process is scheduled even after the barrier releases,
-    # which yields zero adopters on completely correct code -- so that condition retries rather
-    # than failing, and only a total absence across every round is a failure.
-    while rounds_run < RACE_ROUNDS or (adopters_seen == 0 and rounds_run < RACE_ROUNDS * 3):
+    while racing_rounds < RACE_ROUNDS and rounds_run < RACE_ROUNDS * 3:
         state_dir = tmp_path / f"round{rounds_run}"
         state_dir.mkdir()
         results = _race_once(state_dir)
@@ -162,15 +180,17 @@ def test_concurrent_first_boot_yields_exactly_one_host_id(tmp_path: Path) -> Non
         # `source == "assigned"` with `assigned is False` is reachable only through the
         # `FileExistsError` handler, so this counts processes that genuinely lost the race.
         # A cache hit reports `source == "cache"` instead.
-        adopters_seen += sum(
+        adopters = sum(
             1 for _, assigned, source in results if source == "assigned" and not assigned
         )
+        if adopters:
+            racing_rounds += 1
 
-    assert adopters_seen > 0, (
-        f"across {rounds_run} rounds of {CONCURRENT_WORKERS} barrier-released processes, not one "
-        "observed EEXIST — every worker took the cache-hit path, so the adopt-the-winner branch "
-        "never executed and this test proved nothing. Either process startup is serialized on "
-        "this machine despite the barrier, or the barrier is not doing its job."
+    assert racing_rounds == RACE_ROUNDS, (
+        f"only {racing_rounds} of {rounds_run} rounds had any process observe EEXIST. Every "
+        "worker took the cache-hit path, so the adopt-the-winner branch never executed and those "
+        "rounds proved nothing. Either process startup is serialized on this machine despite the "
+        "barrier, or the barrier is not doing its job."
     )
 
 
@@ -671,3 +691,194 @@ def test_a_bad_tmux_stamp_is_ignored_not_fatal(tmp_path: Path, bad: str) -> None
     assert identity.host_id != bad
     assert identity.source == "assigned"
     assert _cache(tmp_path)["host_id"] == identity.host_id
+
+
+def test_concurrent_property_writers_all_land(tmp_path: Path) -> None:
+    """🔴 Two writers, disjoint fields, both must survive — the defect the lock introduced.
+
+    Serializing property writes fixed a lost update and created a *dropped* one: the lock was
+    acquired non-blockingly, so a loser logged at debug and threw its field away. The excuse
+    ("the next start records it") is false, because **every contender is in the same boot** —
+    "the next start" means a sandbox restart. Measured before the fix, 16 processes × 12 rounds:
+    `sandbox_id` absent from the file in 3 rounds, `owner_email` in 4. After: 0 and 0.
+
+    Both fields matter concretely. A missing `sandbox_id` is `doctor` calling a bootstrapped host
+    "never bootstrapped"; a missing `owner_email` is worse than an extra API call, because per
+    E2b the cache is the *only* source after a restart with no credential — so the next boot
+    defers enrollment entirely.
+    """
+    for round_index in range(RACE_ROUNDS):
+        state_dir = tmp_path / f"props{round_index}"
+        state_dir.mkdir()
+        host_id = resolve_host_id(str(state_dir)).host_id  # seed: boot 2+, cache exists
+
+        with multiprocessing.Manager() as manager:
+            barrier = manager.Barrier(CONCURRENT_WORKERS)
+            workers = [
+                multiprocessing.Process(
+                    target=_write_property_at_barrier, args=(str(state_dir), barrier, index)
+                )
+                for index in range(CONCURRENT_WORKERS)
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=90)
+            assert not any(w.is_alive() for w in workers), "a worker hung"
+
+        cached = _cache(state_dir)
+        assert cached["sandbox_id"] == "realistic-phoenix-2742", (
+            f"round {round_index}: sandbox_id was dropped under contention — doctor would report "
+            "this bootstrapped host as never bootstrapped"
+        )
+        assert cached["owner_email"] == "owner@example.com", (
+            f"round {round_index}: owner_email was dropped under contention — a credential-less "
+            "boot would then defer enrollment"
+        )
+        assert cached["host_id"] == host_id, "a property write re-keyed the host"
+
+
+# ------------------------------------------------------------------------ hosts.kind
+def test_kind_is_lakebox_when_the_marker_is_present(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """`hosts.kind` is NOT NULL and `resolve_host_id` is its only producer — and no test read it.
+
+    Two independent mutations survived review because of that: deleting the marker check from
+    `lakebox_kind`, and hardcoding `kind=KIND_UNKNOWN` at all four return sites. Asserted through
+    `resolve_host_id` rather than against `lakebox_kind` directly, since the wiring is the part
+    that was uncovered.
+    """
+    marker = tmp_path / "etc-lakebox"
+    marker.mkdir()
+    monkeypatch.setattr(identity, "_LAKEBOX_MARKERS", (marker,))
+
+    state_dir = tmp_path / "state"
+    assert resolve_host_id(str(state_dir)).kind == KIND_LAKEBOX
+    # Every return site, not just the assign path: a cache hit and an explicit override too.
+    assert resolve_host_id(str(state_dir)).kind == KIND_LAKEBOX
+    assert resolve_host_id(str(state_dir), explicit="x").kind == KIND_LAKEBOX
+
+    monkeypatch.setattr(identity, "_LAKEBOX_MARKERS", (tmp_path / "absent",))
+    monkeypatch.setattr(identity, "_read_pid1_cmdline", lambda: "/sbin/init")
+    assert resolve_host_id(str(tmp_path / "other")).kind == KIND_UNKNOWN
+
+
+def test_a_lakebox_is_recognised_from_pid1_alone(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The marker directory is one of two proofs; the daemon in PID 1's argv is the other."""
+    monkeypatch.setattr(identity, "_LAKEBOX_MARKERS", (tmp_path / "absent",))
+    monkeypatch.setattr(
+        identity, "_read_pid1_cmdline", lambda: "/usr/bin/sandbox-daemon --enable-sshd --uid 10086"
+    )
+    assert resolve_host_id(str(tmp_path / "state")).kind == KIND_LAKEBOX
+
+
+# ------------------------------------------------------- every writer must merge, not rebuild
+def _assert_cache_survived(state_dir: Path, before: dict[str, object]) -> dict[str, object]:
+    """The invariant every write site must satisfy, applied instead of N per-site assertions.
+
+    Review found five surviving mutations that each rebuilt the file from one caller's arguments
+    instead of merging — dropping `owner_email`, `sandbox_id`, `gateway_host`, or writing an
+    explicit null. Every one was at a *call site*, not in the merge helper, so testing the helper
+    was never what was missing. This fails for any future write site with the same shape.
+    """
+    after = _cache(state_dir)
+    missing = set(before) - set(after)
+    assert not missing, f"a write dropped {sorted(missing)}"
+    assert after["host_id"] == before["host_id"], "a write re-keyed the host"
+    assert None not in after.values(), (
+        f"absent fields must be omitted, not nulled: {after}. A reader cannot otherwise tell "
+        '"never bootstrapped" from "the bootstrap said null".'
+    )
+    return after
+
+
+def _seed_full_cache(state_dir: Path) -> dict[str, object]:
+    """A cache carrying every modelled field plus one this module does not know about."""
+    resolve_host_id(str(state_dir), sandbox_id="sbx-seed", gateway_host="gw-seed")
+    resolve_owner_email(str(state_dir), credential_email="seed@example.com")
+    path = state_dir / HOST_JSON_NAME
+    payload = json.loads(path.read_text())
+    payload["some_future_field"] = "keep me"
+    path.write_text(json.dumps(payload))
+    return _cache(state_dir)
+
+
+def test_the_owner_reconciliation_write_preserves_everything_else(tmp_path: Path) -> None:
+    """E2a fires exactly when a sandbox changes hands. A rebuild here left the file with no
+    `host_id` at all — so the next start quarantined it and re-keyed every session, triggered by
+    an *owner-email correction*."""
+    before = _seed_full_cache(tmp_path)
+    resolve_owner_email(str(tmp_path), credential_email="new-owner@example.com")
+    after = _assert_cache_survived(tmp_path, before)
+    assert after["owner_email"] == "new-owner@example.com"
+
+
+def test_the_tmux_mismatch_write_preserves_everything_else(tmp_path: Path) -> None:
+    """The RC-4 fork branch. It reads the file back today but only `host_id` was ever asserted."""
+    before = _seed_full_cache(tmp_path)
+    resolve_host_id(str(tmp_path), recovered="from-tmux")
+    after = _cache(tmp_path)
+    assert after["host_id"] == "from-tmux", "the tmux stamp must win"
+    assert set(before) <= set(after), f"a write dropped {sorted(set(before) - set(after))}"
+    assert None not in after.values()
+
+
+def test_the_property_write_preserves_everything_else(tmp_path: Path) -> None:
+    before = _seed_full_cache(tmp_path)
+    resolve_host_id(str(tmp_path), sandbox_id="sbx-new", gateway_host="gw-new")
+    after = _assert_cache_survived(tmp_path, before)
+    assert (after["sandbox_id"], after["gateway_host"]) == ("sbx-new", "gw-new")
+
+
+def test_first_boot_assignment_records_both_properties(tmp_path: Path) -> None:
+    """`gateway_host` was droppable from the assign path undetected: the boot-2 merge test
+    re-added it, so the suite stayed green."""
+    resolve_host_id(str(tmp_path), sandbox_id="sbx-1", gateway_host="gw-1")
+    cached = _cache(tmp_path)
+    assert (cached["sandbox_id"], cached["gateway_host"]) == ("sbx-1", "gw-1")
+
+
+def test_every_writer_produces_a_0600_file(tmp_path: Path) -> None:
+    """`os.replace` hands the temp file's mode to the final name, so the non-assignment writer
+    can be made world-readable independently of the assignment one — which was the only one
+    covered. This file names a host whose owner is a workspace admin."""
+    resolve_host_id(str(tmp_path))
+    resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
+    resolve_host_id(str(tmp_path), sandbox_id="sbx-1")
+    assert oct(os.stat(tmp_path / HOST_JSON_NAME).st_mode & 0o777) == "0o600"
+
+
+def test_a_second_corruption_does_not_overwrite_the_first_quarantine(tmp_path: Path) -> None:
+    """`_quarantine`'s numbered suffix promises prior evidence is never destroyed, and nothing
+    corrupted the cache twice to check it."""
+    path = tmp_path / HOST_JSON_NAME
+    path.write_text("first corruption")
+    resolve_host_id(str(tmp_path))
+    path.write_text("second corruption")
+    resolve_host_id(str(tmp_path))
+
+    bodies = sorted(f.read_text() for f in tmp_path.glob(f"{HOST_JSON_NAME}.corrupt.*"))
+    assert bodies == ["first corruption", "second corruption"], (
+        f"quarantined bodies were {bodies}; a numbered suffix exists so the second corruption "
+        "cannot overwrite the evidence from the first"
+    )
+
+
+def test_an_unusable_link_fails_loudly_instead_of_writing_racily(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """The `OSError` branch can be turned into exactly what its own comment forbids.
+
+    Replacing the raise with `os.replace` passed every test — and `os.replace` is last-writer-
+    wins, so on the one filesystem where hardlinks are unavailable, hosts would split invisibly.
+    Refusing is the point.
+    """
+
+    def no_hardlinks(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(identity.os, "link", no_hardlinks)
+    with pytest.raises(IdentityError, match="hardlink"):
+        resolve_host_id(str(tmp_path))
+    assert not (tmp_path / HOST_JSON_NAME).exists(), (
+        "no identity may be published when it could not be claimed atomically"
+    )

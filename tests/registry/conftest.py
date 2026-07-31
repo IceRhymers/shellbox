@@ -61,7 +61,21 @@ def _pg_engine_or_skip() -> Iterator[Engine]:
 def pg_engine(_pg_engine_or_skip: Engine) -> Generator[Engine, None, None]:
     """A live engine with the registry schema created fresh for this test and dropped
     afterward — cheaper than driving alembic per-test; alembic itself is exercised by
-    ``test_migrations.py``."""
+    ``test_migrations.py``.
+
+    ⚠️ Two things this fixture does NOT give you, both of which have already misled someone:
+
+    * **It builds the schema from the MODELS, never from the migrations.** So a test passing here
+      says nothing about whether a migration exists for what it asserts — deleting migration 0002
+      left this whole directory green. `test_migrations.py` compares the migrated schema against
+      the models for exactly that reason; keep that comparison, it is the only thing joining the
+      two.
+    * **`create_all` is `checkfirst=True`.** If a previous run left tables behind (a crashed test,
+      an interrupted session, `test_migrations.py` failing before its cleanup), creation is
+      **skipped silently** and you are testing against the OLD schema. A model change can then
+      look verified when it was never applied. CI is unaffected — its database is new each run —
+      but locally, drop the tables before trusting a schema-shaped result.
+    """
     Base.metadata.create_all(_pg_engine_or_skip)
     try:
         yield _pg_engine_or_skip

@@ -548,45 +548,67 @@ def _adopt_winner(path: Path) -> str:
 # Arbitration for multi-step mutations
 # --------------------------------------------------------------------------------------
 @contextmanager
-def _exclusive(path: Path) -> Iterator[bool]:
-    """Serialize multi-step mutations of ``path``. Yields True to exactly one process.
+def _exclusive(path: Path, *, attempts: int = 1) -> Iterator[bool]:
+    """Serialize multi-step mutations of ``path``. Yields True to exactly one process at a time.
 
     A lock file rather than `flock`, for the same reason `_create_or_adopt` uses `link`: it is
     one syscall whose semantics do not vary across the filesystems a `$HOME` can be on.
 
-    Yields **False rather than blocking**, so every caller has to decide what to do without the
-    lock. That is deliberate: the right answer is always "re-read and re-decide", never "assume
-    and write".
+    ``attempts`` is the caller's answer to "what if I do not get it?", and the two answers are
+    genuinely different:
+
+    * ``attempts=1`` (default) — **do not wait.** For callers whose enclosing loop re-reads and
+      re-decides, where waiting would mean holding a decision made against a file that is
+      actively changing. Not getting the lock is *information*: someone else is fixing this.
+    * ``attempts>1`` — **wait, briefly.** For callers whose work is unconditional and cannot be
+      deferred to anyone else.
+
+    🔴 The second mode exists because the first was applied to a caller that needed it. Property
+    writes gave up on contention, and the justification — "the next start records them" — is
+    false when every contender is in the **same boot**: with 16 processes released together,
+    ``sandbox_id`` was absent from the file in 3 of 12 rounds and ``owner_email`` in 4 of 12,
+    which is exactly the "`doctor` reports a bootstrapped host as never bootstrapped" symptom
+    `_record_properties` exists to prevent. The critical section is two filesystem calls, so
+    waiting out a handful of them is free.
     """
     lock = path.with_name(path.name + _LOCK_SUFFIX)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # A lock older than the critical section belonged to a process that died holding it.
-        # Breaking it is safe because every write behind it still goes through `_create_or_adopt`
-        # or a re-read: two processes both believing they hold this cannot both assign.
+    fd: int | None = None
+
+    for attempt in range(attempts):
         try:
-            age = time.time() - lock.stat().st_mtime
-        except OSError:
-            age = 0.0
-        if age > _LOCK_STALE_SECONDS:
-            logger.warning(
-                "breaking a stale identity lock %s (%.1fs old); the process holding it appears "
-                "to have died",
-                lock,
-                age,
-            )
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            # A lock older than the critical section belonged to a process that died holding it.
+            # Breaking it is safe because every write behind it still goes through
+            # `_create_or_adopt` or a re-read under the lock: two processes both believing they
+            # hold this still cannot both assign an identity.
             try:
-                lock.unlink()
+                age = time.time() - lock.stat().st_mtime
             except OSError:
-                pass
+                age = 0.0
+            if age > _LOCK_STALE_SECONDS:
+                logger.warning(
+                    "breaking a stale identity lock %s (%.1fs old); the process holding it "
+                    "appears to have died",
+                    lock,
+                    age,
+                )
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+            if attempt + 1 < attempts:
+                time.sleep(_LOCK_BACKOFF)
+        except OSError as exc:
+            logger.warning("could not take the identity lock %s: %s", lock, exc)
+            break
+
+    if fd is None:
         yield False
         return
-    except OSError as exc:
-        logger.warning("could not take the identity lock %s: %s", lock, exc)
-        yield False
-        return
+
     try:
         os.write(fd, f"{os.getpid()}\n".encode())
     except OSError:
@@ -687,9 +709,11 @@ def _record_properties(
     "never bootstrapped", and the `hosts` row losing a column it had. Invisible to any assertion
     on the *returned* value, which was correct throughout.
 
-    Best-effort by design: if another process holds the lock, the write is skipped rather than
-    queued. These are properties, not identity -- the next start records them, and no caller's
-    correctness depends on the write having happened by the time this returns.
+    ⚠️ Not best-effort. An earlier version skipped the write when another process held the lock,
+    reasoning that "the next start records them" -- which is false, because **every contender is
+    in the same boot**. If all the processes that were told the `sandbox_id` lose the lock to an
+    owner-email writer, nobody records it, and "the next start" means a sandbox restart. Measured
+    at 16 processes: `sandbox_id` absent from the file in 3 of 12 rounds. So this waits.
     """
     incoming = {
         key: value for key, value in properties.items() if value and value != cached.get(key)
@@ -717,9 +741,19 @@ def _merge_properties(
     processes could each merge a `host_id` into a missing file and split the host through the
     back door.
     """
-    with _exclusive(path) as acquired:
+    # Waits, rather than skipping -- see this function's docstring for what skipping cost.
+    with _exclusive(path, attempts=_ADOPT_ATTEMPTS) as acquired:
         if not acquired:
-            logger.debug("skipping a property write to %s: another process holds the lock", path)
+            # At WARNING, not debug: after a restart with no credential the cache is E2b's ONLY
+            # source of `owner_email`, so a dropped write here is not "one extra API call", it is
+            # the next boot deferring enrollment entirely.
+            logger.warning(
+                "could not record %s on %s within %.1fs: another process held the identity lock "
+                "throughout. The value will be recorded on a later start.",
+                ", ".join(sorted(updates)),
+                path,
+                _ADOPT_ATTEMPTS * _LOCK_BACKOFF,
+            )
             return
         _, cached, raw = _load_cache(path)
         if cached is None or raw is None:

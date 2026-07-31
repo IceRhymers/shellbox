@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: make test
+
+  # NOTE: the tmux-3.4 lane (ubuntu:24.04, gating §7 per
+  # .omc/plans/phase-2-session-plane.md §11.2) and the alembic upgrade/downgrade job land
+  # with W2 (tmux adapter + spike/tmux_spike.py regression suite) and W6
+  # (shellbox-registry models + migrations), respectively. Both are out of scope for W1.

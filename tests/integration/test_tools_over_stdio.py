@@ -70,7 +70,9 @@ def test_create_send_read_resize_list_kill_round_trip(
             await call(
                 client,
                 "shell_send",
-                {"session": created["session"], "text": "echo LIFE-OK\n"},
+                # `LIFE''-OK` prints as "LIFE-OK" but echoes differently, so the sentinel
+                # proves the shell RAN the command rather than merely received it.
+                {"session": created["session"], "text": "echo LIFE''-OK\n"},
             )
         ).data
         content = await await_content(client, created["session"], "LIFE-OK")
@@ -103,7 +105,7 @@ def test_create_send_read_resize_list_kill_round_trip(
     assert created["incarnation"], "shell_create returned an empty incarnation"
 
     sent = out["sent"]
-    assert sent["submitted_bytes"] == len("echo LIFE-OK\n")
+    assert sent["submitted_bytes"] == len("echo LIFE''-OK\n")
     assert sent["keys_sent"] == []
     # Stated in the payload so no caller mistakes submission for receipt (H4).
     assert sent["delivery"] == "unverified"
@@ -153,7 +155,11 @@ def test_read_preserves_ansi(tmux_server: TmuxServer, tmp_path: Path) -> None:
         await call(
             client,
             "shell_send",
-            {"session": name, "text": "printf '\\033[31mRED\\033[39m\\n'\n"},
+            # R''ED prints as "RED" while echoing differently, so the wait cannot be
+            # satisfied by the echoed command. Here that was a latent flake rather than a
+            # false pass -- the assertion below needs a real ESC byte, and the echo carries
+            # only the literal text "\033" -- but an early wait would fail confusingly.
+            {"session": name, "text": "printf '\\033[31mR''ED\\033[39m\\n'\n"},
         )
         return await await_content(client, name, "RED")
 
@@ -176,15 +182,22 @@ def test_send_keys_are_delivered_after_text(tmux_server: TmuxServer, tmp_path: P
             await call(
                 client,
                 "shell_send",
-                {"session": name, "text": "echo KEYS-OK", "keys": ["Enter"]},
+                # `KEYS''-OK` echoes to the pane as typed but PRINTS as "KEYS-OK", so the
+                # sentinel exists only in the shell's OUTPUT. Without that, both the wait
+                # and the assertion below are satisfied by the echoed command line -- and
+                # this test would pass even if Enter were never processed, which is the one
+                # thing it exists to prove.
+                {"session": name, "text": "echo KEYS''-OK", "keys": ["Enter"]},
             )
         ).data
         return sent, await await_content(client, name, "KEYS-OK")
 
     sent, content = run_script(harness, script)
     assert sent["keys_sent"] == ["Enter"]
-    assert sent["submitted_bytes"] == len("echo KEYS-OK")
-    assert "KEYS-OK" in content
+    assert sent["submitted_bytes"] == len("echo KEYS''-OK")
+    assert "KEYS-OK" in content, (
+        "the shell never ran the command, so Enter was not processed: " + repr(content)
+    )
 
 
 def test_recreate_with_matching_cwd_is_idempotent(tmux_server: TmuxServer, tmp_path: Path) -> None:

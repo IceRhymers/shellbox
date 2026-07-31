@@ -23,7 +23,7 @@ longer exists anywhere in the package.
 So: `sandbox_id` is *injected* by the bootstrap path (which runs from outside and does know
 it, ADR-8) and is a nullable **property**, never part of the identity.
 
-## Why the exclusive create matters
+## Why assignment is arbitrated by the filesystem
 
 1-32 MCP processes run concurrently against one tmux server -- an invariant issue #2 calls
 "mandatory, not stylistic". Writing the cache with the usual `tmp` + `os.replace` idiom would
@@ -33,9 +33,15 @@ is one sandbox split across N `hosts` rows, session rows for a *shared* tmux ser
 under different hosts, and `server.py`'s cross-host check rejecting a sibling's session id as
 `invalid_name` while that tmux session is alive and usable.
 
-`O_CREAT | O_EXCL` makes exactly one process the assigner; every other **adopts the winner**.
-The file is therefore written once per sandbox lifetime and read forever after, which is also
-why an atomic-replace idiom would be solving a problem that does not arise.
+So exactly one process may win, and the winner's value is what everyone else uses. That is
+`_create_or_adopt`: write the content to a staging file, then `os.link` it into place. `link`
+is atomic and fails with ``EEXIST``, so it elects one winner -- and unlike ``O_EXCL`` on the
+final path, the name appears only once the content behind it is complete, so a loser can never
+read a half-written identity. Read its docstring before changing any of it; the obvious
+simplification reintroduces a bug that only a barrier-synchronised test can see.
+
+Every other write goes through `_merge_cache`, which merges into what the file already holds
+rather than rebuilding it. Three separate writers each used to drop a field the others needed.
 """
 
 from __future__ import annotations
@@ -206,7 +212,27 @@ def resolve_host_id(
                 recovered,
             )
             host_id = recovered
-            _write_cache(path, host_id, overwrite=True)
+            _merge_cache(path, {"host_id": host_id})
+
+        # 🔴 Persist a sandbox_id/gateway_host the caller brought that the cache does not have.
+        #
+        # Without this, ADR-8 does not work at all past the first boot. The bootstrap path runs
+        # **every boot** and is the only actor that knows the sandbox id, but on boot 2+ this is
+        # the branch it takes -- so the id was handed back to that one caller and never written,
+        # leaving every other process in the boot with `None`, `doctor` reporting a bootstrapped
+        # host as "never bootstrapped", and the `hosts` row losing a column it had.
+        #
+        # A test asserting on the *returned* value cannot see this: the return was always
+        # correct. It only shows up by reading the file back.
+        incoming = {
+            key: value
+            for key, value in (("sandbox_id", sandbox_id), ("gateway_host", gateway_host))
+            if value and value != cached.get(key)
+        }
+        if incoming:
+            logger.info("recording %s on identity cache %s", ", ".join(sorted(incoming)), path)
+            _merge_cache(path, incoming)
+
         return HostIdentity(
             host_id=host_id,
             kind=lakebox_kind(),
@@ -254,7 +280,11 @@ def resolve_host_id(
             path,
             recovered,
         )
-        _write_cache(path, recovered, sandbox_id=sandbox_id, gateway_host=gateway_host)
+        _merge_cache(
+            path,
+            {"host_id": recovered, "sandbox_id": sandbox_id, "gateway_host": gateway_host},
+            may_create=True,
+        )
         return HostIdentity(
             host_id=recovered,
             kind=lakebox_kind(),
@@ -375,27 +405,69 @@ def _adopt_winner(path: Path) -> str:
     ) from None
 
 
-def _write_cache(
-    path: Path,
-    host_id: str,
-    *,
-    sandbox_id: str | None = None,
-    gateway_host: str | None = None,
-    overwrite: bool = False,
-) -> None:
-    """Write the cache outside the assignment race.
+def _merge_cache(path: Path, updates: dict[str, Any], *, may_create: bool = False) -> None:
+    """Merge fields into the cache, preserving every key it already holds.
 
-    Used for the recovery and reconciliation paths, where the `host_id` is already decided by
-    something more authoritative than this process. `tmp` + `os.replace` is correct *here* --
-    the value is not being chosen, so a last-writer-wins race between two processes writing
-    the *same* id is harmless.
+    **The ONE writer for everything except assignment.** There were three bespoke writers here
+    and each dropped a field the others cared about, because each rebuilt the payload from its
+    own arguments instead of from the file:
+
+    * the `sandbox_id` a per-boot bootstrap injects was returned to its caller and never
+      written, so every other process in that boot saw ``None`` and `doctor` reported a
+      bootstrapped host as "never bootstrapped";
+    * the recovery path rebuilt the payload from ``host_id``/``sandbox_id`` alone and therefore
+      **silently deleted `owner_email`**.
+
+    Both were invisible to tests that asserted on the *returned value* rather than on the file.
+    Merging from the file makes a dropped field impossible rather than unlikely.
+
+    ``may_create`` guards the one thing this must never do: invent an identity. Assignment is
+    `_create_or_adopt`'s job and is race-arbitrated; if this function created a cache on a
+    missing file, two processes could both "merge" a `host_id` in and split the host.
     """
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if path.exists() and not overwrite:
-        return
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    payload = _payload(host_id, sandbox_id=sandbox_id, gateway_host=gateway_host)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    _, existing = _load_cache(path)
+
+    if existing is None:
+        if not (may_create and updates.get("host_id")):
+            # Nothing to merge into, and not allowed to create. Losing a cached owner_email
+            # costs one API call next start; inventing or clobbering a host_id re-keys every
+            # session on the host.
+            logger.warning(
+                "not updating identity cache %s: it is missing or unusable, and rewriting it "
+                "would risk the host_id it carries",
+                path,
+            )
+            return
+        merged: dict[str, Any] = {"version": 1}
+    else:
+        # Re-read raw so keys this module does not model (a future field, an operator's note)
+        # survive a write by an older build. `_load_cache` returns only the shape-checked keys.
+        merged = _raw_cache(path) or {"version": 1}
+
+    merged.update({k: v for k, v in updates.items() if v})
+    _atomic_write(path, merged)
+
+
+def _raw_cache(path: Path) -> dict[str, Any] | None:
+    """The cache as-is, unvalidated — used only to avoid dropping keys on a merge."""
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
+    """`tmp` + `os.replace`, mode 0600.
+
+    Last-writer-wins, which is correct here and *only* here: these callers are not choosing a
+    `host_id`, they are recording a value something more authoritative already decided, so two
+    processes writing concurrently write the same thing. Assignment must never use this — see
+    `_create_or_adopt`, where last-writer-wins would split one sandbox across N hosts.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
@@ -535,10 +607,10 @@ def resolve_owner_email(
                 cached_email,
                 credential_email,
             )
-            _write_cached_owner(path, credential_email)
+            _merge_cache(path, {"owner_email": credential_email})
             return OwnerResolution(credential_email, source="credential", reconciled=True)
         if not cached_email:
-            _write_cached_owner(path, credential_email)
+            _merge_cache(path, {"owner_email": credential_email})
         return OwnerResolution(credential_email, source="credential")
 
     if cached_email:
@@ -565,37 +637,3 @@ def _read_cached_owner(path: Path) -> str | None:
         return None
     email = parsed.get("owner_email")
     return email if isinstance(email, str) and email.strip() else None
-
-
-def _write_cached_owner(path: Path, owner_email: str) -> None:
-    """Merge `owner_email` into the cache, preserving `host_id`.
-
-    Read-modify-write rather than a rewrite: `host_id` is the irreplaceable field in this file
-    and must survive an owner correction. If the file is unreadable the merge is skipped
-    entirely -- losing a cached email costs one API call next start, while clobbering
-    `host_id` re-keys every session on the host.
-    """
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(existing, dict) or not isinstance(existing.get("host_id"), str):
-            raise ValueError("no host_id")
-    except (OSError, ValueError):
-        logger.warning(
-            "not caching owner_email: %s is missing or unusable, and rewriting it would "
-            "risk the host_id it carries",
-            path,
-        )
-        return
-    existing["owner_email"] = owner_email
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(existing, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, path)
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass

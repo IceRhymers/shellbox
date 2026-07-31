@@ -61,6 +61,17 @@ def _resolve_at_barrier(state_dir: str, barrier: object, results: object) -> Non
         results.append(("<error>", False, f"{type(exc).__name__}: {exc}"))  # type: ignore[attr-defined]
 
 
+def _cache(state_dir: Path) -> dict[str, object]:
+    """The identity cache as written to disk.
+
+    Used deliberately often below: two real bugs in this module were invisible to assertions on
+    the *returned* value and visible only in the file.
+    """
+    parsed = json.loads((state_dir / HOST_JSON_NAME).read_text())
+    assert isinstance(parsed, dict)
+    return parsed
+
+
 def _race_once(state_dir: Path) -> list[tuple[str, bool, str]]:
     """Release `CONCURRENT_WORKERS` real processes into `resolve_host_id` simultaneously.
 
@@ -332,6 +343,76 @@ def test_a_fresh_sandbox_id_wins_over_the_cached_one(tmp_path: Path) -> None:
     """The injector knows; the cache only remembers."""
     resolve_host_id(str(tmp_path), sandbox_id="old-name")
     assert resolve_host_id(str(tmp_path), sandbox_id="new-name").sandbox_id == "new-name"
+    # Asserted on the FILE. The returned value was correct even when the write was missing —
+    # see `test_a_sandbox_id_arriving_after_the_first_boot_is_persisted`.
+    assert _cache(tmp_path)["sandbox_id"] == "new-name"
+
+
+def test_a_sandbox_id_arriving_after_the_first_boot_is_persisted(tmp_path: Path) -> None:
+    """🔴 The bug this test exists for: ADR-8 does not work past boot 1 without it.
+
+    The bootstrap path runs **every boot** and is the only actor that knows the sandbox id. On
+    every boot after the first, `resolve_host_id` takes the cache-hit branch — which returned
+    the injected id to its caller and never wrote it down. Consequences, all silent: the other
+    1-31 processes in that boot see `None`, `doctor` reports a bootstrapped host as "never
+    bootstrapped", and the `hosts` row loses a column it previously had.
+
+    Invisible to any assertion on the return value, which was correct throughout. Only reading
+    the file back catches it.
+    """
+    # Boot 1: a plain `serve`, before anyone has bootstrapped. No sandbox_id, correctly.
+    resolve_host_id(str(tmp_path))
+    assert "sandbox_id" not in _cache(tmp_path)
+
+    # Boot 2: bootstrap runs and injects it.
+    resolve_host_id(str(tmp_path), sandbox_id="realistic-phoenix-2742", gateway_host="gw.example")
+
+    assert _cache(tmp_path)["sandbox_id"] == "realistic-phoenix-2742"
+    assert _cache(tmp_path)["gateway_host"] == "gw.example"
+    # And a *different* process in the same boot, which was never told, still knows.
+    later = resolve_host_id(str(tmp_path))
+    assert (later.sandbox_id, later.gateway_host) == ("realistic-phoenix-2742", "gw.example")
+
+
+def test_recording_a_sandbox_id_never_disturbs_identity_or_owner(tmp_path: Path) -> None:
+    """The merge must preserve what it did not come to write.
+
+    An earlier version rebuilt the payload from its own arguments, so recording one field
+    deleted the others — `owner_email` in particular, which the recovery path dropped outright.
+    """
+    host_id = resolve_host_id(str(tmp_path)).host_id
+    resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
+
+    resolve_host_id(str(tmp_path), sandbox_id="sbx-1")
+
+    cached = _cache(tmp_path)
+    assert cached["host_id"] == host_id, "recording a property must never re-key the host"
+    assert cached["owner_email"] == "owner@example.com", "the merge dropped owner_email"
+    assert cached["sandbox_id"] == "sbx-1"
+
+
+def test_a_merge_preserves_keys_this_module_does_not_model(tmp_path: Path) -> None:
+    """Forward compatibility: a newer build's field must survive an older build's write."""
+    resolve_host_id(str(tmp_path))
+    path = tmp_path / HOST_JSON_NAME
+    payload = json.loads(path.read_text())
+    payload["some_future_field"] = "keep me"
+    path.write_text(json.dumps(payload))
+
+    resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
+    assert _cache(tmp_path)["some_future_field"] == "keep me"
+
+
+def test_a_merge_never_invents_an_identity(tmp_path: Path) -> None:
+    """Only `_create_or_adopt` may create a cache, because only it arbitrates the race.
+
+    If a merge could create one, two processes could each "merge" a `host_id` in and split the
+    host — the failure the link-based assignment exists to prevent, reintroduced by the back
+    door. So an owner write against a missing cache records nothing and says so.
+    """
+    result = resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
+    assert result.owner_email == "owner@example.com", "the caller still gets the resolved value"
+    assert not (tmp_path / HOST_JSON_NAME).exists()
 
 
 def test_absent_sandbox_id_is_omitted_not_nulled(tmp_path: Path) -> None:

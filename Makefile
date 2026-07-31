@@ -1,4 +1,4 @@
-.PHONY: install sync fmt lint test test-tmux migrate migration
+.PHONY: install sync fmt lint test test-tmux test-registry migrate migration migrate-roundtrip
 
 install: sync
 
@@ -25,10 +25,21 @@ test:
 test-tmux:
 	@echo "test-tmux: no tmux-backed tests yet (see W2, .omc/plans/phase-2-session-plane.md §4)"
 
-# PLACEHOLDER (W6): alembic env.py + versions/0001_hosts_sessions.py land with
-# shellbox-registry's models. alembic.ini is added at the repo root at that point too.
 migrate:
 	uv run alembic -c alembic.ini upgrade head
 
 migration:
 	uv run alembic -c alembic.ini revision --autogenerate -m "$(name)"
+
+# A migration that cannot be reversed is not a migration you can deploy twice. CI runs
+# this against a real Postgres rather than asserting the DDL by eye.
+migrate-roundtrip:
+	uv run alembic -c alembic.ini upgrade head
+	uv run alembic -c alembic.ini downgrade base
+	uv run alembic -c alembic.ini upgrade head
+
+# Separate from `make test` because it needs a live Postgres. It SKIPS rather than fails
+# when the DSN is unreachable, so a developer without a database still gets a green
+# `make test` -- but CI provides one, so here the skips should not happen.
+test-registry:
+	uv run pytest tests/registry -v

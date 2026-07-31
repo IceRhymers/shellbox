@@ -25,7 +25,114 @@ jobs:
       - run: uv sync --locked
       - run: make test
 
-  # NOTE: the tmux-3.4 lane (ubuntu:24.04, gating §7 per
-  # .omc/plans/phase-2-session-plane.md §11.2) and the alembic upgrade/downgrade job land
-  # with W2 (tmux adapter + spike/tmux_spike.py regression suite) and W6
-  # (shellbox-registry models + migrations), respectively. Both are out of scope for W1.
+  # The tmux-3.4 lane is a GATE, not a confirmation.
+  #
+  # §7 of the plan is transcribed from spike/tmux_spike.py, and the sandbox runs
+  # tmux 3.4 on Ubuntu 24.04. Every behaviour §7 depends on was measured in two
+  # lanes precisely because a single-version measurement is what let three
+  # rounds of command-form defects survive review. If this job fails, the tmux
+  # adapter's specification is not valid -- do not merge on the strength of the
+  # host lane alone.
+  #
+  # Pinned to the ubuntu:24.04 CONTAINER rather than relying on the runner image:
+  # `ubuntu-latest` happens to ship tmux 3.4 today, but that tracks whatever
+  # GitHub bumps it to, which is exactly the coupling this gate exists to remove.
+  tmux-3-4:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tmux and Python
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            tmux python3 python3-venv curl make ca-certificates
+          tmux -V
+
+      - name: Assert the pinned tmux version
+        run: |
+          # A silent tmux bump under us is the thing this lane guards against, so
+          # fail loudly rather than testing a version nobody chose.
+          set -eu
+          got="$(tmux -V)"
+          case "$got" in
+            "tmux 3.4") echo "tmux version as expected: $got" ;;
+            *) echo "::error::expected 'tmux 3.4' (the sandbox image), got '$got'."
+               echo "If the base image moved, re-run spike/tmux_spike.py against the"
+               echo "new version and update spike/FINDINGS.md before changing this pin."
+               exit 1 ;;
+          esac
+
+      - name: Run the spike (the §7 oracle) on tmux 3.4
+        run: python3 spike/tmux_spike.py
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - name: Run the tmux-backed suite on tmux 3.4
+        run: make test-tmux
+
+  # The spike must also pass on the developer-facing lane. Two lanes green is the
+  # contract; either one alone is not.
+  spike-host-lane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+      - run: tmux -V
+      - name: Run the spike on the host lane
+        run: python3 spike/tmux_spike.py
+
+  registry:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: shellbox
+          POSTGRES_PASSWORD: shellbox
+          POSTGRES_DB: shellbox
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U shellbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    # Components, not a connection string. Writing the assembled DSN here would put a
+    # complete credential-bearing URL in the repo, which credential scanners flag --
+    # correctly, as a habit worth breaking. The test fixtures read these parts directly.
+    env:
+      SHELLBOX_PG_USER: shellbox
+      SHELLBOX_PG_PASSWORD: shellbox
+      SHELLBOX_PG_HOST: localhost
+      SHELLBOX_PG_PORT: "5432"
+      SHELLBOX_PG_DB: shellbox
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+
+      # No DSN is composed here. alembic's env.py resolves it from these components via
+      # shellbox_registry.dsn.dsn_from_env, so the assembled credential-bearing URL never
+      # exists in the repo -- only in the process environment at runtime.
+      - name: alembic upgrade -> downgrade -> upgrade
+        run: make migrate-roundtrip
+
+      # The fixtures skip when no database is reachable, which is right for a developer
+      # machine and wrong here -- CI provides one, so a skip means the service container
+      # or the DSN is broken and would otherwise pass silently.
+      - name: Registry tests against a real Postgres
+        run: make test-registry
+      - name: Fail if the registry tests were skipped
+        run: |
+          uv run pytest tests/registry -m registry -q 2>&1 | tee /tmp/reg.txt
+          if grep -qE '[0-9]+ skipped' /tmp/reg.txt; then
+            echo "::error::registry tests SKIPPED in CI -- the Postgres service or the DSN is misconfigured."
+            exit 1
+          fi

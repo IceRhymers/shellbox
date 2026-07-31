@@ -23,25 +23,34 @@ longer exists anywhere in the package.
 So: `sandbox_id` is *injected* by the bootstrap path (which runs from outside and does know
 it, ADR-8) and is a nullable **property**, never part of the identity.
 
-## Why assignment is arbitrated by the filesystem
+## Concurrency: the thing to understand before changing anything here
 
-1-32 MCP processes run concurrently against one tmux server -- an invariant issue #2 calls
-"mandatory, not stylistic". Writing the cache with the usual `tmp` + `os.replace` idiom would
-be **last-writer-wins**: on a cold first boot every process mints its own uuid4, one write
-survives, and the losers each serve a full lifetime under an id absent from the cache. That
-is one sandbox split across N `hosts` rows, session rows for a *shared* tmux server filed
-under different hosts, and `server.py`'s cross-host check rejecting a sibling's session id as
-`invalid_name` while that tmux session is alive and usable.
+1-32 MCP processes run against one tmux server and one state directory — an invariant issue #2
+calls "mandatory, not stylistic". Every process must end up with the **same** `host_id`, and it
+must equal what is in the file, because `session_id` is `f"{host_id}:{tmux_name}"`: a second id
+means one sandbox split across N `hosts` rows, session rows for a shared tmux server filed
+under different hosts, and each process rejecting its siblings' live session ids as
+`invalid_name`.
 
-So exactly one process may win, and the winner's value is what everyone else uses. That is
-`_create_or_adopt`: write the content to a staging file, then `os.link` it into place. `link`
-is atomic and fails with ``EEXIST``, so it elects one winner -- and unlike ``O_EXCL`` on the
-final path, the name appears only once the content behind it is complete, so a loser can never
-read a half-written identity. Read its docstring before changing any of it; the obvious
-simplification reintroduces a bug that only a barrier-synchronised test can see.
+Three mechanisms, in increasing cost, and the rule for which to use:
 
-Every other write goes through `_merge_cache`, which merges into what the file already holds
-rather than rebuilding it. Three separate writers each used to drop a field the others needed.
+1. **Creating an identity where there is none — `os.link`.** `_create_or_adopt` writes the full
+   content to a staging file and then links it into place. `link` is atomic and fails with
+   ``EEXIST``, so exactly one process wins and the rest **adopt the winner**. Unlike ``O_EXCL``
+   on the final path, the name appears only once the content behind it is complete, so a loser
+   can never read a half-written identity.
+2. **Reading — one `read_text`.** `_load_cache` returns a state *and* the parsed content from a
+   single observation. Deciding anything by asking two questions about the same file is how a
+   concurrent winner's file came to look corrupt to a loser.
+3. **Mutating a file that already exists — `_exclusive`.** Quarantining corruption, overriding
+   the id from a tmux stamp, replacing an empty file, recording a property: all of these are
+   *multi-step transactions* (read, decide, write), and neither (1) nor (2) arbitrates them.
+   Two processes quarantining concurrently destroyed each other's freshly-assigned identities
+   and split one sandbox into six. So every mutation of an existing file takes the lock,
+   **re-reads under it**, and re-derives its decision from that read.
+
+The invariant all three exist to serve, and the one to assert when adding tests: **every
+process's returned `host_id` equals the one in the file.**
 """
 
 from __future__ import annotations
@@ -51,6 +60,8 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -81,35 +92,45 @@ KIND_LAKEBOX = "lakebox"
 KIND_UNKNOWN = "unknown"
 
 # How long a process that lost the exclusive create waits for the winner to finish writing.
-# The real window is a single small `json.dump` -- microseconds -- so this is generous by
-# three orders of magnitude and exists only so a *crashed* winner surfaces as an error
-# instead of a hang. 0.5s total.
+# Under link-after-write the winner's content is complete before the name exists, so this is
+# only reachable during a rolling upgrade from a build that used `O_EXCL` on the final path,
+# where a genuinely empty file can be observed mid-write. 0.5s.
 _ADOPT_ATTEMPTS = 25
 _ADOPT_BACKOFF = 0.02
 
+# Bounded outer loop: each pass either resolves or discovers the file changed underneath and
+# re-reads. Bounded rather than `while True` so a pathological environment fails loudly instead
+# of spinning inside an MCP server's startup.
+_RESOLVE_ATTEMPTS = 8
+
+_LOCK_SUFFIX = ".lock"
+_LOCK_BACKOFF = 0.02
+# The critical section is a couple of filesystem calls, so a lock older than this belonged to a
+# process that died holding it. Breaking it is safe *because* the final write still goes through
+# `_create_or_adopt`: two processes both believing they hold the lock still cannot both assign.
+_LOCK_STALE_SECONDS = 10.0
+
 
 class _CacheState(Enum):
-    """Why a cache read produced no identity. The distinction is not cosmetic: only ``CORRUPT``
-    may be quarantined, and quarantining anything else re-keys every session on the host."""
+    """Why a cache read produced no identity. Not cosmetic: only ``CORRUPT`` is preserved, and
+    preserving the wrong thing re-keys every session on the host."""
 
     OK = "ok"
     ABSENT = "absent"
-    """No file, or a file we could not read at all (permissions, I/O). Never quarantined."""
+    """No file, or a file we could not read at all (permissions, I/O). Never touched."""
     EMPTY = "empty"
-    """Present but blank. Not produced by this module -- see `_create_or_adopt` -- so it means
-    a stray `touch` or a writer from an older build that died. Nothing to preserve."""
+    """Present but blank. Never produced by this module, so it means a stray `touch` or a
+    crashed writer from an older build. Nothing in it to preserve — so it is replaceable."""
     CORRUPT = "corrupt"
-    """Complete content that is not a usable identity. The only quarantinable state."""
+    """Complete content that is not a usable identity. Preserved, never overwritten in place."""
 
 
 class IdentityError(Exception):
-    """The identity cache exists but cannot be used, and overwriting it would be worse.
+    """No identity could be established, and guessing would be worse than failing.
 
-    Distinct from a *missing* cache, which is the normal first-boot path. A corrupt cache is
-    not silently replaced: a new `host_id` re-keys every `session_id` (they are
-    ``f"{host_id}:{tmux_name}"``), stranding live sessions as unaddressable while their tmux
-    sessions still run. An operator deleting the file is a decision; this module making that
-    decision for them is not.
+    Deliberately rare. A missing cache is the normal first-boot path and an unusable one is
+    recoverable; this is for the cases where proceeding would have to invent a second identity
+    for a host that may already have live sessions filed under its first one.
     """
 
 
@@ -120,9 +141,9 @@ class HostIdentity:
     host_id: str
     kind: str
     assigned: bool
-    """True when this process performed the assignment; False when it adopted an existing id.
-    Exposed because "who assigned it" is the one thing the concurrency test can assert on --
-    exactly one winner across N processes."""
+    """True when this process minted the id; False when it adopted an existing one. Exposed
+    because "who assigned it" is the one thing a concurrency test can assert on -- exactly one
+    winner across N processes."""
     source: str
     """``env`` | ``cache`` | ``tmux`` | ``assigned`` -- for logging and `doctor`."""
     sandbox_id: str | None = None
@@ -140,13 +161,41 @@ class OwnerResolution:
     """True when a credential disagreed with the cache and the credential won (E2a)."""
 
 
+# --------------------------------------------------------------------------------------
+# What makes a host_id usable at all
+# --------------------------------------------------------------------------------------
+def _host_id_problem(value: object) -> str | None:
+    """Why ``value`` cannot be a `host_id`, or ``None`` if it can.
+
+    One predicate, applied to **every** source. It used to live inside the cache reader, so the
+    two inputs that bypass the cache -- ``$SHELLBOX_HOST_ID`` and a `host_id` recovered from a
+    tmux user option -- were never checked, and a stamp of `lakebox:abc` or a value with a TAB
+    in it was accepted, persisted, and only detonated on the *next* boot with an error blaming
+    the file.
+    """
+    if not isinstance(value, str):
+        return f"is {type(value).__name__}, not a string"
+    if not value.strip():
+        return "is empty or whitespace"
+    if ":" in value:
+        # `session_id` is `<host_id>:<tmux_name>`; `server.py` splits on the last colon, so an
+        # id containing one makes targeting ambiguous.
+        return "contains ':', which would make session ids ambiguous"
+    if any(char.isspace() for char in value):
+        # `naming.py`'s list parser is TAB-delimited, so whitespace corrupts the record itself.
+        return "contains whitespace"
+    if value != value.strip():
+        return "has leading or trailing whitespace"
+    return None
+
+
 def lakebox_kind(*, pid1_cmdline: str | None = None) -> str:
     """``hosts.kind``: can this host prove it is a Lakebox?
 
     Deliberately a *positive* test with an honest negative. A host that cannot prove it is a
-    Lakebox is ``"unknown"``, which is a true statement about a laptop running the test suite
-    and does not pretend otherwise. Unlike the old ``unknown:<machine-id>`` host id, a
-    ``kind`` of ``"unknown"`` collides with nothing -- it is a label, not a key.
+    Lakebox is ``"unknown"``, which is a true statement about a laptop running the test suite.
+    Unlike the old ``unknown:<machine-id>`` host id, a ``kind`` of ``"unknown"`` collides with
+    nothing -- it is a label, not a key.
     """
     if any(marker.exists() for marker in _LAKEBOX_MARKERS):
         return KIND_LAKEBOX
@@ -165,6 +214,9 @@ def _read_pid1_cmdline() -> str | None:
         return None
 
 
+# --------------------------------------------------------------------------------------
+# host_id
+# --------------------------------------------------------------------------------------
 def resolve_host_id(
     state_dir: str,
     *,
@@ -175,14 +227,22 @@ def resolve_host_id(
 ) -> HostIdentity:
     """Resolve `host_id` by ADR-6's ladder. Never returns a derived or colliding id.
 
-    ``explicit`` is ``$SHELLBOX_HOST_ID`` (step 1). ``recovered`` is a `host_id` read back
-    from a live tmux server's ``@shellbox_host_id`` user option -- see `enroll.py`, which
-    supplies it so that a host whose cache was deleted while sessions are still running
-    re-adopts its real identity instead of re-keying them.
+    ``explicit`` is ``$SHELLBOX_HOST_ID`` (step 1). ``recovered`` is a `host_id` read back from
+    a live tmux server's ``@shellbox_host_id`` user option -- see `enroll.py` -- so a host whose
+    cache was lost while sessions are still running re-adopts its real identity instead of
+    re-keying them.
+
+    Guarantees, under any interleaving of concurrent callers: the returned `host_id` is valid,
+    and (except for ``explicit``, which is not persisted) it equals the one in the cache file.
     """
     # Step 1. An explicit id wins and is NOT written to the cache: it is a test and
     # non-Lakebox-host override, and persisting it would make a one-off run permanent.
     if explicit:
+        problem = _host_id_problem(explicit)
+        if problem:
+            # Operator-set, so refusing is right: silently ignoring it would run under an
+            # identity they did not choose, and silently accepting it corrupts session ids.
+            raise IdentityError(f"SHELLBOX_HOST_ID={explicit!r} {problem}")
         return HostIdentity(
             host_id=explicit,
             kind=lakebox_kind(),
@@ -192,160 +252,235 @@ def resolve_host_id(
             gateway_host=gateway_host,
         )
 
-    path = Path(state_dir) / HOST_JSON_NAME
-    state, cached = _load_cache(path)
-
-    # Step 2. The normal path from boot 2 onward.
-    if cached is not None:
-        host_id = cached["host_id"]
-        # A recovered id that disagrees with the cache means the cache is describing a
-        # different host than the running tmux server is -- which is the fork RC-4 warns
-        # about, caught rather than propagated. tmux wins: it is the session authority
-        # (ADR-5), and its sessions are the things that would be stranded.
-        if recovered and recovered != host_id:
-            logger.warning(
-                "host identity mismatch: cache %s says %r but the live tmux server is "
-                "stamped %r; adopting the tmux value, because its sessions are what a "
-                "re-key would strand. Rewriting the cache.",
-                path,
-                host_id,
+    # A bad tmux stamp is NOT fatal -- it is data from a shared server that any agent can set,
+    # so it is dropped with an ERROR and resolution continues. Refusing would let one bad
+    # `set-option` deny every agent its shells.
+    if recovered is not None:
+        problem = _host_id_problem(recovered)
+        if problem:
+            logger.error(
+                "ignoring the @shellbox_host_id stamp %r on the tmux server: it %s. "
+                "Resolving identity from the cache instead.",
                 recovered,
+                problem,
             )
-            host_id = recovered
-            _merge_cache(path, {"host_id": host_id})
+            recovered = None
 
-        # 🔴 Persist a sandbox_id/gateway_host the caller brought that the cache does not have.
-        #
-        # Without this, ADR-8 does not work at all past the first boot. The bootstrap path runs
-        # **every boot** and is the only actor that knows the sandbox id, but on boot 2+ this is
-        # the branch it takes -- so the id was handed back to that one caller and never written,
-        # leaving every other process in the boot with `None`, `doctor` reporting a bootstrapped
-        # host as "never bootstrapped", and the `hosts` row losing a column it had.
-        #
-        # A test asserting on the *returned* value cannot see this: the return was always
-        # correct. It only shows up by reading the file back.
-        incoming = {
-            key: value
-            for key, value in (("sandbox_id", sandbox_id), ("gateway_host", gateway_host))
-            if value and value != cached.get(key)
-        }
-        if incoming:
-            logger.info("recording %s on identity cache %s", ", ".join(sorted(incoming)), path)
-            _merge_cache(path, incoming)
+    path = Path(state_dir) / HOST_JSON_NAME
+    properties = {"sandbox_id": sandbox_id, "gateway_host": gateway_host}
 
-        return HostIdentity(
-            host_id=host_id,
-            kind=lakebox_kind(),
-            assigned=False,
-            source="cache",
-            # A cached sandbox_id is kept when the caller has none to offer, so a host stays
-            # labelled across boots where the bootstrap has not re-run yet. A fresh value
-            # always wins -- it came from someone who actually knows (ADR-8).
-            sandbox_id=sandbox_id or cached.get("sandbox_id"),
-            gateway_host=gateway_host or cached.get("gateway_host"),
-        )
+    for _ in range(_RESOLVE_ATTEMPTS):
+        state, cached, _ = _load_cache(path)
 
-    # Genuine corruption: content that is present, complete, and not an identity.
-    #
-    # Neither obvious response is acceptable on its own -- silently assigning a new id re-keys
-    # every `session_id` on the host, and refusing to start denies an agent its shells over an
-    # inventory problem. So the file is QUARANTINED (preserved under a new name, so nothing is
-    # destroyed and an operator can still see what it held), a fresh id is assigned, and the
-    # consequence is logged at ERROR. Nothing here is silent.
-    #
-    # ⚠️ This decision rides on the SINGLE read above and must never re-stat the file. An
-    # earlier version asked two questions -- "did the read fail?" then "does the file have
-    # content?" -- and a concurrent winner's `link` landing between them made a perfectly good
-    # identity file look corrupt, so a loser quarantined it and minted a second id. The bug was
-    # in the gap between the two observations, not in either one.
-    if state is _CacheState.CORRUPT:
-        quarantined = _quarantine(path)
-        logger.error(
-            "identity cache %s held unusable content and has been moved aside to %s; "
-            "assigning a NEW host_id. Every session_id on this host is now re-keyed, so any "
-            "session id already handed to an agent will report invalid_name while its tmux "
-            "session keeps running. Inspect the quarantined file.",
-            path,
-            quarantined,
-        )
+        # Step 2. The normal path from boot 2 onward.
+        if cached is not None:
+            if recovered and recovered != cached["host_id"]:
+                # The cache describes a different host than the running tmux server does --
+                # the fork RC-4 warns about. tmux wins: it is the session authority (ADR-5)
+                # and its sessions are what a re-key would strand. Mutating an existing file,
+                # so it goes through the lock and re-reads under it.
+                if not _override_identity(path, cached["host_id"], recovered, properties):
+                    time.sleep(_LOCK_BACKOFF)
+                    continue
+                return _identity(recovered, "tmux", assigned=False, **properties)
 
-    # No cache. Prefer an id recovered from the live tmux server over minting a new one:
-    # this is the "cache deleted while sessions are live" case, the only one where a new id
-    # does real damage.
-    if recovered:
-        logger.warning(
-            "identity cache %s is missing, but the live tmux server is stamped %r; "
-            "re-adopting it rather than assigning a new id, which would re-key every "
-            "session_id on this host.",
-            path,
-            recovered,
-        )
-        _merge_cache(
-            path,
-            {"host_id": recovered, "sandbox_id": sandbox_id, "gateway_host": gateway_host},
-            may_create=True,
-        )
-        return HostIdentity(
-            host_id=recovered,
-            kind=lakebox_kind(),
-            assigned=False,
-            source="tmux",
-            sandbox_id=sandbox_id,
-            gateway_host=gateway_host,
-        )
+            _record_properties(path, cached, properties)
+            return HostIdentity(
+                host_id=cached["host_id"],
+                kind=lakebox_kind(),
+                assigned=False,
+                source="cache",
+                # A cached value is kept when the caller has none to offer, so a host stays
+                # labelled across boots where the bootstrap has not re-run. A fresh value
+                # always wins -- it came from someone who actually knows (ADR-8).
+                sandbox_id=sandbox_id or cached.get("sandbox_id"),
+                gateway_host=gateway_host or cached.get("gateway_host"),
+            )
 
-    # Step 3. Assign. The race is resolved by the filesystem, not by locking: whoever wins
-    # `O_EXCL` is the assigner and everyone else adopts what the winner wrote.
-    candidate = str(uuid.uuid4())
-    host_id, assigned = _create_or_adopt(
-        path, candidate, sandbox_id=sandbox_id, gateway_host=gateway_host
+        # Step 3. No usable identity. When there is no file at all and no stamp to honour,
+        # `os.link` is sufficient arbitration on its own -- no lock, so the common cold-boot
+        # path stays lock-free for all 32 processes.
+        if state is _CacheState.ABSENT and not recovered:
+            host_id, assigned = _create_or_adopt(path, str(uuid.uuid4()), properties)
+            logger.info(
+                "%s host_id %r%s",
+                "assigned" if assigned else "adopted concurrently-assigned",
+                host_id,
+                f" and cached it at {path}" if assigned else f" from {path}",
+            )
+            return _identity(host_id, "assigned", assigned=assigned, **properties)
+
+        # EMPTY, CORRUPT, or ABSENT-with-a-stamp: all mutate or replace what is there, so all
+        # take the lock and re-decide under it.
+        resolved = _replace_unusable(path, recovered, properties)
+        if resolved is None:
+            time.sleep(_LOCK_BACKOFF)
+            continue
+        return resolved
+
+    raise IdentityError(
+        f"could not settle a host identity at {path} after {_RESOLVE_ATTEMPTS} attempts: it is "
+        "being changed continuously by other processes, or a lock is being held and released "
+        "repeatedly. Inspect the state directory."
     )
-    if assigned:
-        logger.info("assigned host_id %r and cached it at %s", host_id, path)
-    else:
-        logger.info("adopted concurrently-assigned host_id %r from %s", host_id, path)
+
+
+def _identity(
+    host_id: str, source: str, *, assigned: bool, **properties: str | None
+) -> HostIdentity:
     return HostIdentity(
         host_id=host_id,
         kind=lakebox_kind(),
         assigned=assigned,
-        source="assigned",
-        sandbox_id=sandbox_id,
-        gateway_host=gateway_host,
+        source=source,
+        sandbox_id=properties.get("sandbox_id"),
+        gateway_host=properties.get("gateway_host"),
     )
 
 
+def _override_identity(
+    path: Path, expected: str, recovered: str, properties: dict[str, str | None]
+) -> bool:
+    """Replace the cached `host_id` with one recovered from tmux. False ⇒ retry the resolution.
+
+    Under the lock throughout, and re-reads under it: if the cache no longer says ``expected``,
+    someone else already changed it and this process's decision was made on stale information.
+    """
+    with _exclusive(path) as acquired:
+        if not acquired:
+            return False
+        _, cached, raw = _load_cache(path)
+        if cached is None or cached["host_id"] != expected:
+            return False
+        logger.warning(
+            "host identity mismatch: cache %s says %r but the live tmux server is stamped %r; "
+            "adopting the tmux value, because its sessions are what a re-key would strand.",
+            path,
+            expected,
+            recovered,
+        )
+        payload = dict(raw or {})
+        payload.update({"version": 1, "host_id": recovered})
+        for key, value in properties.items():
+            if value:
+                payload[key] = value
+        _atomic_write(path, payload)
+        return True
+
+
+def _replace_unusable(
+    path: Path, recovered: str | None, properties: dict[str, str | None]
+) -> HostIdentity | None:
+    """Handle EMPTY / CORRUPT / ABSENT-with-a-stamp. ``None`` ⇒ retry the resolution.
+
+    🔴 **This is where six identities came from.** Quarantine-then-assign is two steps, and with
+    no arbitration two processes each quarantined what the other had just assigned: 32 processes
+    produced 6 distinct ids, 5 quarantine files of which 4 held *live valid identities*, and the
+    ERROR log named a file it had not moved. The fix is not a better quarantine — it is that the
+    whole transaction is serialized and re-decided from a read taken **under** the lock.
+    """
+    with _exclusive(path) as acquired:
+        if not acquired:
+            return None
+
+        state, cached, _ = _load_cache(path)
+        if cached is not None:
+            # Someone else fixed it while we waited. Retry so the normal cache path runs and we
+            # return *their* id -- never a second one.
+            return None
+
+        if state is _CacheState.CORRUPT:
+            quarantined = _quarantine(path)
+            logger.error(
+                "identity cache %s held unusable content and has been moved aside to %s; "
+                "assigning a NEW host_id. Every session_id on this host is now re-keyed, so a "
+                "session id already handed to an agent will report invalid_name while its tmux "
+                "session keeps running. Inspect the quarantined file.",
+                path,
+                quarantined,
+            )
+        elif state is _CacheState.EMPTY:
+            # An empty file has two possible authors, and they want opposite treatment:
+            #
+            #   * a writer that is mid-write RIGHT NOW -- only possible from a build that used
+            #     `O_EXCL` on the final path, i.e. during a rolling upgrade. Replacing it steals
+            #     the name from a live writer, which then writes its own id: two identities.
+            #   * a writer that died, or a stray `touch`. Nothing will ever finish it.
+            #
+            # They are indistinguishable by inspection but trivially separated by *waiting*: the
+            # first resolves within microseconds. So wait out the same window `_adopt_winner`
+            # uses, then treat it as abandoned. That keeps the mid-write adoption AND stops an
+            # empty file being a permanent brick -- an earlier version refused to start on one,
+            # every process, every boot, until a human deleted it, which protected nothing
+            # (there is no `host_id` in an empty file to strand) and cost every shell.
+            for _ in range(_ADOPT_ATTEMPTS):
+                time.sleep(_ADOPT_BACKOFF)
+                if _load_cache(path)[1] is not None:
+                    return None  # it landed; retry so the cache path returns THEIR id
+            logger.error(
+                "identity cache %s has been empty for %.1fs (no host_id to preserve); replacing "
+                "it. A crashed writer or a stray `touch` is the usual cause.",
+                path,
+                _ADOPT_ATTEMPTS * _ADOPT_BACKOFF,
+            )
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.warning("could not remove the empty cache %s: %s", path, exc)
+                return None
+
+        candidate = recovered or str(uuid.uuid4())
+        if recovered:
+            logger.warning(
+                "identity cache %s held no usable id, but the live tmux server is stamped %r; "
+                "re-adopting it rather than assigning a new one, which would re-key every "
+                "session_id on this host.",
+                path,
+                recovered,
+            )
+        # Still through `_create_or_adopt`: holding the lock stops another *lock-taking* process
+        # from racing, but a process on the lock-free cold-boot path above can legitimately link
+        # a file between our unlink and our write. `link` makes that safe -- we adopt theirs.
+        host_id, assigned = _create_or_adopt(path, candidate, properties)
+        source = "tmux" if (recovered and host_id == recovered) else "assigned"
+        return _identity(host_id, source, assigned=assigned, **properties)
+
+
+# --------------------------------------------------------------------------------------
+# The arbitrated create
+# --------------------------------------------------------------------------------------
 def _create_or_adopt(
-    path: Path,
-    candidate: str,
-    *,
-    sandbox_id: str | None,
-    gateway_host: str | None,
+    path: Path, candidate: str, properties: dict[str, str | None]
 ) -> tuple[str, bool]:
     """Claim the identity, or adopt the winner's. Returns ``(host_id, assigned)``.
 
     **Write the content first, then claim the name — never the other way round.** The obvious
     implementation opens the final path with ``O_CREAT|O_EXCL`` and writes into it, which does
-    elect exactly one winner but publishes the file *before* it has content. A loser arriving
-    in that window sees a file that exists and is either empty or **truncated mid-JSON**, and
-    truncated JSON is indistinguishable from corruption by inspection. The first version of
-    this function therefore quarantined the winner's file out from under it and assigned a
-    second id — one sandbox, two hosts, which is the precise failure the exclusive create is
-    here to prevent.
+    elect exactly one winner but publishes the file *before* it has content. A loser arriving in
+    that window sees a file that exists and is either empty or **truncated mid-JSON**, and
+    truncated JSON is indistinguishable from corruption by inspection. An earlier version
+    therefore quarantined the winner's file out from under it and assigned a second id.
 
-    ``os.link`` fixes it structurally rather than by heuristic: it is atomic and it fails with
+    ``os.link`` fixes that structurally rather than by heuristic: it is atomic and fails with
     ``EEXIST`` if the name is taken, so it arbitrates the race exactly as ``O_EXCL`` did — but
-    the directory entry appears only once the content behind it is complete. **A loser can
-    never observe a partial identity file, so no code needs to guess whether one is corrupt.**
+    the directory entry appears only once the content behind it is complete. **A loser can never
+    observe a partial identity file, so no code needs to guess whether one is corrupt.**
 
-    (Discovered by the concurrency test, not by review. It is unreachable without a barrier:
+    (Found by the concurrency test, not by review: it is unreachable without a barrier, because
     serialized process startup lets the winner finish long before a loser looks.)
     """
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload = _payload(candidate, sandbox_id=sandbox_id, gateway_host=gateway_host)
+    payload: dict[str, Any] = {"version": 1, "host_id": candidate}
+    # Absent rather than null when unknown, so a reader cannot mistake "never bootstrapped" for
+    # "the bootstrap told us it is null".
+    for key, value in properties.items():
+        if value:
+            payload[key] = value
     body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
-    # Unique per attempt, not just per pid: two processes can share a pid across a container
-    # boundary, and a stale tmp from a crashed run must never be written into by a live one.
+    # Unique per attempt, not merely per pid: two processes can share a pid across a container
+    # boundary, and a stale staging file from a crashed run must never be written into by a live
+    # one.
     staging = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     # 0600 at open() rather than a later chmod, so the file is never briefly world-readable --
     # it names the host whose owner_email is a workspace admin.
@@ -354,8 +489,8 @@ def _create_or_adopt(
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(body)
             handle.flush()
-            # This file is the sandbox's only durable identity and is written once per sandbox
-            # lifetime, so the cost of an fsync is irrelevant and losing it to a crash is not.
+            # Written once per sandbox lifetime, so the cost is irrelevant and losing it to a
+            # crash is not.
             os.fsync(handle.fileno())
         try:
             os.link(staging, path)
@@ -365,15 +500,19 @@ def _create_or_adopt(
             return _adopt_winner(path), False
         except OSError as exc:
             # Hardlinks are unavailable on a few exotic filesystems. Refusing beats silently
-            # falling back to a racy write: on the one filesystem where that mattered, it would
-            # split hosts invisibly.
+            # falling back to a racy write: on the one filesystem where that mattered, hosts
+            # would split invisibly.
             raise IdentityError(
-                f"could not atomically claim {path} ({exc}). Identity assignment needs "
-                "hardlink support in the state directory; set SHELLBOX_STATE_DIR to a normal "
-                "filesystem, or SHELLBOX_HOST_ID to assign identity explicitly."
+                f"could not atomically claim {path} ({exc}). Identity assignment needs hardlink "
+                "support in the state directory; set SHELLBOX_STATE_DIR to a normal filesystem, "
+                "or SHELLBOX_HOST_ID to assign identity explicitly."
             ) from exc
+        # The fsync above protects the file's *contents*; only fsyncing the directory protects
+        # the name that now points at them.
+        _fsync_dir(path.parent)
         return candidate, True
     finally:
+        # Drops only the second link. `path` keeps the inode.
         try:
             os.unlink(staging)
         except OSError:
@@ -384,115 +523,91 @@ def _adopt_winner(path: Path) -> str:
     """Read the `host_id` of whoever won the race.
 
     Normally one read: `os.link` guarantees the content is complete before the name exists. The
-    retry exists for an identity file left **empty** by something else — a crashed writer from
-    an older build, or an operator's stray `touch` — where waiting briefly is free and assuming
-    corruption would be wrong.
+    retry covers one narrow case -- a **rolling upgrade** from a build that used ``O_EXCL`` on
+    the final path, where a genuinely empty file can be observed between open and write. Nothing
+    in the current module can produce that state.
     """
     for _ in range(_ADOPT_ATTEMPTS):
-        state, adopted = _load_cache(path)
+        state, adopted, _ = _load_cache(path)
         if adopted is not None:
             return adopted["host_id"]
-        if state is _CacheState.CORRUPT:
-            break  # complete content that is not an identity: waiting cannot help
+        if state is not _CacheState.EMPTY:
+            # ABSENT (the winner's file vanished) or CORRUPT: waiting cannot help.
+            break
         time.sleep(_ADOPT_BACKOFF)
-    # Assigning a second id here would split the host, so this is one of the few places where
-    # refusing to start is the least-bad option.
+    # Assigning a second id here would split the host, so refusing is the least-bad option.
     raise IdentityError(
         f"identity cache {path} exists but did not become readable as an identity within "
-        f"{_ADOPT_ATTEMPTS * _ADOPT_BACKOFF:.1f}s. Either the process that created it died "
-        "mid-write, or it is corrupt. Inspect it by hand -- deleting it re-keys every "
-        "session_id on this host."
+        f"{_ADOPT_ATTEMPTS * _ADOPT_BACKOFF:.1f}s. The process that created it may have died "
+        "mid-write, it may be corrupt, or it may be unreadable to this user -- earlier log "
+        "lines say which. Inspect it by hand; deleting it re-keys every session_id on this host."
     ) from None
 
 
-def _merge_cache(path: Path, updates: dict[str, Any], *, may_create: bool = False) -> None:
-    """Merge fields into the cache, preserving every key it already holds.
+# --------------------------------------------------------------------------------------
+# Arbitration for multi-step mutations
+# --------------------------------------------------------------------------------------
+@contextmanager
+def _exclusive(path: Path) -> Iterator[bool]:
+    """Serialize multi-step mutations of ``path``. Yields True to exactly one process.
 
-    **The ONE writer for everything except assignment.** There were three bespoke writers here
-    and each dropped a field the others cared about, because each rebuilt the payload from its
-    own arguments instead of from the file:
+    A lock file rather than `flock`, for the same reason `_create_or_adopt` uses `link`: it is
+    one syscall whose semantics do not vary across the filesystems a `$HOME` can be on.
 
-    * the `sandbox_id` a per-boot bootstrap injects was returned to its caller and never
-      written, so every other process in that boot saw ``None`` and `doctor` reported a
-      bootstrapped host as "never bootstrapped";
-    * the recovery path rebuilt the payload from ``host_id``/``sandbox_id`` alone and therefore
-      **silently deleted `owner_email`**.
-
-    Both were invisible to tests that asserted on the *returned value* rather than on the file.
-    Merging from the file makes a dropped field impossible rather than unlikely.
-
-    ``may_create`` guards the one thing this must never do: invent an identity. Assignment is
-    `_create_or_adopt`'s job and is race-arbitrated; if this function created a cache on a
-    missing file, two processes could both "merge" a `host_id` in and split the host.
+    Yields **False rather than blocking**, so every caller has to decide what to do without the
+    lock. That is deliberate: the right answer is always "re-read and re-decide", never "assume
+    and write".
     """
+    lock = path.with_name(path.name + _LOCK_SUFFIX)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _, existing = _load_cache(path)
-
-    if existing is None:
-        if not (may_create and updates.get("host_id")):
-            # Nothing to merge into, and not allowed to create. Losing a cached owner_email
-            # costs one API call next start; inventing or clobbering a host_id re-keys every
-            # session on the host.
+    try:
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # A lock older than the critical section belonged to a process that died holding it.
+        # Breaking it is safe because every write behind it still goes through `_create_or_adopt`
+        # or a re-read: two processes both believing they hold this cannot both assign.
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age > _LOCK_STALE_SECONDS:
             logger.warning(
-                "not updating identity cache %s: it is missing or unusable, and rewriting it "
-                "would risk the host_id it carries",
-                path,
+                "breaking a stale identity lock %s (%.1fs old); the process holding it appears "
+                "to have died",
+                lock,
+                age,
             )
-            return
-        merged: dict[str, Any] = {"version": 1}
-    else:
-        # Re-read raw so keys this module does not model (a future field, an operator's note)
-        # survive a write by an older build. `_load_cache` returns only the shape-checked keys.
-        merged = _raw_cache(path) or {"version": 1}
-
-    merged.update({k: v for k, v in updates.items() if v})
-    _atomic_write(path, merged)
-
-
-def _raw_cache(path: Path) -> dict[str, Any] | None:
-    """The cache as-is, unvalidated — used only to avoid dropping keys on a merge."""
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+        yield False
+        return
+    except OSError as exc:
+        logger.warning("could not take the identity lock %s: %s", lock, exc)
+        yield False
+        return
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    """`tmp` + `os.replace`, mode 0600.
-
-    Last-writer-wins, which is correct here and *only* here: these callers are not choosing a
-    `host_id`, they are recording a value something more authoritative already decided, so two
-    processes writing concurrently write the same thing. Assignment must never use this — see
-    `_create_or_adopt`, where last-writer-wins would split one sandbox across N hosts.
-    """
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, path)
+        yield True
     finally:
         try:
-            os.unlink(tmp)
+            lock.unlink()
         except OSError:
             pass
 
 
-def _payload(host_id: str, *, sandbox_id: str | None, gateway_host: str | None) -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": 1, "host_id": host_id}
-    # Absent rather than null when unknown, so a reader cannot mistake "we have never been
-    # bootstrapped" for "the bootstrap told us it is null".
-    if sandbox_id:
-        payload["sandbox_id"] = sandbox_id
-    if gateway_host:
-        payload["gateway_host"] = gateway_host
-    return payload
-
-
 def _quarantine(path: Path) -> Path:
-    """Move a corrupt cache aside, preserving it. Returns the new path.
+    """Move a corrupt cache aside, preserving it. Returns its new path.
+
+    ⚠️ **Callers must hold `_exclusive`.** The `exists()`-then-`replace` below is only safe
+    because one process at a time runs it; unguarded, two quarantines moved each other's
+    freshly-assigned identities aside and split one sandbox six ways.
 
     Never deletes: the file names a host whose sessions may still be running, and its contents
     are the only evidence of what that host's identity used to be.
@@ -509,71 +624,163 @@ def _quarantine(path: Path) -> Path:
     return path  # pragma: no cover - 999 corrupt caches is someone else's problem
 
 
-def _load_cache(path: Path) -> tuple[_CacheState, dict[str, Any] | None]:
-    """Read and **shape-check** the cache in ONE observation.
+# --------------------------------------------------------------------------------------
+# Reading and property writes
+# --------------------------------------------------------------------------------------
+def _load_cache(path: Path) -> tuple[_CacheState, dict[str, Any] | None, dict[str, Any] | None]:
+    """Read and shape-check the cache in ONE observation.
 
-    Returns a state as well as the data, because callers must distinguish *why* they got
-    nothing, and the difference decides whether a file gets quarantined. Splitting that
-    judgement across two filesystem calls is what made a live winner's file look corrupt to a
-    concurrent loser -- see `resolve_host_id`.
-
-    Shape-checked rather than trusted, following the idiom #11's review established for the
-    tmux incarnation: a file that parses as JSON but holds the wrong shape is a likelier
-    failure than a missing one, and a `host_id` of ``None`` or ``[]`` would propagate into
-    every `session_id` on the host before anything noticed.
+    Returns ``(state, checked, raw)``. ``checked`` holds only the keys this module models and is
+    ``None`` unless the state is ``OK``; ``raw`` is the file as parsed, so a merge can preserve
+    keys a future build adds without a second read. Handing back both from one `read_text` is
+    the point -- a caller that reads twice to answer one question is the bug this signature
+    exists to prevent.
     """
     try:
-        raw = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return _CacheState.ABSENT, None
+        return _CacheState.ABSENT, None, None
     except OSError as exc:
         # Unreadable is NOT corrupt: a permissions or I/O problem must never cause the file to
         # be moved aside, because moving it aside re-keys every session on the host.
         logger.warning("identity cache %s is unreadable (%s); treating as absent", path, exc)
-        return _CacheState.ABSENT, None
+        return _CacheState.ABSENT, None, None
 
-    if not raw.strip():
-        # Empty. With link-after-write we never publish an empty identity file, so this is a
-        # stray `touch` or a crashed writer from an older build. Not corrupt -- there is nothing
-        # in it to preserve or to have been damaged -- and not usable either.
-        return _CacheState.EMPTY, None
+    if not text.strip():
+        return _CacheState.EMPTY, None, None
 
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(text)
     except ValueError:
         logger.error(
-            "identity cache %s is not valid JSON; it will be preserved rather than "
-            "overwritten, because a new host_id re-keys every session_id on this host.",
+            "identity cache %s is not valid JSON; it will be preserved rather than overwritten, "
+            "because a new host_id re-keys every session_id on this host.",
             path,
         )
-        return _CacheState.CORRUPT, None
+        return _CacheState.CORRUPT, None, None
     if not isinstance(parsed, dict):
         logger.error("identity cache %s holds %s, not an object", path, type(parsed).__name__)
-        return _CacheState.CORRUPT, None
-    host_id = parsed.get("host_id")
-    if not isinstance(host_id, str) or not host_id.strip():
-        logger.error("identity cache %s has no usable host_id (%r)", path, host_id)
-        return _CacheState.CORRUPT, None
-    # A colon would split `f"{host_id}:{tmux_name}"` ambiguously. `server.py` uses
-    # `rpartition` so the LAST colon separates, which is safe for a uuid4 but not for an
-    # arbitrary hand-edited value -- so reject it here rather than let it corrupt targeting.
-    if ":" in host_id:
-        logger.error(
-            "identity cache %s has a host_id containing ':' (%r); session ids are "
-            "'<host_id>:<tmux_name>', so this would make them ambiguous",
-            path,
-            host_id,
-        )
-        return _CacheState.CORRUPT, None
+        return _CacheState.CORRUPT, None, None
 
-    result: dict[str, Any] = {"host_id": host_id}
+    problem = _host_id_problem(parsed.get("host_id"))
+    if problem:
+        logger.error("identity cache %s has an unusable host_id: it %s", path, problem)
+        return _CacheState.CORRUPT, None, parsed
+
+    checked: dict[str, Any] = {"host_id": parsed["host_id"]}
     for optional in ("sandbox_id", "gateway_host"):
         value = parsed.get(optional)
         if isinstance(value, str) and value.strip():
-            result[optional] = value
-    return _CacheState.OK, result
+            checked[optional] = value
+    return _CacheState.OK, checked, parsed
 
 
+def _record_properties(
+    path: Path, cached: dict[str, Any], properties: dict[str, str | None]
+) -> None:
+    """Persist a `sandbox_id`/`gateway_host` the caller brought that the cache lacks.
+
+    🔴 Without this, ADR-8 does not work past the first boot. The bootstrap path runs **every
+    boot** and is the only actor that knows the sandbox id, but from boot 2 onward it takes the
+    cache-hit branch -- so the id was handed back to that one caller and never written, leaving
+    the other 1-31 processes in the boot with ``None``, `doctor` reporting a bootstrapped host as
+    "never bootstrapped", and the `hosts` row losing a column it had. Invisible to any assertion
+    on the *returned* value, which was correct throughout.
+
+    Best-effort by design: if another process holds the lock, the write is skipped rather than
+    queued. These are properties, not identity -- the next start records them, and no caller's
+    correctness depends on the write having happened by the time this returns.
+    """
+    incoming = {
+        key: value for key, value in properties.items() if value and value != cached.get(key)
+    }
+    if not incoming:
+        return
+    logger.info("recording %s on identity cache %s", ", ".join(sorted(incoming)), path)
+    _merge_properties(path, incoming, expected_host_id=cached["host_id"])
+
+
+def _merge_properties(
+    path: Path, updates: dict[str, Any], *, expected_host_id: str | None = None
+) -> None:
+    """Merge non-identity fields into the cache, preserving everything else.
+
+    **Never writes `host_id`.** That is not a stylistic split, it is what makes a lost update
+    harmless: this is a read-modify-write, so a concurrent writer's change can be overwritten by
+    a stale snapshot -- and when the field in that snapshot was `host_id`, the effect was to
+    silently *revert* an identity, undoing the tmux-wins reconciliation and sending the next boot
+    back to the previous id. Properties are idempotent and re-derived every start, so losing one
+    costs an API call; losing an identity change costs every session on the host.
+
+    Identity therefore only ever changes through `_create_or_adopt` or `_override_identity`,
+    both arbitrated. This function also never *creates* the cache: if a merge could, two
+    processes could each merge a `host_id` into a missing file and split the host through the
+    back door.
+    """
+    with _exclusive(path) as acquired:
+        if not acquired:
+            logger.debug("skipping a property write to %s: another process holds the lock", path)
+            return
+        _, cached, raw = _load_cache(path)
+        if cached is None or raw is None:
+            logger.warning(
+                "not updating identity cache %s: it is missing or unusable, and rewriting it "
+                "would risk the host_id it carries",
+                path,
+            )
+            return
+        if expected_host_id is not None and cached["host_id"] != expected_host_id:
+            # The identity changed while we were deciding; our update was computed against a
+            # host that is no longer this one.
+            logger.info("skipping a property write to %s: the host_id changed underneath", path)
+            return
+        payload = dict(raw)
+        payload.update({key: value for key, value in updates.items() if value})
+        payload["host_id"] = cached["host_id"]  # belt and braces: never let `updates` move it
+        _atomic_write(path, payload)
+
+
+def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
+    """`tmp` + `os.replace`, mode 0600. **Callers must hold `_exclusive`.**
+
+    `os.replace` is last-writer-wins, which is why this is never the arbiter of an identity --
+    see `_create_or_adopt`. It is correct for a caller that has already been serialized and has
+    re-read the file under the lock.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Persist a directory entry, so a crash cannot lose the name a written file now has."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - not all filesystems allow it
+        pass
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------------------
+# owner_email
+# --------------------------------------------------------------------------------------
 def resolve_owner_email(
     state_dir: str,
     *,
@@ -591,9 +798,9 @@ def resolve_owner_email(
     case was documented as *the* normal path after the PAT reset, on the strength of the CLI's
     OAuth token cache serving in-sandbox API calls. That holds **within one boot only**:
     `~/.databricks/token-cache.json` is boot-templated into wiped `/run`
-    (`docs/sandbox-environment.md` §3), so after a restart a PAT-reset sandbox has no
-    credential at all until the login is re-run. The cache is then the *only* source, which is
-    exactly why it is written before the `hosts` row and never expired.
+    (`docs/sandbox-environment.md` §3), so after a restart a PAT-reset sandbox has no credential
+    at all until the login is re-run. The cache is then the *only* source, which is exactly why
+    it is written before the `hosts` row and never expired.
     """
     path = Path(state_dir) / HOST_JSON_NAME
     cached_email = _read_cached_owner(path)
@@ -607,33 +814,30 @@ def resolve_owner_email(
                 cached_email,
                 credential_email,
             )
-            _merge_cache(path, {"owner_email": credential_email})
+            _merge_properties(path, {"owner_email": credential_email})
             return OwnerResolution(credential_email, source="credential", reconciled=True)
         if not cached_email:
-            _merge_cache(path, {"owner_email": credential_email})
+            _merge_properties(path, {"owner_email": credential_email})
         return OwnerResolution(credential_email, source="credential")
 
     if cached_email:
         return OwnerResolution(cached_email, source="cache")
     if env_email:
         return OwnerResolution(env_email, source="env")
-    # E2d. Enrollment defers; the tool surface keeps working with NullRegistry semantics,
-    # because a shell an agent cannot get is a worse outcome than an inventory row nobody
-    # reads. `doctor` is where this becomes visible.
+    # E2d. Enrollment defers; the tool surface keeps working with NullRegistry semantics, because
+    # a shell an agent cannot get is a worse outcome than an inventory row nobody reads.
+    # `doctor` is where this becomes visible.
     logger.warning(
-        "no credential, no cached owner_email, and SHELLBOX_OWNER_EMAIL is unset: "
-        "enrollment is DEFERRED and will be retried. Shell tools still work. "
-        "Run `shellbox-mcp doctor` to see why no credential was available."
+        "no credential, no cached owner_email, and SHELLBOX_OWNER_EMAIL is unset: enrollment is "
+        "DEFERRED and will be retried. Shell tools still work. Run `shellbox-mcp doctor` to see "
+        "why no credential was available."
     )
     return OwnerResolution(None, source="deferred")
 
 
 def _read_cached_owner(path: Path) -> str | None:
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    _, _, raw = _load_cache(path)
+    if raw is None:
         return None
-    if not isinstance(parsed, dict):
-        return None
-    email = parsed.get("owner_email")
+    email = raw.get("owner_email")
     return email if isinstance(email, str) and email.strip() else None

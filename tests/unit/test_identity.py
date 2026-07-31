@@ -43,20 +43,26 @@ CONCURRENT_WORKERS = 32
 RACE_ROUNDS = 3
 
 
-def _resolve_at_barrier(state_dir: str, barrier: object, results: object) -> None:
+def _resolve_at_barrier(
+    state_dir: str, barrier: object, results: object, recovered: str | None = None
+) -> None:
     """Wait at the barrier, then resolve. Module-level so it survives `spawn` pickling.
 
     Exceptions are *recorded*, never raised: a child that dies takes its result with it, and
     "31 processes raised IdentityError" is precisely the failure this test exists to catch, so
     it has to arrive as data rather than as a lost traceback.
     """
+    barrier_ok = True
     try:
         barrier.wait(timeout=30)  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 - a broken barrier must not mask the identity result
-        pass
+        # Recorded, not swallowed: a failed barrier degrades the round to the serialized
+        # startup this test exists to defeat, and a silently degraded round looks green.
+        barrier_ok = False
     try:
-        identity = resolve_host_id(state_dir)
-        results.append((identity.host_id, identity.assigned, identity.source))  # type: ignore[attr-defined]
+        identity = resolve_host_id(state_dir, recovered=recovered)
+        source = identity.source if barrier_ok else f"{identity.source}/barrier-failed"
+        results.append((identity.host_id, identity.assigned, source))  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         results.append(("<error>", False, f"{type(exc).__name__}: {exc}"))  # type: ignore[attr-defined]
 
@@ -72,7 +78,9 @@ def _cache(state_dir: Path) -> dict[str, object]:
     return parsed
 
 
-def _race_once(state_dir: Path) -> list[tuple[str, bool, str]]:
+def _race_once(
+    state_dir: Path, *, recovered_for: set[int] | None = None, recovered: str = "from-tmux"
+) -> list[tuple[str, bool, str]]:
     """Release `CONCURRENT_WORKERS` real processes into `resolve_host_id` simultaneously.
 
     Explicit `Process` objects rather than a pool: with a pool, `map` may hand two tasks to one
@@ -83,9 +91,15 @@ def _race_once(state_dir: Path) -> list[tuple[str, bool, str]]:
         results = manager.list()
         workers = [
             multiprocessing.Process(
-                target=_resolve_at_barrier, args=(str(state_dir), barrier, results)
+                target=_resolve_at_barrier,
+                args=(
+                    str(state_dir),
+                    barrier,
+                    results,
+                    recovered if recovered_for and index in recovered_for else None,
+                ),
             )
-            for _ in range(CONCURRENT_WORKERS)
+            for index in range(CONCURRENT_WORKERS)
         ]
         for worker in workers:
             worker.start()
@@ -104,47 +118,59 @@ def test_concurrent_first_boot_yields_exactly_one_host_id(tmp_path: Path) -> Non
     session rows for a single shared tmux server land under different hosts, and each process
     rejects its siblings' live session ids as `invalid_name`.
     """
-    adopters_across_rounds = 0
+    adopters_seen = 0
+    rounds_run = 0
 
-    for round_index in range(RACE_ROUNDS):
-        state_dir = tmp_path / f"round{round_index}"
+    # Extra rounds are allowed *only* to observe a genuine EEXIST, never to get a passing
+    # assertion: every correctness check below runs on every round. On a 1-2 vCPU runner the
+    # winner can finish before the next process is scheduled even after the barrier releases,
+    # which yields zero adopters on completely correct code -- so that condition retries rather
+    # than failing, and only a total absence across every round is a failure.
+    while rounds_run < RACE_ROUNDS or (adopters_seen == 0 and rounds_run < RACE_ROUNDS * 3):
+        state_dir = tmp_path / f"round{rounds_run}"
         state_dir.mkdir()
         results = _race_once(state_dir)
+        rounds_run += 1
 
         assert len(results) == CONCURRENT_WORKERS, (
-            f"round {round_index}: {len(results)} of {CONCURRENT_WORKERS} workers reported"
+            f"round {rounds_run}: {len(results)} of {CONCURRENT_WORKERS} workers reported"
         )
         errors = [source for host_id, _, source in results if host_id == "<error>"]
-        assert not errors, f"round {round_index}: workers failed to resolve an identity: {errors}"
+        assert not errors, f"round {rounds_run}: workers failed to resolve an identity: {errors}"
+        degraded = [source for _, _, source in results if source.endswith("/barrier-failed")]
+        assert not degraded, (
+            f"round {rounds_run}: {len(degraded)} workers failed to reach the barrier, so this "
+            "round did not race at all"
+        )
 
         host_ids = {host_id for host_id, _, _ in results}
         assert len(host_ids) == 1, (
-            f"round {round_index}: {len(host_ids)} distinct host_ids across "
+            f"round {rounds_run}: {len(host_ids)} distinct host_ids across "
             f"{CONCURRENT_WORKERS} concurrent processes: {host_ids}. See identity.py's module "
             "docstring for what N identities do to session_id and the hosts table."
         )
 
         assigners = [host_id for host_id, assigned, _ in results if assigned]
         assert len(assigners) == 1, (
-            f"round {round_index}: {len(assigners)} processes claim to have ASSIGNED the id; "
+            f"round {rounds_run}: {len(assigners)} processes claim to have ASSIGNED the id; "
             "exactly one may win the exclusive create and the rest must adopt"
         )
 
         # The surviving file holds the id everyone returned — not merely *an* id.
-        cached = json.loads((state_dir / HOST_JSON_NAME).read_text())
-        assert cached["host_id"] == next(iter(host_ids))
+        assert _cache(state_dir)["host_id"] == next(iter(host_ids))
 
         # `source == "assigned"` with `assigned is False` is reachable only through the
         # `FileExistsError` handler, so this counts processes that genuinely lost the race.
         # A cache hit reports `source == "cache"` instead.
-        adopters_across_rounds += sum(
+        adopters_seen += sum(
             1 for _, assigned, source in results if source == "assigned" and not assigned
         )
 
-    assert adopters_across_rounds > 0, (
-        f"across {RACE_ROUNDS} rounds of {CONCURRENT_WORKERS} barrier-released processes, not "
-        "one observed EEXIST — every worker took the cache-hit path, so the adopt-the-winner "
-        "branch was never executed and this test proved nothing. Fix the test, not the code."
+    assert adopters_seen > 0, (
+        f"across {rounds_run} rounds of {CONCURRENT_WORKERS} barrier-released processes, not one "
+        "observed EEXIST — every worker took the cache-hit path, so the adopt-the-winner branch "
+        "never executed and this test proved nothing. Either process startup is serialized on "
+        "this machine despite the barrier, or the barrier is not doing its job."
     )
 
 
@@ -210,7 +236,7 @@ def test_recovered_id_is_adopted_when_the_cache_is_gone(tmp_path: Path) -> None:
     would re-key every `session_id` and strand running sessions as unaddressable.
     """
     identity = resolve_host_id(str(tmp_path), recovered="from-tmux")
-    assert (identity.host_id, identity.source, identity.assigned) == ("from-tmux", "tmux", False)
+    assert (identity.host_id, identity.source) == ("from-tmux", "tmux")
     # And it is re-cached, so the recovery happens once rather than on every call.
     assert json.loads((tmp_path / HOST_JSON_NAME).read_text())["host_id"] == "from-tmux"
 
@@ -280,20 +306,16 @@ def test_corrupt_cache_reassignment_is_logged_at_error(
     )
 
 
-def test_the_losers_wait_out_the_winners_write(tmp_path: Path) -> None:
-    """🔴 The bug the barrier found. An EMPTY cache file is the exclusive-create winner caught
-    between `os.open` and `json.dump`, so a loser must **wait** for it, not fail.
+def test_a_winners_content_landing_late_is_adopted_never_duplicated(tmp_path: Path) -> None:
+    """The bug the barrier found, kept as a regression guard.
 
-    The first version of `identity.py` classified this correctly and then raised anyway,
-    calling it "retryable" with nothing retrying — so a genuine 32-way first-boot race failed
-    for 31 of 32 processes. Serialized process startup meant no test could reach it: worker 1
-    finished writing long before worker 2 looked.
-
-    Simulated here rather than raced, so the assertion is deterministic: hold the file empty,
-    then land the real content while the loser is waiting.
+    An empty-then-filled file is what a build using `O_EXCL` on the final path looks like
+    mid-write, which is reachable during a rolling upgrade. Whatever route the code takes, the
+    one unacceptable outcome is minting a *second* id — so this asserts the winner's value is
+    adopted and that the file agrees.
     """
     path = tmp_path / HOST_JSON_NAME
-    path.write_text("")  # a winner has opened it and not yet written
+    path.write_text("")  # a writer has opened it and not yet written
 
     def finish_the_write() -> None:
         time.sleep(0.05)
@@ -307,28 +329,27 @@ def test_the_losers_wait_out_the_winners_write(tmp_path: Path) -> None:
         writer.join()
 
     assert identity.host_id == "the-winners-id", (
-        "the loser did not adopt the winner's id; if it minted its own, one sandbox is now two "
-        "hosts — the exact split the exclusive create exists to prevent"
+        "a second id was minted while a writer was mid-write; one sandbox is now two hosts"
     )
-    assert (identity.source, identity.assigned) == ("assigned", False)
-    assert not list(tmp_path.glob(f"{HOST_JSON_NAME}.corrupt.*")), (
-        "the winner's file must never be quarantined — that would move it out from under a "
-        "live writer and let this process assign a second identity"
-    )
+    assert _cache(tmp_path)["host_id"] == "the-winners-id"
 
 
-def test_a_permanently_empty_cache_eventually_raises(tmp_path: Path) -> None:
-    """A winner that died between `os.open` and `json.dump` leaves an empty file forever.
+def test_an_empty_cache_is_replaced_rather_than_bricking_the_host(tmp_path: Path) -> None:
+    """An EMPTY file has no `host_id`, so there is nothing to preserve and nothing to strand.
 
-    Waiting cannot fix that, and neither can assigning: a second id splits the host. So it
-    raises — the one outcome that neither corrupts the inventory nor hides the problem — and
-    the file is left exactly as found for whoever investigates.
+    An earlier version refused to start on it — every process, every boot, forever, until a
+    human deleted the file. That protected nothing (no prior identity existed to be re-keyed)
+    and cost the sandbox every shell, so `_CacheState.EMPTY`'s "nothing to preserve" is now
+    acted on rather than merely documented.
     """
     path = tmp_path / HOST_JSON_NAME
     path.write_text("")
-    with pytest.raises(IdentityError, match="did not become readable"):
-        resolve_host_id(str(tmp_path))
-    assert path.exists()
+
+    identity = resolve_host_id(str(tmp_path))
+
+    assert identity.source == "assigned"
+    assert _cache(tmp_path)["host_id"] == identity.host_id
+    # Not quarantined: there was no content worth keeping.
     assert not list(tmp_path.glob(f"{HOST_JSON_NAME}.corrupt.*"))
 
 
@@ -490,3 +511,163 @@ def test_owner_is_not_cached_when_it_would_risk_the_host_id(tmp_path: Path) -> N
     result = resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
     assert result.owner_email == "owner@example.com", "the caller still gets the resolved value"
     assert "owner_email" not in json.loads(path.read_text())
+
+
+# ----------------------------------------------------------- the other three races
+def test_concurrent_resolution_against_a_corrupt_cache_yields_one_host_id(
+    tmp_path: Path,
+) -> None:
+    """🔴 Regression guard for the worst bug found in this module.
+
+    Quarantine-then-assign is two steps, and nothing arbitrated them. P1 moved the corrupt file
+    aside and linked identity U; P2 — still acting on its own earlier read — then "quarantined"
+    what was now **P1's valid identity** and linked V. Repeated 32 times, measured: 6 distinct
+    host_ids, 5 quarantine files of which 4 held live valid identities, 28 of 32 processes
+    running under an id absent from the cache, and an ERROR naming a file it had not moved.
+
+    Three separate promises failed at once, so all three are asserted here.
+    """
+    for round_index in range(RACE_ROUNDS):
+        state_dir = tmp_path / f"corrupt{round_index}"
+        state_dir.mkdir()
+        (state_dir / HOST_JSON_NAME).write_text("not json at all")
+
+        results = _race_once(state_dir)
+        errors = [source for host_id, _, source in results if host_id == "<error>"]
+        assert not errors, f"round {round_index}: {errors}"
+
+        host_ids = {host_id for host_id, _, _ in results}
+        assert len(host_ids) == 1, (
+            f"round {round_index}: {len(host_ids)} distinct host_ids from one corrupt cache: "
+            f"{host_ids}. Concurrent quarantines are destroying each other's identities."
+        )
+        # Every process agrees with the file — the invariant, not a proxy for it.
+        assert _cache(state_dir)["host_id"] == next(iter(host_ids))
+
+        # "Nothing is destroyed" must mean the CORRUPT content, not a valid identity that
+        # happened to be at the path when a stale decision was acted on.
+        quarantined = sorted(state_dir.glob(f"{HOST_JSON_NAME}.corrupt.*"))
+        for quarantine_file in quarantined:
+            body = quarantine_file.read_text()
+            assert body == "not json at all", (
+                f"{quarantine_file.name} holds {body!r} rather than the corrupt content — a "
+                "live identity was moved aside"
+            )
+        assert len(quarantined) == 1, (
+            f"round {round_index}: {len(quarantined)} quarantine files for one corrupt cache; "
+            "only the process that actually handled it may create one"
+        )
+
+
+def test_a_tmux_stamp_shared_by_every_process_yields_exactly_that_id(tmp_path: Path) -> None:
+    """The realistic recovery case: `host.json` was lost while tmux sessions are still live.
+
+    `enroll.py` reads `@shellbox_host_id` once and hands it to every process, so all 32 carry
+    the same stamp. They must converge on it and never mint a uuid — a fresh id here re-keys
+    every `session_id` on a host whose sessions are running and addressable.
+    """
+    for round_index in range(RACE_ROUNDS):
+        state_dir = tmp_path / f"stamped{round_index}"
+        state_dir.mkdir()
+
+        results = _race_once(state_dir, recovered_for=set(range(CONCURRENT_WORKERS)))
+        errors = [source for host_id, _, source in results if host_id == "<error>"]
+        assert not errors, f"round {round_index}: {errors}"
+
+        host_ids = {host_id for host_id, _, _ in results}
+        assert host_ids == {"from-tmux"}, (
+            f"round {round_index}: expected every process to adopt the tmux stamp, got {host_ids}"
+        )
+        assert _cache(state_dir)["host_id"] == "from-tmux"
+
+
+def test_a_mixed_stamp_race_converges_on_the_stamp_and_invents_nothing(tmp_path: Path) -> None:
+    """Only some processes carry a stamp — a `show-options` against a contended server can fail.
+
+    ⚠️ **Two ids is the correct outcome here, and that is not a weaker assertion than it looks.**
+    A process that resolves *before* the override legitimately returns the assigned uuid; it
+    cannot know a stamp is about to win. What must hold is that the race invents nothing beyond
+    those two, the file converges on the stamp so every later start agrees, and each stamp-carrier
+    returns the stamp rather than a silent no-op — which is exactly what the old code did: it
+    logged "re-adopting it" while writing nothing, and returned an id in no cache.
+    """
+    for round_index in range(RACE_ROUNDS):
+        state_dir = tmp_path / f"mixed{round_index}"
+        state_dir.mkdir()
+
+        results = _race_once(state_dir, recovered_for={0, 1, 2})
+        errors = [source for host_id, _, source in results if host_id == "<error>"]
+        assert not errors, f"round {round_index}: {errors}"
+
+        host_ids = {host_id for host_id, _, _ in results}
+        assert len(host_ids) <= 2, (
+            f"round {round_index}: {len(host_ids)} distinct host_ids: {host_ids}. At most two are "
+            "explicable (the assigned uuid and the stamp); a third means the transaction is "
+            "unarbitrated again."
+        )
+        assert _cache(state_dir)["host_id"] == "from-tmux", (
+            "the tmux stamp must win in the file, or hosts with live sessions never converge"
+        )
+        for host_id, _, source in results:
+            if source == "tmux":
+                assert host_id == "from-tmux", (
+                    f"a process reported source='tmux' but returned {host_id!r} — the old silent "
+                    "no-op, where the log claimed a write that never happened"
+                )
+        # Nothing here is corrupt, so nothing may be quarantined.
+        assert not list(state_dir.glob(f"{HOST_JSON_NAME}.corrupt.*"))
+
+
+def test_a_property_write_can_never_change_the_host_id(tmp_path: Path) -> None:
+    """Property writes are read-modify-write, so a stale snapshot can overwrite a newer one.
+
+    That is tolerable for `sandbox_id`/`owner_email` — idempotent, re-derived every start — and
+    intolerable for `host_id`, where it silently REVERTED the tmux-wins reconciliation and sent
+    the next boot back to the previous identity. So the property writer refuses to carry a
+    `host_id` at all, and identity only changes through the arbitrated paths.
+    """
+    resolve_host_id(str(tmp_path))
+    reconciled = resolve_host_id(str(tmp_path), recovered="from-tmux").host_id
+    assert reconciled == "from-tmux"
+
+    # An unrelated owner write, exactly as `resolve_owner_email` issues it.
+    resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
+
+    assert _cache(tmp_path)["host_id"] == "from-tmux", (
+        "an owner_email write reverted the host_id; the tmux-wins reconciliation was undone by "
+        "an unrelated field"
+    )
+    assert resolve_host_id(str(tmp_path)).host_id == "from-tmux"
+
+
+# ------------------------------------------------------- validation of every input
+@pytest.mark.parametrize(
+    "bad",
+    # No "" case: an empty env var means UNSET, which `if explicit:` handles by falling
+    # through to normal resolution. Whitespace-only is different — someone meant something.
+    ["a:b", "lakebox:abc", "   ", "x\ty", "x y", "trailing ", "\nid"],
+)
+def test_an_explicit_host_id_is_validated(tmp_path: Path, bad: str) -> None:
+    """`$SHELLBOX_HOST_ID` used to bypass every check the cache reader applied.
+
+    A colon makes `<host_id>:<tmux_name>` ambiguous and a TAB corrupts the TAB-delimited
+    list-sessions record, so neither may be accepted. Operator-set, so this refuses loudly
+    rather than silently running under something else.
+    """
+    with pytest.raises(IdentityError, match="SHELLBOX_HOST_ID"):
+        resolve_host_id(str(tmp_path), explicit=bad)
+
+
+@pytest.mark.parametrize("bad", ["a:b", "lakebox:abc", "   ", "x\ty"])
+def test_a_bad_tmux_stamp_is_ignored_not_fatal(tmp_path: Path, bad: str) -> None:
+    """The mirror case, decided the other way.
+
+    A stamp comes from a tmux user option that any agent on the shared server can set, so
+    refusing would let one bad `set-option` deny every agent its shells. It is dropped with an
+    ERROR and resolution continues. The old code accepted it, PERSISTED it, and detonated one
+    boot later with an error blaming the file.
+    """
+    identity = resolve_host_id(str(tmp_path), recovered=bad)
+    assert identity.host_id != bad
+    assert identity.source == "assigned"
+    assert _cache(tmp_path)["host_id"] == identity.host_id

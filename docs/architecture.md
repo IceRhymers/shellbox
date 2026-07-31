@@ -44,23 +44,42 @@ sandbox dials out and why `App→SSH→tmux attach` is excluded twice over.
 
 ### Phase 2 — session plane
 
-Planned in detail at [`.omc/plans/phase-2-session-plane.md`](../.omc/plans/phase-2-session-plane.md)
-(revision 4; Architect and Critic both APPROVE). §7 of that plan is **transcribed from an executable
-spike**, [`spike/tmux_spike.py`](../spike/tmux_spike.py), after three rounds of prose review kept
-finding new defects in freshly-rewritten command blocks.
+The Phase 2 plan is a working document kept outside version control (`.omc/` is
+`.gitignore`d), so it is deliberately not linked here — an earlier revision of this file
+linked a path no clone contains. §7 of that plan is **transcribed from an executable spike**,
+[`spike/tmux_spike.py`](../spike/tmux_spike.py), after three rounds of prose review kept
+finding new defects in freshly-rewritten command blocks. The measured sandbox facts the plan
+depends on are committed at [`docs/sandbox-environment.md`](sandbox-environment.md), with the
+probe and its raw output alongside them.
 
 - **The PAT is stamped first, then reset — and the reset belongs to the bootstrap path, not
   `serve`.** Enrolment order is fixed: resolve identity via `current_user.me()` → cache
   `owner_email`/`host_id` to `$HOME/.shellbox/host.json` → write the `hosts` row → *(bootstrap only)*
   reset `~/.databrickscfg`. Deleting the PAT inside `serve` would strand the sandbox with no
-  workspace credential before Phase 3's OAuth login exists. Note `~/.databrickscfg` is a **symlink
-  into tmpfs `/run`**, so the reset must remove the *symlink* and write a regular `$HOME` file, and it
-  is inherently a **per-boot** operation rather than one-shot.
+  workspace credential before Phase 3's OAuth login exists. `~/.databrickscfg` is a **symlink into
+  `/run/lakebox/`**, re-pointed by `ln -sfn` on **every** boot by
+  `/etc/lakebox/setup-home-directory.sh`, so the reset must remove the *symlink*, write a regular
+  `$HOME` file, and run **per boot** rather than once. (An earlier revision justified this with
+  "`/run` is tmpfs". That is unverifiable from inside — `/proc/mounts` lists only the overlay root —
+  and unnecessary: `/run` is *measurably wiped between boots*, which is what the code needs.
+  See [`docs/sandbox-environment.md`](sandbox-environment.md) §3.)
+- ⚠️ **Two things make the reset harder than it looks**, both measured after the plan was
+  written: PID 1 exports `DATABRICKS_CONFIG_FILE=/run/lakebox/databrickscfg`, which **overrides
+  the `~/` path**, so where an agent inherits it the reset is a silent no-op; and
+  `~/.databricks/token-cache.json` is boot-templated too (currently a *dangling* symlink), so the
+  CLI's OAuth token cache does **not** survive a boot — a PAT-reset sandbox has no workspace
+  credential at all after a restart until the login is re-run. The second is Phase 3's to own.
 - Identity stamping (D4) is confirmed viable: the ambient credential authenticates
   as the sandbox creator, and the Lakebox API exposes **no owner field**, so
   stamping host-side really is the only way to answer "whose sandbox is this."
   The `$HOME` cache is **reconciled** against the credential whenever one is available (credential
   wins, mismatch logs loudly) rather than short-circuiting on it.
+- **A sandbox cannot learn its own `sandbox_id`** — not from its environment, its disk, its
+  hostname, or even PID 1's environment. So `host_id` is a **self-assigned uuid4** persisted to
+  `$HOME/.shellbox/host.json` under an exclusive create (1–32 concurrent processes must adopt one
+  winner, not mint one identity each), and `sandbox_id` is **injected by the bootstrap path**,
+  which runs from outside and does know it. `/etc/machine-id` must never be used: it is
+  image-baked, so it is identical on every sandbox from that image.
 - **tmux 3.4 is already present at `/usr/bin/tmux`, so vendoring a static binary (D10) is optional,
   not required.** The binary is resolved from `$SHELLBOX_TMUX_BIN` before falling back to `PATH`, and
   the resolved path and version are recorded on the `hosts` row so an image bump is visible in the

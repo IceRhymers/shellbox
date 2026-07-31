@@ -198,3 +198,41 @@ def test_validate_socket_path_counts_bytes_not_characters() -> None:
 def test_session_id_is_deterministic() -> None:
     assert naming.session_id("host-1", "build") == "host-1:build"
     assert naming.session_id("host-1", "build") == naming.session_id("host-1", "build")
+
+
+# --- Regressions found in code review of PR #11 -------------------------------------------
+
+
+def test_a_trailing_newline_in_a_session_name_is_rejected() -> None:
+    """``$`` also matches BEFORE a trailing newline in Python; ``\\Z`` does not.
+
+    This is not a cosmetic validation nit. ``new-session -s "build\\n"`` SUCCEEDS, and then
+    every ``set-option -t '=build\\n:'`` in the create chain fails, so the chain returns rc=1
+    and the caller sees ``not_found`` -- while a session with no incarnation is left behind on
+    the tmux server that every pooled agent shares. It can never be reached through
+    ``target()``, ``shell_kill`` refuses it for having no incarnation, and it appears in
+    ``shell_list`` as ``foreign`` forever.
+    """
+    for name in ("build\n", "build\r\n", "build\n\n"):
+        with pytest.raises(InvalidName):
+            naming.validate_session_name(name)
+
+
+def test_a_nul_in_cwd_is_bad_cwd_and_not_a_raw_valueerror() -> None:
+    """NUL must be rejected at the boundary, like TAB/CR/LF.
+
+    ``os.path.realpath`` raises ``ValueError("embedded null character")`` before any of the
+    record-corruption checks run, so without NUL in the forbidden set the caller got
+    ``tmux_error`` wrapping a raw ValueError instead of ``bad_cwd``. An agent branching on
+    ``bad_cwd`` to retry somewhere else would read a bad argument as an infrastructure
+    failure. ``validate_env`` already rejected NUL; this keeps the two consistent.
+    """
+    with pytest.raises(BadCwd):
+        naming.validate_cwd("/tmp/a" + chr(0) + "b")
+
+
+def test_the_length_boundary_still_holds_after_the_anchor_change() -> None:
+    """Guard against ``\\Z`` having moved the 1-64 boundary as a side effect."""
+    naming.validate_session_name("a" * 64)
+    with pytest.raises(InvalidName):
+        naming.validate_session_name("a" * 65)

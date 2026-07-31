@@ -29,7 +29,12 @@ __all__ = [
 
 # `:` is tmux's session:window.pane separator and is rejected rather than sanitised: a
 # silently rewritten name would differ from the name the agent sees in `shell_list`.
-SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# `\Z`, not `$`: Python's `$` also matches immediately BEFORE a trailing newline, so `$`
+# accepted "build\n". That is not cosmetic -- `new-session -s "build\n"` succeeds, then every
+# `set-option -t '=build\n:'` fails, so the create chain returns rc=1 and reports not_found
+# while leaving a session on the SHARED tmux server that has no incarnation, can never be
+# reached through target(), cannot be killed, and shows up as foreign forever.
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 # Characters that corrupt the `list-sessions -F` TAB record. Measured (spike S11, both
 # lanes) with a TAB and an LF in @shellbox_cwd:
@@ -42,7 +47,14 @@ SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #
 # CR is included because tmux ships records line-wise and a bare CR is indistinguishable
 # from a line ending to enough consumers to not be worth the argument.
-FORBIDDEN_PATH_CHARS = ("\t", "\r", "\n")
+#
+# NUL is included for a different reason: it never reaches the record at all, because
+# `os.path.realpath` raises ValueError("embedded null character") first. Without it here, a
+# client sending a NUL in a path got `tmux_error` wrapping a raw ValueError instead of
+# `bad_cwd` -- so an agent branching on `bad_cwd` to retry elsewhere read a bad argument as
+# an infrastructure failure. `validate_env` already rejected NUL for this reason; this makes
+# the two consistent.
+FORBIDDEN_PATH_CHARS = ("\t", "\r", "\n", "\0")
 
 # Upper bound for `-x/-y`. tmux itself accepts much larger, but a 100k-column window is a
 # memory multiplier on the server every pooled agent shares (§7.3).

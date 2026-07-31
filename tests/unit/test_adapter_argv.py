@@ -391,7 +391,7 @@ def test_text_is_delivered_before_keys() -> None:
 def test_read_preserves_ansi_and_omits_dash_j() -> None:
     runner = RecordingRunner(
         results=[
-            result(rc=0, stdout="build\t80\t24\t0\t7\t20000\n"),
+            result(rc=0, stdout="build\t80\t24\t0\t7\t20000\tinc-1\n"),
             result(rc=0, stdout="\x1b[31mRED\x1b[39m\n"),
         ]
     )
@@ -413,7 +413,10 @@ def test_read_preserves_ansi_and_omits_dash_j() -> None:
 
 def test_read_with_lines_uses_dash_s_negative() -> None:
     runner = RecordingRunner(
-        results=[result(rc=0, stdout="build\t80\t24\t0\t7\t20000\n"), result(rc=0, stdout="x\n")]
+        results=[
+            result(rc=0, stdout="build\t80\t24\t0\t7\t20000\tinc-1\n"),
+            result(rc=0, stdout="x\n"),
+        ]
     )
     adapter(runner).read("build", lines=100)
     argv = _after_verb(runner.sub_argv("capture-pane"), "capture-pane")
@@ -423,7 +426,7 @@ def test_read_with_lines_uses_dash_s_negative() -> None:
 def test_read_reports_a_dead_pane_as_not_alive() -> None:
     runner = RecordingRunner(
         results=[
-            result(rc=0, stdout="build\t80\t24\t1\t3\t20000\n"),
+            result(rc=0, stdout="build\t80\t24\t1\t3\t20000\tinc-1\n"),
             result(rc=0, stdout="LASTLINE\n"),
         ]
     )
@@ -720,7 +723,7 @@ def test_every_dash_t_value_is_anchored_at_runtime(tmp_path) -> None:
     """The structural test in ``test_target.py`` proved the source; this proves the argv."""
     # One default that satisfies both readers: `_display_tail` takes everything after the
     # first TAB as the value (non-empty => owned), and `_display_numeric` sees 6 fields.
-    runner = RecordingRunner(default=result(rc=0, stdout="build\t80\t24\t0\t7\t20000\n"))
+    runner = RecordingRunner(default=result(rc=0, stdout="build\t80\t24\t0\t7\t20000\tinc-1\n"))
     ad = adapter(runner)
     ad.create("build", cwd=str(tmp_path))
     ad.send("build", text="hi\n", keys=["Enter"])
@@ -735,3 +738,25 @@ def test_every_dash_t_value_is_anchored_at_runtime(tmp_path) -> None:
                 assert argv[index + 1] == "=build:"
                 seen += 1
     assert seen >= 8, f"expected -t on most verbs, saw {seen}"
+
+
+def test_read_refuses_a_session_with_an_empty_incarnation() -> None:
+    """§6 lists ``not_found`` for read on a session present but carrying no incarnation.
+
+    ``read`` was the one verb that did not enforce it -- ``send``/``resize``/``kill`` all went
+    through ``_resolve_owned`` -- so a foreign session could be read while the other three
+    refused it, and the code was looser than its own documented table.
+
+    The incarnation is checked from the SAME ``display-message`` that already fetches the
+    metrics, so enforcing it costs no extra tmux round-trip. Note the stub's trailing TAB: an
+    unstamped session really does produce an empty final field, and the field-count check has
+    to survive it (F10).
+    """
+    runner = RecordingRunner(results=[result(rc=0, stdout="build\t80\t24\t0\t7\t20000\t\n")])
+    with pytest.raises(NotFound):
+        adapter(runner).read("build")
+    # It must fail on the metrics read alone, without going on to capture the pane.
+    # Checked against `argvs` rather than `sub_argv`, which RAISES for an absent verb -- that
+    # would pass this test for the wrong reason and fail it for another.
+    verbs_run = [argv for argv in runner.argvs if "capture-pane" in argv]
+    assert verbs_run == [], f"read captured a pane it had refused: {verbs_run}"

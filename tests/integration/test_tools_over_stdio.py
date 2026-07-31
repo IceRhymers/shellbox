@@ -249,7 +249,12 @@ def test_read_reports_a_dead_pane_and_still_returns_its_output(
 
     async def script(client: ClientSession) -> dict[str, object]:
         await call(client, "shell_create", {"name": name, "cwd": str(tmp_path)})
-        await call(client, "shell_send", {"session": name, "text": "echo BYE-NOW; exit\n"})
+        # BYE''-NOW for the same reason as the others: the closing assertion is what names
+        # "a dead pane still returns ITS OUTPUT", and an echoed command line is not output.
+        # The alive-is-false poll below rescues the timing, so this was not a false green for
+        # pane death -- but it would have passed if `echo` produced nothing and only `exit`
+        # ran.
+        await call(client, "shell_send", {"session": name, "text": "echo BYE''-NOW; exit\n"})
         await await_content(client, name, "BYE-NOW")
         # Poll for the pane's death rather than sleeping past it: the shell exits when it
         # gets round to it, not when tmux accepted the paste.

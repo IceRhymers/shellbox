@@ -105,6 +105,12 @@ _READ_FIELDS = (
     "#{pane_dead}",
     "#{history_size}",
     "#{history_limit}",
+    # LAST, deliberately: it is the only field here that can legitimately be EMPTY (an
+    # unstamped or mid-create session), and `_display_numeric` counts fields from the raw
+    # line, so a trailing empty field still counts. Putting it earlier would be fine for the
+    # count but would place a possibly-empty value between two always-present ones, which is
+    # the shape that made `.strip()` destructive in the first place (F10).
+    "#{@shellbox_incarnation}",
 )
 
 INCARNATION_OPTION = "@shellbox_incarnation"
@@ -623,7 +629,23 @@ class TmuxAdapter:
         metrics = self._display_numeric(name, _READ_FIELDS)
         if metrics is None:
             raise NotFound(f"session {name!r} does not exist", session=name)
-        width, height, pane_dead, history_size, history_limit = metrics
+        width, height, pane_dead, history_size, history_limit, incarnation = metrics
+
+        # §6 lists not_found for send, read, resize AND kill when a session is present but
+        # carries no incarnation. read was the one that did not enforce it, so the code was
+        # looser than its own documented contract: a foreign session could be read while the
+        # other three refused it. Enforced rather than relaxing the spec -- a read-only
+        # carve-out is arguable under D6, but silently differing from the table is not.
+        #
+        # Checked from the field above rather than by calling _resolve_owned, which would add
+        # a second tmux round-trip to every read. Same guarantee, one invocation.
+        if not incarnation:
+            raise NotFound(
+                f"session {name!r} exists but carries no {INCARNATION_OPTION}: it is either "
+                "mid-create or foreign, and shellbox will not act on a session it cannot "
+                "prove it owns",
+                session=name,
+            )
 
         capture_args = ["capture-pane", "-p", "-e", "-t", target(name)]
         if lines:

@@ -48,6 +48,14 @@ class SessionRecord:
     created_at: datetime | None = None
     """Only used on first insert; an existing row's ``created_at`` is preserved on
     conflict, mirroring hosts.enrolled_at. Defaults to ``last_activity_at`` if omitted."""
+    last_read_at: datetime | None = None
+    """When the pane was last *read*. ``last_activity_at`` advances on send only, so the two
+    together let #5 choose a reaping predicate that Phase 2 does not pre-decide (see
+    ``models.py``).
+
+    ``None`` means "this write is not a read" — **not** "never read". An `upsert_session`
+    carrying ``None`` must therefore leave an existing timestamp alone rather than clearing
+    it, which is what `PostgresRegistry` relies on ``GREATEST`` for."""
 
 
 class Registry(Protocol):

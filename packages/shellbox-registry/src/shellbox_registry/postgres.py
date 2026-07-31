@@ -44,6 +44,7 @@ def _session_to_record(row: SessionModel) -> SessionRecord:
         cols=row.cols,
         rows=row.rows,
         created_at=row.created_at,
+        last_read_at=row.last_read_at,
     )
 
 
@@ -111,6 +112,7 @@ class PostgresRegistry(Registry):
             rows=record.rows,
             created_at=created_at,
             last_activity_at=record.last_activity_at,
+            last_read_at=record.last_read_at,
             status=record.status,
         )
         stmt = stmt.on_conflict_do_update(
@@ -125,6 +127,18 @@ class PostgresRegistry(Registry):
                 # created_at intentionally NOT set here -> preserved on conflict.
                 "last_activity_at": func.greatest(
                     stmt.excluded.last_activity_at, SessionModel.last_activity_at
+                ),
+                # GREATEST is doing two jobs here, and the second one is why `last_read_at`
+                # needs no special-casing in callers:
+                #   1. a delayed/stale write cannot move the timestamp backwards, as above;
+                #   2. Postgres's GREATEST *ignores NULLs* (returning NULL only when every
+                #      argument is NULL), so a send-only upsert -- which carries
+                #      last_read_at=None -- preserves whatever read timestamp is already
+                #      there instead of clearing it.
+                # Note (2) is NOT portable intuition: it is the opposite of how NULL behaves
+                # in most expressions, and `MAX` over a column set would not give it.
+                "last_read_at": func.greatest(
+                    stmt.excluded.last_read_at, SessionModel.last_read_at
                 ),
                 "status": stmt.excluded.status,
             },

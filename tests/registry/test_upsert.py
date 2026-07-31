@@ -274,3 +274,97 @@ def test_get_missing_rows_return_none(registry: PostgresRegistry) -> None:
     assert registry.get_host("nope") is None
     assert registry.get_session("nope") is None
     assert registry.list_sessions_for_host("nope") == []
+
+
+# --------------------------------------------------------------------------------------
+# `last_read_at` -- the two-column activity split (plan OQ5). `last_activity_at` advances
+# on SEND, `last_read_at` on READ, so #5 can choose a reaping predicate that Phase 2 does
+# not pre-decide. These live here rather than in the unit lane because the property being
+# asserted is Postgres's, not Python's: GREATEST ignores NULLs.
+# --------------------------------------------------------------------------------------
+def _session(**overrides: object) -> SessionRecord:
+    fields: dict[str, object] = {
+        "session_id": "h1:build",
+        "host_id": "h1",
+        "tmux_name": "build",
+        "owner_email": "a@example.com",
+        "last_activity_at": T0,
+        "status": "live",
+        "created_at": T0,
+    }
+    fields.update(overrides)
+    return SessionRecord(**fields)  # type: ignore[arg-type]
+
+
+def _host(registry: PostgresRegistry) -> None:
+    """The FK parent. `sessions.host_id` REFERENCES hosts, so this is not optional."""
+    registry.upsert_host(
+        HostRecord(
+            host_id="h1",
+            kind="lakebox",
+            owner_email="a@example.com",
+            last_seen_at=T0,
+            status="active",
+            enrolled_at=T0,
+        )
+    )
+
+
+def test_last_read_at_is_null_until_a_read_happens(registry: PostgresRegistry) -> None:
+    """ "Never read" has no honest timestamp. It must NOT default to created_at, which would
+    read as "someone looked at this"."""
+    _host(registry)
+    registry.upsert_session(_session())
+    row = registry.get_session("h1:build")
+    assert row is not None
+    assert row.last_read_at is None
+
+
+def test_a_send_only_upsert_preserves_an_existing_last_read_at(
+    registry: PostgresRegistry,
+) -> None:
+    """🔴 The subtle one, and the reason `last_read_at` needs no special-casing in callers.
+
+    Postgres's GREATEST *ignores* NULLs -- returning NULL only when every argument is NULL --
+    so a send-only upsert carrying last_read_at=None leaves the stored read timestamp alone
+    instead of clearing it. That is the opposite of how NULL behaves in most expressions, and
+    it is a property of the database rather than of this code, so it is asserted against a
+    real Postgres. If it were ever wrong, every `shell_send` would silently erase the
+    evidence that a session is being watched -- and #5 would then reap sessions mid-build.
+    """
+    _host(registry)
+    registry.upsert_session(_session(last_read_at=T1))
+    # A subsequent SEND: advances last_activity_at, says nothing about reads.
+    registry.upsert_session(_session(last_activity_at=T2, last_read_at=None))
+
+    row = registry.get_session("h1:build")
+    assert row is not None
+    assert row.last_activity_at == T2, "a send must advance last_activity_at"
+    assert row.last_read_at == T1, (
+        "a send carried last_read_at=None and CLEARED the read timestamp; GREATEST must "
+        "ignore the NULL and preserve T1"
+    )
+
+
+def test_last_read_at_never_moves_backwards(registry: PostgresRegistry) -> None:
+    """Same GREATEST guarantee the other timestamps get: a delayed write cannot rewind it."""
+    _host(registry)
+    registry.upsert_session(_session(last_read_at=T2))
+    registry.upsert_session(_session(last_read_at=T0))
+    row = registry.get_session("h1:build")
+    assert row is not None
+    assert row.last_read_at == T2
+
+
+def test_the_two_activity_columns_advance_independently(registry: PostgresRegistry) -> None:
+    """The whole point of two columns: a session being READ but not DRIVEN is distinguishable
+    from one being driven, which is the distinction #5 needs and one column cannot express."""
+    _host(registry)
+    registry.upsert_session(_session(last_activity_at=T0, last_read_at=None))
+    registry.upsert_session(_session(last_activity_at=T0, last_read_at=T2))
+
+    row = registry.get_session("h1:build")
+    assert row is not None
+    assert (row.last_activity_at, row.last_read_at) == (T0, T2), (
+        "reads advanced while sends did not -- a watched-but-idle session"
+    )

@@ -10,6 +10,7 @@ Two halves:
 Sessions are created by agents, attached to by humans, and reaped on inactivity. Harness-agnostic (Claude Code, Codex, Buzz — anything speaking MCP).
 
 Work in progress. Design and phased plan: [epic #9](https://github.com/IceRhymers/shellbox/issues/9).
+Registering `shellbox-mcp` with a harness (Claude Code, Codex): [`docs/registration.md`](docs/registration.md).
 
 ---
 

@@ -73,7 +73,11 @@ class Session(Base):
     #                                 its session reaped mid-build
     #
     # Recording both leaves the predicate to #5 (`last_activity_at` alone, `GREATEST(...)`, or a
-    # different timeout per column) and costs nothing now: there is no deployed database yet.
+    # different timeout per column). Added by migration 0002 rather than folded into the merged
+    # 0001: alembic records only a revision *id* and never fingerprints content, so amending a
+    # migration a developer has already applied gives them a schema missing this column while
+    # `alembic current` reports up to date -- the same silent divergence the `_TIMESTAMPTZ`
+    # comment above exists to prevent.
     # Nullable because a session that has never been read has no honest value for it — do NOT
     # default it to `created_at`, which would read as "someone looked at this".
     last_read_at: Mapped[datetime | None] = mapped_column(_TIMESTAMPTZ, default=None)

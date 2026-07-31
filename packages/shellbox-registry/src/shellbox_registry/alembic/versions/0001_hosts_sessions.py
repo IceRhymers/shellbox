@@ -53,15 +53,7 @@ def upgrade() -> None:
         sa.Column("cols", sa.Integer(), nullable=True),
         sa.Column("rows", sa.Integer(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        # Two activity columns, deliberately. `last_activity_at` advances on SEND only,
-        # `last_read_at` on READ. One column cannot express both of Phase 5's hazards
-        # (a polling reader keeping a session alive forever vs. a session reaped mid-build
-        # while someone watches it), so recording both leaves the reaping predicate to #5
-        # instead of Phase 2 pre-deciding it. Added to THIS migration rather than an 0002
-        # because no database is deployed yet; nullable because "never read" has no honest
-        # timestamp and defaulting to created_at would read as "someone looked at this".
         sa.Column("last_activity_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("last_read_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("status", sa.Text(), nullable=False),
         sa.PrimaryKeyConstraint("session_id"),
         sa.ForeignKeyConstraint(["host_id"], ["hosts.host_id"]),

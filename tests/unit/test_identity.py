@@ -1,17 +1,28 @@
 """`identity.py` — ADR-6's ladder, and the race that makes it correct.
 
-The headline test here is `test_concurrent_first_boot_yields_exactly_one_host_id`. An earlier
-revision of the plan proposed asserting only that "two resolutions agree", which is satisfied
-by sequential agreement and would have passed while the `os.replace` bug shipped. The bug is
-only visible under genuine concurrency, so that is what this asserts -- with real processes,
-since the invariant is about 1-32 concurrent MCP *processes*.
+The headline test is `test_concurrent_first_boot_yields_exactly_one_host_id`, and it took two
+attempts to make it test anything.
+
+⚠️ **Do not "simplify" it back.** The first version spawned N workers and asserted they agreed
+on one `host_id`. That assertion is satisfiable **without the code under test ever running**:
+absent a barrier the OS serializes process startup, so worker 1 creates the cache and workers
+2..N take the ordinary step-2 *cache-hit* path. All ids agree, the suite is green, and the
+`O_EXCL`-and-adopt branch is never executed. A test for a race that never happens tests
+nothing. Hence: a barrier releasing all N at the same instant, and an explicit assertion that
+at least one process really did observe `EEXIST`.
+
+That is not a hypothetical. Making the race real immediately exposed a bug in `identity.py`
+that the serialized version could never have reached — see
+`test_the_losers_wait_out_the_winners_write` below.
 """
 
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -25,42 +36,105 @@ from shellbox_mcp.identity import (
     resolve_owner_email,
 )
 
+# The top of #2's stated range ("1-32 agents", an invariant it calls mandatory), because the
+# whole point is to race the real concurrency ceiling rather than a token two processes.
+CONCURRENT_WORKERS = 32
+# Repeated, because losing a race is timing-dependent: one green round is weak evidence.
+RACE_ROUNDS = 3
 
-# Module-level so ProcessPoolExecutor can pickle it: a local closure cannot be sent to a
-# child process, and the whole point of this test is that the workers are real processes.
-def _resolve_in_child(state_dir: str) -> tuple[str, bool]:
-    identity = resolve_host_id(state_dir)
-    return identity.host_id, identity.assigned
+
+def _resolve_at_barrier(state_dir: str, barrier: object, results: object) -> None:
+    """Wait at the barrier, then resolve. Module-level so it survives `spawn` pickling.
+
+    Exceptions are *recorded*, never raised: a child that dies takes its result with it, and
+    "31 processes raised IdentityError" is precisely the failure this test exists to catch, so
+    it has to arrive as data rather than as a lost traceback.
+    """
+    try:
+        barrier.wait(timeout=30)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - a broken barrier must not mask the identity result
+        pass
+    try:
+        identity = resolve_host_id(state_dir)
+        results.append((identity.host_id, identity.assigned, identity.source))  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        results.append(("<error>", False, f"{type(exc).__name__}: {exc}"))  # type: ignore[attr-defined]
+
+
+def _race_once(state_dir: Path) -> list[tuple[str, bool, str]]:
+    """Release `CONCURRENT_WORKERS` real processes into `resolve_host_id` simultaneously.
+
+    Explicit `Process` objects rather than a pool: with a pool, `map` may hand two tasks to one
+    worker, and that worker would then wait at a barrier for a party that never arrives.
+    """
+    with multiprocessing.Manager() as manager:
+        barrier = manager.Barrier(CONCURRENT_WORKERS)
+        results = manager.list()
+        workers = [
+            multiprocessing.Process(
+                target=_resolve_at_barrier, args=(str(state_dir), barrier, results)
+            )
+            for _ in range(CONCURRENT_WORKERS)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=90)
+        assert not any(w.is_alive() for w in workers), "a worker hung on the barrier"
+        return list(results)
 
 
 # --------------------------------------------------------------------------- the race
 def test_concurrent_first_boot_yields_exactly_one_host_id(tmp_path: Path) -> None:
-    """N processes, one empty state dir, exactly one identity and exactly one assigner.
+    """N processes, one empty state dir: exactly one identity, exactly one assigner.
 
-    With `tmp` + `os.replace` this fails: every worker mints its own uuid4 and the ones that
-    lose the write still *return* their own, so a sandbox ends up split across N `hosts` rows
-    with session rows for one shared tmux server filed under different hosts.
+    With `tmp` + `os.replace` this fails: every worker mints its own uuid4, one write survives,
+    and the losers still *return* their own — so one sandbox is split across N `hosts` rows,
+    session rows for a single shared tmux server land under different hosts, and each process
+    rejects its siblings' live session ids as `invalid_name`.
     """
-    workers = 16
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(_resolve_in_child, [str(tmp_path)] * workers))
+    adopters_across_rounds = 0
 
-    host_ids = {host_id for host_id, _ in results}
-    assert len(host_ids) == 1, (
-        f"{len(host_ids)} distinct host_ids across {workers} concurrent processes: {host_ids}. "
-        "Every process must adopt one identity -- see identity.py's module docstring for what "
-        "N identities do to session_id and the hosts table."
+    for round_index in range(RACE_ROUNDS):
+        state_dir = tmp_path / f"round{round_index}"
+        state_dir.mkdir()
+        results = _race_once(state_dir)
+
+        assert len(results) == CONCURRENT_WORKERS, (
+            f"round {round_index}: {len(results)} of {CONCURRENT_WORKERS} workers reported"
+        )
+        errors = [source for host_id, _, source in results if host_id == "<error>"]
+        assert not errors, f"round {round_index}: workers failed to resolve an identity: {errors}"
+
+        host_ids = {host_id for host_id, _, _ in results}
+        assert len(host_ids) == 1, (
+            f"round {round_index}: {len(host_ids)} distinct host_ids across "
+            f"{CONCURRENT_WORKERS} concurrent processes: {host_ids}. See identity.py's module "
+            "docstring for what N identities do to session_id and the hosts table."
+        )
+
+        assigners = [host_id for host_id, assigned, _ in results if assigned]
+        assert len(assigners) == 1, (
+            f"round {round_index}: {len(assigners)} processes claim to have ASSIGNED the id; "
+            "exactly one may win the exclusive create and the rest must adopt"
+        )
+
+        # The surviving file holds the id everyone returned — not merely *an* id.
+        cached = json.loads((state_dir / HOST_JSON_NAME).read_text())
+        assert cached["host_id"] == next(iter(host_ids))
+
+        # `source == "assigned"` with `assigned is False` is reachable only through the
+        # `FileExistsError` handler, so this counts processes that genuinely lost the race.
+        # A cache hit reports `source == "cache"` instead.
+        adopters_across_rounds += sum(
+            1 for _, assigned, source in results if source == "assigned" and not assigned
+        )
+
+    assert adopters_across_rounds > 0, (
+        f"across {RACE_ROUNDS} rounds of {CONCURRENT_WORKERS} barrier-released processes, not "
+        "one observed EEXIST — every worker took the cache-hit path, so the adopt-the-winner "
+        "branch was never executed and this test proved nothing. Fix the test, not the code."
     )
-
-    assigners = [host_id for host_id, assigned in results if assigned]
-    assert len(assigners) == 1, (
-        f"{len(assigners)} processes claimed to have ASSIGNED the id; exactly one may win the "
-        "exclusive create and the rest must report adoption"
-    )
-
-    # The surviving file must hold the id everyone returned -- not merely *an* id.
-    cached = json.loads((tmp_path / HOST_JSON_NAME).read_text())
-    assert cached["host_id"] == host_ids.pop()
 
 
 def test_cache_is_created_0600(tmp_path: Path) -> None:
@@ -195,19 +269,54 @@ def test_corrupt_cache_reassignment_is_logged_at_error(
     )
 
 
-def test_empty_cache_raises_because_it_looks_like_a_concurrent_writer(tmp_path: Path) -> None:
-    """An EMPTY file is not corruption — it is what the exclusive-create winner looks like
-    between `os.open` and `json.dump`.
+def test_the_losers_wait_out_the_winners_write(tmp_path: Path) -> None:
+    """🔴 The bug the barrier found. An EMPTY cache file is the exclusive-create winner caught
+    between `os.open` and `json.dump`, so a loser must **wait** for it, not fail.
 
-    So this case is retryable and must not be quarantined: quarantining it would move the
-    winner's file out from under it and let this process assign a second identity, which is
-    the very split the exclusive create exists to prevent. Raising lets the caller retry.
+    The first version of `identity.py` classified this correctly and then raised anyway,
+    calling it "retryable" with nothing retrying — so a genuine 32-way first-boot race failed
+    for 31 of 32 processes. Serialized process startup meant no test could reach it: worker 1
+    finished writing long before worker 2 looked.
+
+    Simulated here rather than raced, so the assertion is deterministic: hold the file empty,
+    then land the real content while the loser is waiting.
+    """
+    path = tmp_path / HOST_JSON_NAME
+    path.write_text("")  # a winner has opened it and not yet written
+
+    def finish_the_write() -> None:
+        time.sleep(0.05)
+        path.write_text(json.dumps({"version": 1, "host_id": "the-winners-id"}))
+
+    writer = threading.Thread(target=finish_the_write)
+    writer.start()
+    try:
+        identity = resolve_host_id(str(tmp_path))
+    finally:
+        writer.join()
+
+    assert identity.host_id == "the-winners-id", (
+        "the loser did not adopt the winner's id; if it minted its own, one sandbox is now two "
+        "hosts — the exact split the exclusive create exists to prevent"
+    )
+    assert (identity.source, identity.assigned) == ("assigned", False)
+    assert not list(tmp_path.glob(f"{HOST_JSON_NAME}.corrupt.*")), (
+        "the winner's file must never be quarantined — that would move it out from under a "
+        "live writer and let this process assign a second identity"
+    )
+
+
+def test_a_permanently_empty_cache_eventually_raises(tmp_path: Path) -> None:
+    """A winner that died between `os.open` and `json.dump` leaves an empty file forever.
+
+    Waiting cannot fix that, and neither can assigning: a second id splits the host. So it
+    raises — the one outcome that neither corrupts the inventory nor hides the problem — and
+    the file is left exactly as found for whoever investigates.
     """
     path = tmp_path / HOST_JSON_NAME
     path.write_text("")
-    with pytest.raises(IdentityError, match="not readable as an identity"):
+    with pytest.raises(IdentityError, match="did not become readable"):
         resolve_host_id(str(tmp_path))
-    # Untouched: no quarantine, and the (possibly mid-write) file is still where it was.
     assert path.exists()
     assert not list(tmp_path.glob(f"{HOST_JSON_NAME}.corrupt.*"))
 

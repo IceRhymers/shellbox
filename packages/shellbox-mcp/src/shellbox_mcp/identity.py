@@ -43,8 +43,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +73,27 @@ _LAKEBOX_PID1 = "sandbox-daemon"
 
 KIND_LAKEBOX = "lakebox"
 KIND_UNKNOWN = "unknown"
+
+# How long a process that lost the exclusive create waits for the winner to finish writing.
+# The real window is a single small `json.dump` -- microseconds -- so this is generous by
+# three orders of magnitude and exists only so a *crashed* winner surfaces as an error
+# instead of a hang. 0.5s total.
+_ADOPT_ATTEMPTS = 25
+_ADOPT_BACKOFF = 0.02
+
+
+class _CacheState(Enum):
+    """Why a cache read produced no identity. The distinction is not cosmetic: only ``CORRUPT``
+    may be quarantined, and quarantining anything else re-keys every session on the host."""
+
+    OK = "ok"
+    ABSENT = "absent"
+    """No file, or a file we could not read at all (permissions, I/O). Never quarantined."""
+    EMPTY = "empty"
+    """Present but blank. Not produced by this module -- see `_create_or_adopt` -- so it means
+    a stray `touch` or a writer from an older build that died. Nothing to preserve."""
+    CORRUPT = "corrupt"
+    """Complete content that is not a usable identity. The only quarantinable state."""
 
 
 class IdentityError(Exception):
@@ -164,7 +187,7 @@ def resolve_host_id(
         )
 
     path = Path(state_dir) / HOST_JSON_NAME
-    cached = _read_cache(path)
+    state, cached = _load_cache(path)
 
     # Step 2. The normal path from boot 2 onward.
     if cached is not None:
@@ -196,19 +219,20 @@ def resolve_host_id(
             gateway_host=gateway_host or cached.get("gateway_host"),
         )
 
-    # The file exists but did not survive shape-checking. Two very different situations look
-    # identical from here, and they are separated by CONTENT rather than guessed at:
+    # Genuine corruption: content that is present, complete, and not an identity.
     #
-    #   * empty  -> almost certainly the exclusive-create winner caught between `os.open` and
-    #     `json.dump`. Retryable, and handled below by `_create_or_adopt`, which raises.
-    #   * non-empty but malformed -> corruption, not a race. Retrying never fixes it.
+    # Neither obvious response is acceptable on its own -- silently assigning a new id re-keys
+    # every `session_id` on the host, and refusing to start denies an agent its shells over an
+    # inventory problem. So the file is QUARANTINED (preserved under a new name, so nothing is
+    # destroyed and an operator can still see what it held), a fresh id is assigned, and the
+    # consequence is logged at ERROR. Nothing here is silent.
     #
-    # For corruption, neither obvious option is acceptable: silently assigning a new id
-    # re-keys every `session_id` on the host, and refusing to start denies an agent its
-    # shells for an inventory problem. So the file is QUARANTINED -- preserved under a new
-    # name, so nothing is destroyed and an operator can still see what it held -- a fresh id
-    # is assigned, and the whole thing is logged at ERROR. Nothing here is silent.
-    if cached is None and _has_content(path):
+    # ⚠️ This decision rides on the SINGLE read above and must never re-stat the file. An
+    # earlier version asked two questions -- "did the read fail?" then "does the file have
+    # content?" -- and a concurrent winner's `link` landing between them made a perfectly good
+    # identity file look corrupt, so a loser quarantined it and minted a second id. The bug was
+    # in the gap between the two observations, not in either one.
+    if state is _CacheState.CORRUPT:
         quarantined = _quarantine(path)
         logger.error(
             "identity cache %s held unusable content and has been moved aside to %s; "
@@ -267,30 +291,88 @@ def _create_or_adopt(
     sandbox_id: str | None,
     gateway_host: str | None,
 ) -> tuple[str, bool]:
-    """Exclusive-create the cache, or adopt the winner's value. Returns ``(host_id, assigned)``."""
+    """Claim the identity, or adopt the winner's. Returns ``(host_id, assigned)``.
+
+    **Write the content first, then claim the name — never the other way round.** The obvious
+    implementation opens the final path with ``O_CREAT|O_EXCL`` and writes into it, which does
+    elect exactly one winner but publishes the file *before* it has content. A loser arriving
+    in that window sees a file that exists and is either empty or **truncated mid-JSON**, and
+    truncated JSON is indistinguishable from corruption by inspection. The first version of
+    this function therefore quarantined the winner's file out from under it and assigned a
+    second id — one sandbox, two hosts, which is the precise failure the exclusive create is
+    here to prevent.
+
+    ``os.link`` fixes it structurally rather than by heuristic: it is atomic and it fails with
+    ``EEXIST`` if the name is taken, so it arbitrates the race exactly as ``O_EXCL`` did — but
+    the directory entry appears only once the content behind it is complete. **A loser can
+    never observe a partial identity file, so no code needs to guess whether one is corrupt.**
+
+    (Discovered by the concurrency test, not by review. It is unreachable without a barrier:
+    serialized process startup lets the winner finish long before a loser looks.)
+    """
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     payload = _payload(candidate, sandbox_id=sandbox_id, gateway_host=gateway_host)
+    body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+    # Unique per attempt, not just per pid: two processes can share a pid across a container
+    # boundary, and a stale tmp from a crashed run must never be written into by a live one.
+    staging = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    # 0600 at open() rather than a later chmod, so the file is never briefly world-readable --
+    # it names the host whose owner_email is a workspace admin.
+    fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        # O_EXCL is the whole mechanism. 0600 at open() rather than a later chmod, so the file
-        # is never briefly world-readable -- it names the host whose owner_email is a
-        # workspace admin.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        adopted = _read_cache(path)
-        if adopted is None:
-            # The winner created the file but has not finished writing it, or wrote something
-            # unusable. Raising beats both alternatives: assigning a second id splits the
-            # host, and looping risks doing so under a genuinely corrupt file.
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            # This file is the sandbox's only durable identity and is written once per sandbox
+            # lifetime, so the cost of an fsync is irrelevant and losing it to a crash is not.
+            os.fsync(handle.fileno())
+        try:
+            os.link(staging, path)
+        except FileExistsError:
+            # Losing is the COMMON case, not an error: with 32 processes starting together, 31
+            # arrive here. Thanks to link-after-write, whatever is at `path` is complete.
+            return _adopt_winner(path), False
+        except OSError as exc:
+            # Hardlinks are unavailable on a few exotic filesystems. Refusing beats silently
+            # falling back to a racy write: on the one filesystem where that mattered, it would
+            # split hosts invisibly.
             raise IdentityError(
-                f"identity cache {path} exists but is not readable as an identity yet; "
-                "another process may be mid-write. Retry; if it persists, inspect the file "
-                "(deleting it re-keys every session_id on this host)."
-            ) from None
-        return adopted["host_id"], False
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    return candidate, True
+                f"could not atomically claim {path} ({exc}). Identity assignment needs "
+                "hardlink support in the state directory; set SHELLBOX_STATE_DIR to a normal "
+                "filesystem, or SHELLBOX_HOST_ID to assign identity explicitly."
+            ) from exc
+        return candidate, True
+    finally:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+
+
+def _adopt_winner(path: Path) -> str:
+    """Read the `host_id` of whoever won the race.
+
+    Normally one read: `os.link` guarantees the content is complete before the name exists. The
+    retry exists for an identity file left **empty** by something else — a crashed writer from
+    an older build, or an operator's stray `touch` — where waiting briefly is free and assuming
+    corruption would be wrong.
+    """
+    for _ in range(_ADOPT_ATTEMPTS):
+        state, adopted = _load_cache(path)
+        if adopted is not None:
+            return adopted["host_id"]
+        if state is _CacheState.CORRUPT:
+            break  # complete content that is not an identity: waiting cannot help
+        time.sleep(_ADOPT_BACKOFF)
+    # Assigning a second id here would split the host, so this is one of the few places where
+    # refusing to start is the least-bad option.
+    raise IdentityError(
+        f"identity cache {path} exists but did not become readable as an identity within "
+        f"{_ADOPT_ATTEMPTS * _ADOPT_BACKOFF:.1f}s. Either the process that created it died "
+        "mid-write, or it is corrupt. Inspect it by hand -- deleting it re-keys every "
+        "session_id on this host."
+    ) from None
 
 
 def _write_cache(
@@ -337,19 +419,6 @@ def _payload(host_id: str, *, sandbox_id: str | None, gateway_host: str | None) 
     return payload
 
 
-def _has_content(path: Path) -> bool:
-    """Does the file exist with something in it?
-
-    The separator between "a concurrent winner has not finished writing" (empty, retryable)
-    and "this file is corrupt" (non-empty, never fixes itself). Whitespace counts as empty:
-    a partial `json.dump` of an object always starts with ``{``.
-    """
-    try:
-        return bool(path.read_text(encoding="utf-8").strip())
-    except OSError:
-        return False
-
-
 def _quarantine(path: Path) -> Path:
     """Move a corrupt cache aside, preserving it. Returns the new path.
 
@@ -368,37 +437,51 @@ def _quarantine(path: Path) -> Path:
     return path  # pragma: no cover - 999 corrupt caches is someone else's problem
 
 
-def _read_cache(path: Path) -> dict[str, Any] | None:
-    """Read and **shape-check** the cache. ``None`` when absent or unusable.
+def _load_cache(path: Path) -> tuple[_CacheState, dict[str, Any] | None]:
+    """Read and **shape-check** the cache in ONE observation.
+
+    Returns a state as well as the data, because callers must distinguish *why* they got
+    nothing, and the difference decides whether a file gets quarantined. Splitting that
+    judgement across two filesystem calls is what made a live winner's file look corrupt to a
+    concurrent loser -- see `resolve_host_id`.
 
     Shape-checked rather than trusted, following the idiom #11's review established for the
-    tmux incarnation: a file that parses as JSON but holds the wrong shape is a more likely
+    tmux incarnation: a file that parses as JSON but holds the wrong shape is a likelier
     failure than a missing one, and a `host_id` of ``None`` or ``[]`` would propagate into
     every `session_id` on the host before anything noticed.
     """
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return None
+        return _CacheState.ABSENT, None
     except OSError as exc:
+        # Unreadable is NOT corrupt: a permissions or I/O problem must never cause the file to
+        # be moved aside, because moving it aside re-keys every session on the host.
         logger.warning("identity cache %s is unreadable (%s); treating as absent", path, exc)
-        return None
+        return _CacheState.ABSENT, None
+
+    if not raw.strip():
+        # Empty. With link-after-write we never publish an empty identity file, so this is a
+        # stray `touch` or a crashed writer from an older build. Not corrupt -- there is nothing
+        # in it to preserve or to have been damaged -- and not usable either.
+        return _CacheState.EMPTY, None
+
     try:
         parsed = json.loads(raw)
     except ValueError:
         logger.error(
-            "identity cache %s is not valid JSON; refusing to overwrite it, because a new "
-            "host_id re-keys every session_id on this host. Inspect it by hand.",
+            "identity cache %s is not valid JSON; it will be preserved rather than "
+            "overwritten, because a new host_id re-keys every session_id on this host.",
             path,
         )
-        return None
+        return _CacheState.CORRUPT, None
     if not isinstance(parsed, dict):
         logger.error("identity cache %s holds %s, not an object", path, type(parsed).__name__)
-        return None
+        return _CacheState.CORRUPT, None
     host_id = parsed.get("host_id")
     if not isinstance(host_id, str) or not host_id.strip():
         logger.error("identity cache %s has no usable host_id (%r)", path, host_id)
-        return None
+        return _CacheState.CORRUPT, None
     # A colon would split `f"{host_id}:{tmux_name}"` ambiguously. `server.py` uses
     # `rpartition` so the LAST colon separates, which is safe for a uuid4 but not for an
     # arbitrary hand-edited value -- so reject it here rather than let it corrupt targeting.
@@ -409,13 +492,14 @@ def _read_cache(path: Path) -> dict[str, Any] | None:
             path,
             host_id,
         )
-        return None
+        return _CacheState.CORRUPT, None
+
     result: dict[str, Any] = {"host_id": host_id}
     for optional in ("sandbox_id", "gateway_host"):
         value = parsed.get(optional)
         if isinstance(value, str) and value.strip():
             result[optional] = value
-    return result
+    return _CacheState.OK, result
 
 
 def resolve_owner_email(

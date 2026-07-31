@@ -25,13 +25,14 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 import pytest
-from shellbox_mcp.tmux import CommandResult, TmuxAdapter, TmuxConfig
+from shellbox_mcp.tmux import CommandResult, Runner, SubprocessRunner, TmuxAdapter, TmuxConfig
 
 TMUX_BIN = os.environ.get("SHELLBOX_TMUX_BIN") or shutil.which("tmux")
 
@@ -95,6 +96,41 @@ def await_file_bytes(path: str, minimum: int, *, timeout: float = DEFAULT_TIMEOU
     )
 
 
+# --------------------------------------------------------------------------------------
+# The two reader panes. They are defined TOGETHER, and next to the warning above, because
+# the only way the split oracle breaks is by someone editing one of them to look like the
+# other -- most plausibly by adding `stty -icanon` to the canonical case to stop a
+# byte-exactness assertion from failing. Nothing downstream would notice: over-long lines
+# are DROPPED on macOS and silently TRUNCATED on Linux, both with rc=0 everywhere.
+# --------------------------------------------------------------------------------------
+
+
+def raw_reader(path: str) -> list[str]:
+    """A RAW-mode reader pane: ``stty -icanon`` then ``cat`` into a file.
+
+    The ONLY oracle for byte-exact delivery. ``MAX_CANON`` does not apply, so full delivery
+    is possible at any line length (spike H4: raw is lossless at every measured length in
+    both lanes).
+
+    ``-icanon`` alone, deliberately -- NOT ``stty raw``. ``paste-buffer`` translates LF to CR
+    unless given ``-r``, and it is the pane's ``icrnl`` that turns that CR back into the LF
+    the payload contained (M25). ``stty raw`` clears ``icrnl`` too, so every newline would
+    arrive as ``\\r`` and a byte-exactness assertion would fail for a reason that has nothing
+    to do with shellbox.
+    """
+    return ["sh", "-c", f"stty -icanon; cat > {path}"]
+
+
+def canonical_reader(path: str) -> list[str]:
+    """A CANONICAL-mode reader pane: plain ``cat``, the pty's default line discipline.
+
+    ⚠️ Never assert byte-exactness against this. It exists for one purpose: to prove the
+    ``line_too_long`` guard fires *before* tmux is invoked, so the bytes the line discipline
+    would destroy never reach the pty at all. See the warning at the top of this module.
+    """
+    return ["sh", "-c", f"cat > {path}"]
+
+
 @dataclass
 class TmuxServer:
     """One tmux server on its own short socket, torn down after the test."""
@@ -128,6 +164,16 @@ class TmuxServer:
 
     def adapter(self, **overrides: object) -> TmuxAdapter:
         return TmuxAdapter(self.config(**overrides))
+
+    def spied_adapter(
+        self,
+        fault: Callable[[tuple[str, ...]], CommandResult | None] | None = None,
+        **overrides: object,
+    ) -> tuple[TmuxAdapter, SpyRunner]:
+        """An adapter talking to the REAL server through a recording, faultable runner."""
+        config = self.config(**overrides)
+        spy = SpyRunner(inner=SubprocessRunner(config), fault=fault)
+        return TmuxAdapter(config, runner=spy), spy
 
     def sessions(self) -> list[str]:
         """Session names straight from tmux, for assertions about what the adapter did."""
@@ -240,3 +286,70 @@ class RecordingRunner:
 def result(rc: int = 0, stdout: str = "", stderr: str = "") -> CommandResult:
     """Terse ``CommandResult`` constructor for scripted runners."""
     return CommandResult(argv=(), rc=rc, stdout_raw=stdout, stderr=stderr)
+
+
+@dataclass
+class SpyRunner:
+    """The REAL runner, wrapped: every invocation recorded, chosen ones faulted.
+
+    Two things the unit lane's ``RecordingRunner`` cannot do, because both need a real server:
+
+    * **Fault injection on a live server.** ``fault`` may return a substitute
+      ``CommandResult`` for an argv -- so a ``paste-buffer`` can be made to fail *after* a real
+      ``load-buffer`` has really created a buffer, which is the only way to observe whether the
+      buffer is left behind.
+    * **Proving tmux was never invoked while a real pane is waiting for input.** "No calls
+      recorded" plus "the pane's file is still empty" is a stronger statement than either alone.
+
+    Thread-safe because the concurrency assertions call one adapter from 32 threads.
+    """
+
+    inner: Runner
+    fault: Callable[[tuple[str, ...]], CommandResult | None] | None = None
+
+    def __post_init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], bytes | None]] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, argv: Sequence[str], stdin: bytes | None = None) -> CommandResult:
+        frozen = tuple(argv)
+        with self._lock:
+            self.calls.append((frozen, stdin))
+        if self.fault is not None:
+            substitute = self.fault(frozen)
+            if substitute is not None:
+                return CommandResult(
+                    argv=frozen,
+                    rc=substitute.rc,
+                    stdout_raw=substitute.stdout_raw,
+                    stderr=substitute.stderr,
+                )
+        return self.inner(argv, stdin)
+
+    @property
+    def argvs(self) -> list[tuple[str, ...]]:
+        with self._lock:
+            return [argv for argv, _ in self.calls]
+
+    def values_after(self, flag: str, verb: str) -> list[str]:
+        """Every value following ``flag`` in the recorded invocations of ``verb``.
+
+        Used for the buffer-name assertions: ``values_after("-b", "load-buffer")``.
+        """
+        found: list[str] = []
+        for argv in self.argvs:
+            if verb not in argv:
+                continue
+            for index, item in enumerate(argv[:-1]):
+                if item == flag:
+                    found.append(argv[index + 1])
+        return found
+
+
+def fail_verb(verb: str, stderr: str) -> Callable[[tuple[str, ...]], CommandResult | None]:
+    """A ``SpyRunner.fault`` that makes every invocation of ``verb`` fail."""
+
+    def fault(argv: tuple[str, ...]) -> CommandResult | None:
+        return result(rc=1, stderr=stderr) if verb in argv else None
+
+    return fault

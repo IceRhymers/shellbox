@@ -36,6 +36,7 @@ __all__ = [
     "TmuxError",
     "TmuxUnavailable",
     "TooLarge",
+    "UnencodableText",
     "classify_stderr",
     "public_code",
     "tmux_failure",
@@ -119,6 +120,26 @@ class LineTooLong(ShellboxError):
     """Bytes since the last newline exceeded the limit (§8, H4). The real boundary."""
 
     code = "line_too_long"
+
+
+class UnencodableText(ShellboxError):
+    """``text`` cannot be encoded as UTF-8 -- in practice, a lone surrogate.
+
+    Reachable from an MCP client: ``json.loads('"\\ud800"')`` yields exactly such a string, so
+    without this the send path raises a bare ``UnicodeEncodeError`` -- an exception outside the
+    §6 taxonomy, from a tool whose documented failures are all structured payloads.
+
+    Rejecting is the point. ``encode(errors="replace")`` would put U+FFFD where the caller's
+    bytes were, and ``"surrogatepass"`` would paste bytes that are not UTF-8 at all; both are
+    the silent mutation of agent input that this whole path exists to prevent (H4).
+
+    ``code`` is the closed set's catch-all deliberately: §6 fixes ``shell_send``'s codes at
+    ``not_found | no_payload | invalid_key | too_large | line_too_long | tmux_error``, so a new
+    public code would be a change to the tool boundary, not to the send path. The distinct
+    class exists so the rejection can happen before tmux is invoked and name its own cause.
+    """
+
+    code = "tmux_error"
 
 
 class InvalidDimensions(ShellboxError):

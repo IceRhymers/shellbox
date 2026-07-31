@@ -39,6 +39,7 @@ from shellbox_mcp.errors import (
     NotFound,
     TmuxError,
     TooLarge,
+    UnencodableText,
     classify_stderr,
     tmux_failure,
 )
@@ -551,7 +552,7 @@ class TmuxAdapter:
         """
         naming.validate_session_name(name)
         validated_keys = validate_keys(keys)
-        payload = b"" if text is None else text.encode("utf-8")
+        payload = b"" if text is None else _encode_text(text, name)
         if not payload and not validated_keys:
             raise NoPayload("shell_send requires at least one of text or keys", session=name)
         if payload:
@@ -825,6 +826,27 @@ class TmuxAdapter:
         if classify_stderr(result.stderr) in {"not_found", NO_SERVER}:
             return False
         raise tmux_failure(result.stderr, session=name, context="has-session failed")
+
+
+def _encode_text(text: str, name: str) -> bytes:
+    """Encode ``text`` to the bytes that will be pasted, or reject it before tmux is touched.
+
+    Every other guard on this path exists because an over-long line is *silently* destroyed or
+    mutated; this one exists for the same reason one layer earlier. A str carrying a lone
+    surrogate (which an MCP client can send: ``json.loads('"\\ud800"')``) has no UTF-8 encoding,
+    and the two ways to encode it anyway both corrupt the payload -- ``errors="replace"`` swaps
+    in U+FFFD, ``"surrogatepass"`` emits bytes that are not UTF-8. So it is an error, and an
+    error inside the taxonomy rather than a bare ``UnicodeEncodeError`` from a tool whose
+    documented failures are all structured payloads.
+    """
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise UnencodableText(
+            f"text is not encodable as UTF-8 ({exc.reason} at position {exc.start}): shellbox "
+            "will not substitute or reinterpret bytes the caller did not send",
+            session=name,
+        ) from exc
 
 
 def _as_int(value: str, default: int) -> int:

@@ -14,22 +14,15 @@ from __future__ import annotations
 import os
 
 import pytest
-from conftest import TmuxServer, await_file, await_file_bytes, requires_tmux
+from conftest import TmuxServer, await_file, await_file_bytes, raw_reader, requires_tmux
 from shellbox_mcp.errors import BadCwd, InvalidName, NotFound
 from shellbox_mcp.tmux import LIST_FORMAT, TmuxAdapter
 
 pytestmark = requires_tmux
 
-
-def _raw_reader(path: str) -> list[str]:
-    """A RAW-mode reader pane: ``stty -icanon`` then ``cat`` into a file.
-
-    Raw mode on purpose. In canonical mode the pty line discipline destroys an over-long
-    line -- dropped entirely on macOS, silently TRUNCATED on Linux -- so a canonical pane is
-    not an oracle for delivered bytes. See the warning in ``tests/conftest.py``: these two
-    pane kinds test different things and must never be unified.
-    """
-    return ["sh", "-c", f"stty -icanon; cat > {path}"]
+# The raw-mode reader lives in conftest.py NEXT TO the canonical one, so the two cannot be
+# quietly made to look alike -- which is the single way the split H4 oracle breaks (§11.3).
+_raw_reader = raw_reader
 
 
 # --------------------------------------------------------------------------------------

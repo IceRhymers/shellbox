@@ -1,9 +1,23 @@
 """Shellbox registry package: SQLAlchemy models, Registry protocol, and alembic migrations.
 
-Models, the Registry protocol, PostgresRegistry/NullRegistry, and the alembic
-environment are implemented in W6 (see .omc/plans/phase-2-session-plane.md §4, §12).
-This package currently only establishes the importable module skeleton.
+Implements W6 (see .omc/plans/phase-2-session-plane.md §4, §10, §12, ADR-3): `hosts`/
+`sessions` models, the `Registry` protocol, `NullRegistry`/`PostgresRegistry`, and the
+alembic environment + migration 0001. `lakebase.py` (OAuth-token-as-password, token
+refresh) is out of scope here — that is W9.
 """
+
+from shellbox_registry.base import HostRecord, Registry, SessionRecord
+from shellbox_registry.factory import create_registry
+from shellbox_registry.null import NullRegistry
+from shellbox_registry.postgres import PostgresRegistry
 
 __version__ = "0.1.0"
 
+__all__ = [
+    "HostRecord",
+    "NullRegistry",
+    "PostgresRegistry",
+    "Registry",
+    "SessionRecord",
+    "create_registry",
+]

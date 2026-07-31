@@ -10,6 +10,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "registry: requires a live Postgres reachable at SHELLBOX_DATABASE_URL (skipped when absent, see tests/registry/conftest.py)",
+]
 
 [tool.ruff]
 line-length = 100

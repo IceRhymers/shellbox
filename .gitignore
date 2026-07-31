@@ -1,2 +1,22 @@
 .omc/
 .claude/settings.local.json
+
+# Python / uv workspace
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# uv.lock is deliberately NOT committed.
+#
+# `uv lock` resolves against whatever package index the developer has configured, and bakes
+# those artifact URLs into the file -- so a lockfile committed from a machine pointed at an
+# internal mirror publishes that hostname and breaks CI for everyone outside that network.
+# It happened. Until there is a single agreed index that every contributor and CI resolve
+# through, the lockfile is a local artifact.
+uv.lock

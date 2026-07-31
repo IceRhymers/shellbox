@@ -1,0 +1,209 @@
+// shellbox — overall architecture
+//
+// Reflects the design AFTER Phase 1 probe (#1). Every annotation marked
+// [P1] is a measured result, not an assumption. Excluded paths are drawn
+// because "why not the obvious thing" is the most common design question.
+//
+// Render:  dot -Tpng docs/architecture.dot -o docs/architecture.png
+
+digraph shellbox {
+  compound  = true;
+  rankdir   = TB;
+  bgcolor   = "white";
+  fontname  = "Helvetica";
+  labelloc  = "t";
+  label     = <<B>shellbox</B> — agent shell sessions with browser rendering on Databricks<BR/>
+               <FONT POINT-SIZE="10" COLOR="#555555">transport + auth verified by Phase 1 probe (#1) · [P1] = measured</FONT><BR/> >;
+  fontsize  = 18;
+
+  node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled",
+        fillcolor="white", color="#888888", margin="0.12,0.07"];
+  edge [fontname="Helvetica", fontsize=9, color="#444444"];
+
+  // ───────────────────────── operator laptop ─────────────────────────
+  subgraph cluster_laptop {
+    label = <<B>Operator laptop</B>  <FONT POINT-SIZE="9">(one-time per sandbox)</FONT>>;
+    style = "rounded,filled"; fillcolor = "#f4f4f4"; color = "#aaaaaa"; fontsize = 11;
+
+    cli [label=<<B>shellbox CLI</B><BR/><FONT POINT-SIZE="9">bootstrap + OAuth driver</FONT>>,
+         fillcolor="#ffffff"];
+    browser_local [label=<<B>local browser</B><BR/><FONT POINT-SIZE="9">OAuth consent only</FONT>>,
+         fillcolor="#ffffff", color="#bbbbbb"];
+  }
+
+  // ───────────────────────── the sandbox (host) ─────────────────────────
+  subgraph cluster_sandbox {
+    label = <<B>Databricks Sandbox ("Lakebox")</B>  <FONT POINT-SIZE="9">— host kind: lakebox</FONT>>;
+    style = "rounded,filled"; fillcolor = "#eaf3fb"; color = "#7ba7cc"; fontsize = 11;
+
+    agent [label=<<B>agent</B><BR/><FONT POINT-SIZE="9">Claude Code · Codex · (Buzz: Ph6)</FONT>>,
+           fillcolor="#ffffff"];
+
+    mcp [label=<<B>shellbox-mcp</B>  <FONT POINT-SIZE="9">(stdio MCP server)</FONT><BR/>
+                <FONT POINT-SIZE="9">shell_create · send · read · list · resize · kill<BR/>
+                <I>holds zero session state in-process</I></FONT>>,
+         fillcolor="#ffffff", color="#4a7fa5"];
+
+    tmux [label=<<B>tmux server</B>  <FONT POINT-SIZE="9">(sibling process)</FONT><BR/>
+                <FONT POINT-SIZE="9">session "build" · session "logs"<BR/>
+                <I>survives MCP restart / agent rotation</I></FONT>>,
+          fillcolor="#ffffff", color="#4a7fa5"];
+
+    xport [label=<<B>transport client</B><BR/><FONT POINT-SIZE="9">WSTransport (B) · seq'd frames</FONT>>,
+           fillcolor="#fff8e1", color="#c9a227"];
+
+    grant [label=<<B>OAuth grant</B>  <FONT POINT-SIZE="9">(databricks-cli token cache)</FONT><BR/>
+                  <FONT POINT-SIZE="9">sandbox is the <B>sole holder</B><BR/>
+                  ~/.databrickscfg = one credential-less [DEFAULT]</FONT>>,
+           fillcolor="#e8f5e9", color="#4c8c4a", shape=note];
+
+    keepalive [label=<<B>idleTimeout keepalive</B><BR/>
+                     <FONT POINT-SIZE="9">raises autostop while attached<BR/>
+                     <I>must run host-side</I> [P1]</FONT>>,
+               fillcolor="#ffffff", color="#999999"];
+  }
+
+  // ───────────────────────── the app ─────────────────────────
+  subgraph cluster_app {
+    label = <<B>shellbox-app</B>  <FONT POINT-SIZE="9">— Databricks App (FastAPI, port 8000)</FONT>>;
+    style = "rounded,filled"; fillcolor = "#fdf0e6"; color = "#d08b4f"; fontsize = 11;
+
+    edge_in [label=<<B>Databricks Apps edge</B><BR/>
+                   <FONT POINT-SIZE="9">302→OIDC unauthenticated · <B>rejects PATs</B> [P1]<BR/>
+                   injects x-forwarded-email / -access-token<BR/>
+                   x-envoy-expected-rq-timeout-ms: 300000</FONT>>,
+             fillcolor="#f6ddc7", color="#b5713a", shape=box3d];
+
+    tunnel [label=<<B>/v1/tunnel</B>  <FONT POINT-SIZE="9">(WebSocket)</FONT><BR/>
+                  <FONT POINT-SIZE="9">frames in · input out</FONT>>,
+            fillcolor="#ffffff", color="#c9a227"];
+
+    api [label=<<B>/api/hosts · /api/sessions</B><BR/><FONT POINT-SIZE="9">inventory</FONT>>,
+         fillcolor="#ffffff"];
+
+    ui [label=<<B>/ — xterm.js terminal UI</B><BR/><FONT POINT-SIZE="9">attach · type · resize</FONT>>,
+        fillcolor="#ffffff"];
+  }
+
+  // ───────────────────────── state ─────────────────────────
+  subgraph cluster_state {
+    label = <<B>Lakebase</B>  <FONT POINT-SIZE="9">(managed Postgres)</FONT>>;
+    style = "rounded,filled"; fillcolor = "#f3ecf8"; color = "#9b7cb8"; fontsize = 11;
+
+    db [label=<<B>hosts</B>  <FONT POINT-SIZE="9">host_id, sandbox_id, owner_email, last_seen_at, status</FONT><BR/>
+               <B>sessions</B>  <FONT POINT-SIZE="9">session_id, tmux_name, owner_email, cwd, cols/rows, status</FONT><BR/>
+               <FONT POINT-SIZE="9" COLOR="#8b0000"><B>no session_frames table</B> — D7, live stream only</FONT>>,
+          fillcolor="#ffffff", color="#7d5e9c", shape=cylinder];
+  }
+
+  viewer [label=<<B>viewer's browser</B><BR/><FONT POINT-SIZE="9">workspace-authenticated</FONT>>,
+          fillcolor="#f4f4f4", color="#888888", shape=box];
+
+  // ───────────────────────── live data path ─────────────────────────
+  agent -> mcp   [label="  stdio (MCP)", style=bold];
+  mcp   -> tmux  [label="  send-keys / capture-pane\l  forks + reparents away\l", style=bold];
+  mcp   -> xport [label="  frames", style=bold];
+  mcp   -> keepalive [style=dotted, arrowhead=none, color="#999999"];
+  grant -> xport [label="  bearer\l  (refreshed every\l  reconnect)\l", style=dashed, color="#4c8c4a"];
+
+  xport -> edge_in [
+    label=<  <B>wss://…/v1/tunnel</B>  <FONT COLOR="#006400"><B>101 ✓</B></FONT> [P1]<BR ALIGN="LEFT"/>
+           ~4 ms RTT · bidirectional<BR ALIGN="LEFT"/>
+           <FONT COLOR="#8b0000"><B>killed every ~10–18 min</B></FONT> [P1]<BR ALIGN="LEFT"/>
+           global · simultaneous · no close frame<BR ALIGN="LEFT"/>
+           keepalive-immune → <B>reconnect + resume</B><BR ALIGN="LEFT"/>>,
+    penwidth=2.2, color="#c9a227", lhead=cluster_app];
+
+  edge_in -> tunnel [style=bold];
+  tunnel -> api     [style=invis];
+  tunnel -> db      [label="  registry upsert\l  (no frames)\l", color="#7d5e9c"];
+  api    -> db      [color="#7d5e9c"];
+  ui     -> tunnel  [label="  attach / input", style=dashed];
+
+  // Drawn edge_in -> viewer so the viewer ranks BELOW the app in this TB graph;
+  // dir=both keeps the semantics (browser initiates, WS is bidirectional).
+  edge_in -> viewer [label=<  workspace OAuth<BR ALIGN="LEFT"/>x-forwarded-email → <I>display only</I> (D5)<BR ALIGN="LEFT"/>>,
+                     dir=both, penwidth=1.6];
+
+  // ───────────────────────── bootstrap path (one-time) ─────────────────────────
+  cli -> mcp [label=<  <B>SSH</B> — provisioning only (D1)<BR ALIGN="LEFT"/>
+                    1. install shellbox-mcp + tmux<BR ALIGN="LEFT"/>
+                    2. reset ~/.databrickscfg (<B>delete baked PAT</B>)<BR ALIGN="LEFT"/>
+                    3. run login in-sandbox over PTY<BR ALIGN="LEFT"/>
+                    4. <B>ssh -L</B> forward OAuth callback port in<BR ALIGN="LEFT"/>>,
+              style=dashed, color="#4c8c4a", penwidth=1.6, lhead=cluster_sandbox];
+  browser_local -> grant [label="  OAuth consent →\l  grant lands in-sandbox\l",
+                          style=dotted, color="#4c8c4a"];
+
+  // ───────────────────────── excluded / impossible ─────────────────────────
+  subgraph cluster_no {
+    label = <<B>Excluded — proven impossible or rejected</B>>;
+    style = "rounded,filled"; fillcolor = "#fdecea"; color = "#c0392b"; fontsize = 11;
+
+    no1 [label=<<B>✗ App → sandbox (App-dials-in)</B><BR/>
+                <FONT POINT-SIZE="9"><FONT FACE="Courier New">[Errno 113] No route to host</FONT> in <B>1 ms</B> [P1]<BR/>
+                no route exists — not a timeout or filter</FONT>>,
+         fillcolor="#ffffff", color="#c0392b"];
+
+    no2 [label=<<B>✗ App manages the user's sandbox</B><BR/>
+                <FONT POINT-SIZE="9">lakebox API is <B>caller-scoped</B>, no owner field [P1]<BR/>
+                app SP sees only its own; OBO token = scope <FONT FACE="Courier New">default</FONT><BR/>
+                → <FONT FACE="Courier New">403 required scopes: all-apis</FONT><BR/>
+                <B>a stopped sandbox cannot be revived from the browser</B></FONT>>,
+         fillcolor="#ffffff", color="#c0392b"];
+
+    no3 [label=<<B>✗ SSETransport (option C)</B><BR/>
+                <FONT POINT-SIZE="9">cut at <B>exactly 300.1 s</B> = Envoy route timeout [P1]<BR/>
+                dies as clean EOF, indistinguishable from normal end</FONT>>,
+         fillcolor="#ffffff", color="#c0392b"];
+
+    no4 [label=<<B>✗ App → SSH → tmux attach</B><BR/>
+                <FONT POINT-SIZE="9">machine-level keypair (one key, all sandboxes)<BR/>
+                → App would authenticate as creator, not viewer<BR/>
+                <I>and</I> no route exists anyway [P1]</FONT>>,
+         fillcolor="#ffffff", color="#c0392b"];
+
+    no5 [label=<<B>✗ ttyd via gateway</B> · <B>✗ Buzz relay</B><BR/>
+                <FONT POINT-SIZE="9">ttyd on root-owned UDS, no HTTPS vhost (TLS mismatch) [P1]<BR/>
+                relay: 256 KB cap, Schnorr per event, permanent persistence</FONT>>,
+         fillcolor="#ffffff", color="#c0392b"];
+
+    no6 [label=<<B>✗ dedicated service principal for the tunnel</B><BR/>
+                <FONT POINT-SIZE="9">unnecessary — the sandbox holds its own OAuth grant<BR/>
+                a shared SP would make <FONT FACE="Courier New">owner_email</FONT> an untrusted claim</FONT>>,
+         fillcolor="#ffffff", color="#c0392b"];
+
+    no1 -> no2 -> no3 -> no4 -> no5 -> no6 [style=invis];
+  }
+
+  // ───────────────────────── operating constraints ─────────────────────────
+  notes [shape=note, fillcolor="#fffde7", color="#c9a227", fontsize=9, label=<
+    <B>Operating constraints from Phase 1 [P1]</B><BR ALIGN="LEFT"/>
+    <BR ALIGN="LEFT"/>
+    <B>Reconnect is the steady state.</B> Sockets die every ~10–18 min on a<BR ALIGN="LEFT"/>
+    wall-clock global event — not per-connection, not periodic, no close<BR ALIGN="LEFT"/>
+    frame. Detect with a client-side liveness timer.<BR ALIGN="LEFT"/>
+    <BR ALIGN="LEFT"/>
+    <B>Resume = redraw, not replay.</B> D7 means no frame log exists, so<BR ALIGN="LEFT"/>
+    subscribe(from_seq) repaints from tmux capture-pane. Do not promise<BR ALIGN="LEFT"/>
+    gap-fill semantics the store cannot honour.<BR ALIGN="LEFT"/>
+    <BR ALIGN="LEFT"/>
+    <B>Validate content, not status.</B> Unauthenticated POST returns<BR ALIGN="LEFT"/>
+    HTTP 200 with an HTML login body.<BR ALIGN="LEFT"/>
+    <BR ALIGN="LEFT"/>
+    <B>Sandbox restart:</B> $HOME persists · <B>tmux does not</B> (socket in<BR ALIGN="LEFT"/>
+    wiped /tmp) · .bashrc rewritten per boot · no cron, no user systemd,<BR ALIGN="LEFT"/>
+    no rc.local → <B>no in-VM boot hook</B>; re-enrol from the agent side.<BR ALIGN="LEFT"/>
+    <BR ALIGN="LEFT"/>
+    <B>Lifecycle:</B> create 1.8 s (warm pool) · start 25 s · stop is async<BR ALIGN="LEFT"/>
+    with a premature success message — poll status. Fresh sandboxes<BR ALIGN="LEFT"/>
+    autostop after 600 s idle.<BR ALIGN="LEFT"/>
+    <BR ALIGN="LEFT"/>
+    <B>Credential:</B> baked PAT must be <B>deleted</B>, not ignored — host-keyed<BR ALIGN="LEFT"/>
+    resolution prefers it and the edge 302s it, so it shadows the grant.<BR ALIGN="LEFT"/>
+  >];
+
+  // layout hints
+  db -> notes [style=invis];
+  no6 -> notes [style=invis];
+}

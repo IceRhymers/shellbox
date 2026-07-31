@@ -43,16 +43,42 @@ sandbox dials out and why `App→SSH→tmux attach` is excluded twice over.
 ## What each remaining phase must do differently
 
 ### Phase 2 — session plane
-- **Delete the baked PAT** during enrolment; do not merely ignore it. Host-keyed
-  credential resolution prefers a host-matching cfg entry and the edge 302s PATs,
-  so the PAT *shadows* the OAuth grant. Reset `~/.databrickscfg` to exactly one
-  **credential-less** `[DEFAULT]` naming the fronting workspace — the entry must
-  exist or `databricks auth login` stalls on an interactive profile-name prompt.
+
+Planned in detail at [`.omc/plans/phase-2-session-plane.md`](../.omc/plans/phase-2-session-plane.md)
+(revision 4; Architect and Critic both APPROVE). §7 of that plan is **transcribed from an executable
+spike**, [`spike/tmux_spike.py`](../spike/tmux_spike.py), after three rounds of prose review kept
+finding new defects in freshly-rewritten command blocks.
+
+- **The PAT is stamped first, then reset — and the reset belongs to the bootstrap path, not
+  `serve`.** Enrolment order is fixed: resolve identity via `current_user.me()` → cache
+  `owner_email`/`host_id` to `$HOME/.shellbox/host.json` → write the `hosts` row → *(bootstrap only)*
+  reset `~/.databrickscfg`. Deleting the PAT inside `serve` would strand the sandbox with no
+  workspace credential before Phase 3's OAuth login exists. Note `~/.databrickscfg` is a **symlink
+  into tmpfs `/run`**, so the reset must remove the *symlink* and write a regular `$HOME` file, and it
+  is inherently a **per-boot** operation rather than one-shot.
 - Identity stamping (D4) is confirmed viable: the ambient credential authenticates
   as the sandbox creator, and the Lakebox API exposes **no owner field**, so
   stamping host-side really is the only way to answer "whose sandbox is this."
-- tmux 3.4 is already present in the image, so vendoring a static binary (D10) is
-  belt-and-braces rather than required.
+  The `$HOME` cache is **reconciled** against the credential whenever one is available (credential
+  wins, mismatch logs loudly) rather than short-circuiting on it.
+- **tmux 3.4 is already present at `/usr/bin/tmux`, so vendoring a static binary (D10) is optional,
+  not required.** The binary is resolved from `$SHELLBOX_TMUX_BIN` before falling back to `PATH`, and
+  the resolved path and version are recorded on the `hosts` row so an image bump is visible in the
+  registry rather than surfacing as a mystery bug.
+- **Four tmux behaviours are load-bearing and each is measured in two lanes** (3.6b/macOS and
+  3.4/Ubuntu — identical results):
+  - `-t <name>` **prefix- and fnmatch-matches**, so `has-session` is *not* an enforcement boundary and
+    one agent could address another's session by naming a prefix. Every targeting verb uses the single
+    anchored form **`=<name>:`**; `new-session -s` takes a **bare** name.
+  - A **global** `window-size manual` **kills the tmux server on the next `new-session`** (15/15), so
+    it appears nowhere in the create path. The **per-window** form is safe (0/15) and is how Phase 3/4
+    should set it — never `-g`.
+  - `history-limit` must be set **before** the first pane spawns (chained with `start-server`), or the
+    pane keeps the 2000 default while `show-options` reports the new global.
+  - The pty **line discipline** silently corrupts over-long lines — **dropped on macOS, truncated on
+    Linux** — so a line-length ceiling is enforced before tmux is invoked.
+- Sessions survive an **MCP restart** but not a **sandbox restart**, and there is no in-VM boot hook
+  to fix that. See the README's "What survives what".
 
 ### Phase 3 — transport
 - Ships `WSTransport` (B). `SSETransport` (C) is dead: cut at exactly 300.1 s.
@@ -90,11 +116,24 @@ sandbox dials out and why `App→SSH→tmux attach` is excluded twice over.
 
 ---
 
-## Open scoping question
+## Scoping question — RESOLVED (2026-07-31): build
 
-Before Phase 2 begins, see the [premise correction on
-#9](https://github.com/IceRhymers/shellbox/issues/9#issuecomment-5137298161):
-omnigent already implements this architecture on Databricks Apps — tmux PTY↔WS
-bridge, xterm.js renderer, terminal CRUD, host tunnel, Lakebox launcher, and the
-in-sandbox OAuth bootstrap drawn above. This diagram documents the design as
-specified; whether to build it or extend omnigent is unresolved.
+The [premise correction on
+#9](https://github.com/IceRhymers/shellbox/issues/9#issuecomment-5137298161) established that
+omnigent already implements this architecture on Databricks Apps — tmux PTY↔WS bridge, xterm.js
+renderer, terminal CRUD, host tunnel, Lakebox launcher, and the in-sandbox OAuth bootstrap drawn
+above. Three options were scored: **G1** build shellbox as specified, **G2** extend omnigent, **G3**
+build the session plane and borrow omnigent's transport and renderer.
+
+**Decision: G1 — build.** The deciding argument is structural rather than about code quality:
+omnigent enforces launch-before-use through a **per-process in-memory registry**
+(`omnigent/terminals/registry.py:104`), which is correct for omnigent, where one process owns the
+terminals. shellbox runs **1–32 concurrent MCP processes** with session rotation, under which
+in-process session state is wrong within a single turn — issue #2 declares that invariant mandatory.
+"Extend omnigent" therefore means rewriting the layer that made omnigent attractive, inside a
+codebase whose remainder assumes that layer's semantics.
+
+G3 remains the right answer for **Phases 3 and 4**, and is not foreclosed: omnigent's
+`ws_bridge.py:447` and `terminal_attach.py:130` already solve the transport and renderer problems
+under this exact edge, including the ~10–18 minute ingress socket recycle the probe measured
+(`omnigent/host/connect.py:1266`). Borrowing there is additive to a shellbox session plane.

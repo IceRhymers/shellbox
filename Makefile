@@ -1,14 +1,5 @@
 .PHONY: install sync fmt lint test test-tmux test-registry test-integration migrate migration migrate-roundtrip
 
-# `uv run` re-resolves and REWRITES uv.lock when it considers the lock stale, using whatever
-# index the developer has configured locally. That is how a lockfile full of internal
-# corporate mirror URLs came to be committed here: every `make test` silently regenerated
-# it, so fixing the file by hand did not stick.
-#
-# UV_FROZEN makes the lockfile authoritative -- uv uses it as-is and never rewrites it as a
-# side effect of running tests. Changing dependencies becomes a deliberate `uv lock`, which
-# is what it should have been in the first place.
-export UV_FROZEN := 1
 
 install: sync
 

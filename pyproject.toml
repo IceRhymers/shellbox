@@ -28,18 +28,3 @@ mypy_path = ["packages/shellbox-mcp/src", "packages/shellbox-registry/src"]
 explicit_package_bases = true
 ignore_missing_imports = true
 warn_unused_ignores = true
-
-# Pin the package index in the REPO, not in developer machine config.
-#
-# Without this, `uv lock` resolves against whatever index the developer happens to have
-# configured in ~/.config/uv/uv.toml -- and uv then bakes those artifact URLs into
-# uv.lock. That happened: a lockfile referencing an internal corporate PyPI mirror was
-# committed, and CI failed on every job because GitHub runners cannot reach that host.
-# The URLs are also an internal hostname nobody meant to publish.
-#
-# Declaring it here makes the lockfile a property of the project rather than of whoever
-# ran `uv lock` last.
-[[tool.uv.index]]
-name = "pypi"
-url = "https://pypi.org/simple"
-default = true

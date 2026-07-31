@@ -264,17 +264,30 @@ def test_read_lines_reports_scrollback_facts(tmux_server: TmuxServer, tmp_path: 
     harness = make_harness(tmux_server, tmp_path)
     name = harness.name("hist")
 
+    # The sentinel must NOT appear in the command echo, or the wait is satisfied the instant
+    # the line is typed and the read races the output. `seq 1 200` + awaiting "200" did
+    # exactly that: it matched the echoed command, passed on macOS by luck of timing, and
+    # failed on Linux with scrollback_lines == 0. `printf 'L%s\n'` puts "L200" only in the
+    # OUTPUT -- the command text contains "L%s".
+    emit_200_lines = "printf 'L%s\\n' $(seq 1 200)\n"
+
     async def script(client: ClientSession) -> dict[str, object]:
         await call(client, "shell_create", {"name": name, "cwd": str(tmp_path)})
-        await call(client, "shell_send", {"session": name, "text": "seq 1 200\n"})
-        await await_content(client, name, "200")
+        await call(client, "shell_send", {"session": name, "text": emit_200_lines})
+        await await_content(client, name, "L200", lines=300)
         return (await call(client, "shell_read", {"session": name, "lines": 300})).data
 
     read = run_script(harness, script)
     assert read["history_limit"] == 20_000
-    assert read["scrollback_lines"] > 0
+    # 200 lines through a 24-row pane must push lines into scrollback. Asserting > 0 is the
+    # point of the test, so the payload has to actually be large enough to cause it rather
+    # than the assertion being relaxed to match whatever happened.
+    assert read["scrollback_lines"] > 0, (
+        f"200 lines in a {read.get('rows', 24)}-row pane produced no scrollback; "
+        "either the output had not landed yet or the pane is taller than expected"
+    )
     assert read["lines"] == 300
-    assert "1\n" in str(read["content"]), "scrollback above the visible pane was not returned"
+    assert "L1\n" in str(read["content"]), "scrollback above the visible pane was not returned"
 
 
 def test_a_session_id_from_another_host_is_rejected(

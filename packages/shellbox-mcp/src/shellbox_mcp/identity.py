@@ -58,6 +58,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from collections.abc import Iterator
@@ -360,7 +361,13 @@ def _override_identity(
             recovered,
         )
         payload = dict(raw or {})
-        payload.update({"version": 1, "host_id": recovered})
+        # `host_id` only. NOT `version`: forcing it here would let an older build stamp a
+        # version-2 file back to 1 while leaving the version-2 *content* in place, so the
+        # field would assert a schema the file does not have -- worse than having no field,
+        # since the point of the scaffolding is that a later reader can trust it. `raw`
+        # already carries whatever wrote the file; `_payload` sets it when creating one.
+        payload["host_id"] = recovered
+        payload.setdefault("version", 1)
         for key, value in properties.items():
             if value:
                 payload[key] = value
@@ -600,7 +607,12 @@ def _exclusive(path: Path, *, attempts: int = 1) -> Iterator[bool]:
                 except OSError:
                     pass
             if attempt + 1 < attempts:
-                time.sleep(_LOCK_BACKOFF)
+                # Jittered, because a fixed interval makes 32 processes released together
+                # retry in lockstep every 20ms. That cannot corrupt anything -- the lock
+                # still serializes -- but it can starve one waiter past its bounded window,
+                # and the consequence is the dropped-field symptom `attempts` exists to
+                # prevent, recurring under sustained load.
+                time.sleep(_LOCK_BACKOFF * (1.0 + random.random()))
         except OSError as exc:
             logger.warning("could not take the identity lock %s: %s", lock, exc)
             break
@@ -741,6 +753,16 @@ def _merge_properties(
     processes could each merge a `host_id` into a missing file and split the host through the
     back door.
     """
+    # An assertion rather than a filter, deliberately. `host_id` is stripped defensively
+    # below too, but a silent strip lets a future caller believe it changed an identity
+    # through this path -- which is last-writer-wins and would revert a concurrent
+    # reconciliation. No test can catch a caller that does not exist yet; this trips over it
+    # on the first run.
+    assert "host_id" not in updates, (
+        f"identity must not change through a property write ({sorted(updates)}); use "
+        "_create_or_adopt or _override_identity, which are arbitrated"
+    )
+
     # Waits, rather than skipping -- see this function's docstring for what skipping cost.
     with _exclusive(path, attempts=_ADOPT_ATTEMPTS) as acquired:
         if not acquired:

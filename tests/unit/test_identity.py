@@ -29,6 +29,8 @@ from pathlib import Path
 import pytest
 from shellbox_mcp import identity
 from shellbox_mcp.identity import (
+    _LOCK_STALE_SECONDS,
+    _LOCK_SUFFIX,
     HOST_JSON_NAME,
     KIND_LAKEBOX,
     KIND_UNKNOWN,
@@ -882,3 +884,110 @@ def test_an_unusable_link_fails_loudly_instead_of_writing_racily(
     assert not (tmp_path / HOST_JSON_NAME).exists(), (
         "no identity may be published when it could not be claimed atomically"
     )
+
+
+# ------------------------------------------------- the lock-wait, deterministically
+#
+# ⚠️ These two carry the regression guarantee for the lock-wait fix, NOT the 32-process test
+# above. That test's assertion needs a field to be ABSENT from the file, which requires *every*
+# writer of that field to lose the lock — so its power is a coincidence, not a consequence, and
+# raising the worker count makes it WEAKER (more writers, more chances one wins and the
+# assertion passes). Measured against the reverted fix: caught 8/8 runs on a 12-core machine and
+# 1/8 on the reviewer's. Both are the same test. A gate whose power swings by 8x between machines
+# is not a gate, so the process test stays as a smoke test of the real thing and these two decide
+# whether the fix is present.
+def _release_lock_after(lock: Path, delay: float) -> threading.Thread:
+    """Hold the lock, then drop it — a live holder finishing its transaction."""
+    lock.write_text("99999\n")
+
+    def release() -> None:
+        time.sleep(delay)
+        lock.unlink()
+
+    thread = threading.Thread(target=release)
+    thread.start()
+    return thread
+
+
+def test_an_owner_write_waits_out_a_briefly_held_lock(tmp_path: Path) -> None:
+    """`resolve_owner_email` must not abandon its write because someone else held the lock.
+
+    Per E2b the cache is the ONLY source of `owner_email` after a restart with no credential, so
+    a skipped write here is not "one extra API call" — it is the next boot deferring enrollment.
+    """
+    resolve_host_id(str(tmp_path))
+    releaser = _release_lock_after(tmp_path / (HOST_JSON_NAME + _LOCK_SUFFIX), 0.15)
+    try:
+        resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
+    finally:
+        releaser.join()
+    assert _cache(tmp_path)["owner_email"] == "owner@example.com", (
+        "the owner write was dropped because the lock was momentarily held"
+    )
+
+
+def test_a_sandbox_id_write_waits_out_a_briefly_held_lock(tmp_path: Path) -> None:
+    """Same for the property writer: a dropped `sandbox_id` is `doctor` reporting a bootstrapped
+    host as never bootstrapped, for the whole life of that boot."""
+    resolve_host_id(str(tmp_path))
+    releaser = _release_lock_after(tmp_path / (HOST_JSON_NAME + _LOCK_SUFFIX), 0.15)
+    try:
+        resolve_host_id(str(tmp_path), sandbox_id="realistic-phoenix-2742")
+    finally:
+        releaser.join()
+    assert _cache(tmp_path)["sandbox_id"] == "realistic-phoenix-2742", (
+        "the sandbox_id write was dropped because the lock was momentarily held"
+    )
+
+
+def test_a_lock_left_by_a_dead_process_is_broken(tmp_path: Path) -> None:
+    """Stale-lock recovery is correct but was asserted nowhere, and regressing it is permanent.
+
+    A process that dies holding the lock leaves a file that makes **every** property write skip
+    for the life of the sandbox, and `_replace_unusable`/`_override_identity` then exhaust their
+    retries and raise — so a corrupt cache becomes unrecoverable without a human.
+    """
+    resolve_host_id(str(tmp_path))
+    lock = tmp_path / (HOST_JSON_NAME + _LOCK_SUFFIX)
+    lock.write_text("99999\n")
+    stale = time.time() - (_LOCK_STALE_SECONDS + 50)
+    os.utime(lock, (stale, stale))
+
+    resolve_owner_email(str(tmp_path), credential_email="owner@example.com")
+
+    assert _cache(tmp_path)["owner_email"] == "owner@example.com", (
+        "a lock abandoned by a dead process blocked the write instead of being broken"
+    )
+    assert not lock.exists(), "the stale lock was not cleaned up, so the next write blocks too"
+
+
+def test_a_version_field_written_by_a_newer_build_is_not_stamped_backwards(
+    tmp_path: Path,
+) -> None:
+    """`version` is scaffolding for a future schema change, so it must not lie.
+
+    `_override_identity` forced `"version": 1` rather than preserving what it read, so an older
+    build processing a tmux mismatch would stamp a version-2 file back to 1 **while leaving the
+    version-2 content in place** — the field then asserts a schema the file does not have, which
+    is worse than having no field at all.
+    """
+    resolve_host_id(str(tmp_path))
+    path = tmp_path / HOST_JSON_NAME
+    payload = json.loads(path.read_text())
+    payload["version"] = 2
+    payload["a_version_2_field"] = "keep me"
+    path.write_text(json.dumps(payload))
+
+    resolve_host_id(str(tmp_path), recovered="from-tmux")
+
+    cached = _cache(tmp_path)
+    assert cached["host_id"] == "from-tmux"
+    assert cached["version"] == 2, "an older build stamped the version backwards"
+    assert cached["a_version_2_field"] == "keep me"
+
+
+def test_the_property_writer_refuses_a_host_id(tmp_path: Path) -> None:
+    """The guard is an assertion so a future caller trips over it on the first run."""
+    resolve_host_id(str(tmp_path))
+    with pytest.raises(AssertionError, match="identity must not change"):
+        identity._merge_properties(tmp_path / HOST_JSON_NAME, {"host_id": "smuggled"})

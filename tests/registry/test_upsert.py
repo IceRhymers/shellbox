@@ -129,6 +129,7 @@ def test_upsert_host_other_fields_still_update_on_conflict(registry: PostgresReg
             last_seen_at=T0,
             status="active",
             enrolled_at=T0,
+            sandbox_id="sbx-1",
             gateway_host="gw-1",
             tmux_socket="/a.sock",
         )
@@ -140,6 +141,7 @@ def test_upsert_host_other_fields_still_update_on_conflict(registry: PostgresReg
             owner_email="a@example.com",
             last_seen_at=T1,
             status="stale",
+            sandbox_id="sbx-2",
             gateway_host="gw-2",
             tmux_socket="/b.sock",
         )
@@ -147,6 +149,10 @@ def test_upsert_host_other_fields_still_update_on_conflict(registry: PostgresReg
     row = registry.get_host("h1")
     assert row is not None
     assert row.status == "stale"
+    # `sandbox_id` was droppable from both the values and the conflict set with nothing failing,
+    # and ADR-8's entire story funnels into this column: it is the only human-meaningful label a
+    # `hosts` row has, since `host_id` is an opaque uuid4 and the sandbox cannot learn its own id.
+    assert row.sandbox_id == "sbx-2"
     assert row.gateway_host == "gw-2"
     assert row.tmux_socket == "/b.sock"
 
@@ -308,6 +314,26 @@ def _host(registry: PostgresRegistry) -> None:
             enrolled_at=T0,
         )
     )
+
+
+def test_upsert_session_round_trips_the_columns_phase_4_renders(
+    registry: PostgresRegistry,
+) -> None:
+    """`cwd`/`cols`/`rows` were droppable from `upsert_session` undetected.
+
+    Lower stakes than `sandbox_id`, but they are what Phase 4 needs to size a terminal, so a
+    silently-unwritten column surfaces as a mis-rendered pane rather than as an error.
+    """
+    _host(registry)
+    registry.upsert_session(_session(cwd="/w", cols=120, rows=40))
+    row = registry.get_session("h1:build")
+    assert row is not None
+    assert (row.cwd, row.cols, row.rows) == ("/w", 120, 40)
+
+    registry.upsert_session(_session(cwd="/other", cols=80, rows=24))
+    row = registry.get_session("h1:build")
+    assert row is not None
+    assert (row.cwd, row.cols, row.rows) == ("/other", 80, 24), "the conflict set must update too"
 
 
 def test_last_read_at_is_null_until_a_read_happens(registry: PostgresRegistry) -> None:

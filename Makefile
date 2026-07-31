@@ -19,11 +19,33 @@ lint:
 test:
 	uv run pytest
 
-# PLACEHOLDER (W2): the real tmux-backed regression suite (spike/tmux_spike.py adopted
-# into tests/tmux, gated on tmux 3.4 in CI) lands in W2. Kept as a separate target because
-# it needs a real tmux binary and must not silently no-op inside `make test`.
+# The tmux-backed lane, in the order that fails fastest and most informatively.
+#
+# The spike runs FIRST and is the oracle: §7 is transcribed from it, and if a tmux version
+# behaves differently the spike says so in one line while tests/tmux would fail in a dozen
+# confusing places. It also gates on its own exit code (it asserts; it does not merely emit
+# JSONL), so it belongs in a target and not in a comment.
+#
+# tests/tmux also runs inside `make test` -- it skips when tmux is absent -- so this target
+# is about the GATE: CI runs it in the tmux-3.4 container, and `-p no:randomly`-style
+# surprises aside, a failure here invalidates §7 rather than one test.
 test-tmux:
-	@echo "test-tmux: no tmux-backed tests yet (see W2, .omc/plans/phase-2-session-plane.md §4)"
+	python3 spike/tmux_spike.py
+	uv run pytest tests/tmux -v
+	@# A skip here means no tmux binary, which in this target is a failure, not a pass:
+	@# a silently skipped gate is indistinguishable from a green one.
+	@uv run pytest tests/tmux -q 2>&1 | tee /tmp/shellbox-tmux.txt | tail -1
+	@if grep -qE '[0-9]+ skipped' /tmp/shellbox-tmux.txt; then \
+		echo "ERROR: tests/tmux SKIPPED -- no tmux binary on PATH (or SHELLBOX_TMUX_BIN unset)."; \
+		exit 1; \
+	fi
+
+# The integration suite drives the server over real stdio against a real tmux server, so it
+# is tmux-version-sensitive in the same way tests/tmux is and belongs in the 3.4 gate lane
+# too. Separate target because it needs the mcp SDK, which `make test-tmux` deliberately
+# does not (that target must be runnable with nothing but tmux and pytest).
+test-integration:
+	uv run pytest tests/integration -v
 
 migrate:
 	uv run alembic -c alembic.ini upgrade head

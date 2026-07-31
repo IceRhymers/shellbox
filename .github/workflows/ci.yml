@@ -74,6 +74,13 @@ jobs:
       - name: Run the tmux-backed suite on tmux 3.4
         run: make test-tmux
 
+      # The integration suite drives the server over stdio against a real tmux server, so
+      # it is tmux-version-sensitive too. It cannot run in the local 3.4 container (no
+      # PyPI reachable there to install the mcp SDK), so CI is the only place this
+      # combination is actually exercised -- which is precisely why it runs here.
+      - name: Run the integration suite on tmux 3.4
+        run: make test-integration
+
   # The spike must also pass on the developer-facing lane. Two lanes green is the
   # contract; either one alone is not.
   spike-host-lane:

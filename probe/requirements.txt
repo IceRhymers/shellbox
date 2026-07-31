@@ -1,0 +1,4 @@
+# fastapi + uvicorn are pre-installed on the Apps runtime.
+# websockets is NOT, and uvicorn needs it to serve the WS handshake at all —
+# without it the /ws upgrade fails in-app and we'd misread that as an edge block.
+websockets

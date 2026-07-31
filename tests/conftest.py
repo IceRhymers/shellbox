@@ -247,6 +247,11 @@ class RecordingRunner:
 
     results: list[CommandResult] | None = None
     default: CommandResult | None = None
+    # Answer based on the argv, for tests that drive several verbs through ONE runner and need
+    # different `display-message` shapes per format. A single `default` cannot serve both
+    # readers: `_display_tail` takes everything after the first TAB as one value, while
+    # `_display_numeric` requires an exact field count.
+    respond: Callable[[tuple[str, ...]], CommandResult | None] | None = None
 
     def __post_init__(self) -> None:
         self.calls: list[tuple[tuple[str, ...], bytes | None]] = []
@@ -254,6 +259,15 @@ class RecordingRunner:
 
     def __call__(self, argv: Sequence[str], stdin: bytes | None = None) -> CommandResult:
         self.calls.append((tuple(argv), stdin))
+        if self.respond is not None:
+            answered = self.respond(tuple(argv))
+            if answered is not None:
+                return CommandResult(
+                    argv=tuple(argv),
+                    rc=answered.rc,
+                    stdout_raw=answered.stdout_raw,
+                    stderr=answered.stderr,
+                )
         if self._queue:
             scripted = self._queue.pop(0)
             return CommandResult(

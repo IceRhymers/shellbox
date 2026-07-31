@@ -30,7 +30,7 @@ from shellbox_mcp.tmux import TmuxAdapter, TmuxConfig
 SOCKET = "/tmp/sbx-send.sock"
 
 # One resolve reply that satisfies `_resolve_owned`: session present, incarnation non-empty.
-RESOLVED = result(rc=0, stdout="build\tINC-1\n")
+RESOLVED = result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n")
 
 TMUX_SOURCE = Path(inspect.getsourcefile(tmux_module) or "").read_text()
 TMUX_TREE = ast.parse(TMUX_SOURCE)

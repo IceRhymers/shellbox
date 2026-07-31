@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import uuid
 from collections.abc import Mapping, Sequence
@@ -97,8 +98,14 @@ FIELD_COUNT = len(LIST_FIELDS)
 # check does the detecting.
 _LIST_MAXSPLIT = FIELD_COUNT
 
-# Numeric/bounded formats, safe to read as a TAB group because none of them can contain a
-# TAB. Anything user-controlled (a path, a user option) is read one value per invocation.
+# Numeric/bounded formats, safe to read as a TAB group. Paths stay OUT of this group because
+# they are user-controlled and can contain a TAB or LF (§7.4).
+#
+# @shellbox_incarnation is the one user option read here, which the previous version of this
+# comment said should never happen. It is admissible only because the value is shape-checked on
+# read-back by `_own_incarnation`: a value carrying a TAB or LF cannot masquerade as valid, it
+# reads as ABSENT. Without that check this group would be exactly the hazard the comment warned
+# about, so the two changes belong together and neither is safe alone.
 _READ_FIELDS = (
     "#{window_width}",
     "#{window_height}",
@@ -114,6 +121,34 @@ _READ_FIELDS = (
 )
 
 INCARNATION_OPTION = "@shellbox_incarnation"
+
+# shellbox only ever writes a uuid4 here, so the read-back is shape-checked rather than merely
+# tested for emptiness. That is strictly stronger, and it closes an edge the emptiness test
+# could not:
+#
+# Both display read-backs take `stdout_raw.split("\n", 1)[0]`, so an incarnation containing an
+# LF truncates to its FIRST LINE. A value of "aaa\nbbb" therefore read back as "aaa" --
+# non-empty -- so `if not incarnation` was False and send/read/resize/kill all proceeded on a
+# session shellbox could not prove it owned. A TAB gave a related mess.
+#
+# This is not a privilege escalation: writing the option needs `tmux set-option` on the shared
+# server, and anyone with that can `capture-pane`/`send-keys` directly. What it damages is the
+# thing §9.1 says the incarnation actually buys -- post-hoc misdelivery DETECTION. A caller
+# comparing a truncated prefix will find two distinct incarnations equal, which is the
+# detection mechanism failing silently.
+_INCARNATION_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+
+def _own_incarnation(raw: str) -> str:
+    """A malformed incarnation is reported as ABSENT, i.e. ``""``.
+
+    Returning "" rather than raising is deliberate: every caller already distinguishes
+    "missing" from "present", and "shellbox cannot prove it owns this session" is exactly what
+    absent means. So this strengthens the existing checks without moving any of them.
+    """
+    return raw if _INCARNATION_RE.match(raw) else ""
+
+
 CWD_OPTION = "@shellbox_cwd"
 
 
@@ -373,8 +408,12 @@ class TmuxAdapter:
         The three are returned rather than collapsed because ``kill`` must treat the first as
         an idempotent no-op and the second as ``not_found``, and telling them apart by
         inspecting an exception message is the kind of thing that breaks silently.
+
+        A present-but-MALFORMED value collapses into the second state -- see
+        ``_own_incarnation`` for why a truncated prefix would otherwise read as valid.
         """
-        return self._display_tail(name, f"#{{{INCARNATION_OPTION}}}")
+        raw = self._display_tail(name, f"#{{{INCARNATION_OPTION}}}")
+        return raw if raw is None else _own_incarnation(raw)
 
     def _resolve_owned(self, name: str) -> str:
         """Return the session's incarnation, or raise ``not_found``.
@@ -629,7 +668,8 @@ class TmuxAdapter:
         metrics = self._display_numeric(name, _READ_FIELDS)
         if metrics is None:
             raise NotFound(f"session {name!r} does not exist", session=name)
-        width, height, pane_dead, history_size, history_limit, incarnation = metrics
+        width, height, pane_dead, history_size, history_limit, raw_incarnation = metrics
+        incarnation = _own_incarnation(raw_incarnation)
 
         # §6 lists not_found for send, read, resize AND kill when a session is present but
         # carries no incarnation. read was the one that did not enforce it, so the code was

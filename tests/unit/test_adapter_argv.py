@@ -203,7 +203,9 @@ def test_line_too_long_is_returned_without_invoking_tmux() -> None:
 
 def test_a_long_payload_split_across_lines_is_allowed() -> None:
     """Total bytes are not the boundary: 10 x 999-byte lines is fine, one 1000 is not."""
-    runner = RecordingRunner(default=result(rc=0, stdout="build\tINC-1\n"))
+    runner = RecordingRunner(
+        default=result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n")
+    )
     payload = "\n".join(["x" * 999] * 10)
     sent = adapter(runner).send("build", text=payload)
     assert sent.submitted_bytes == len(payload.encode())
@@ -293,7 +295,9 @@ def test_kill_distinguishes_absent_from_unowned() -> None:
 
 
 def test_send_text_uses_load_buffer_from_stdin_and_paste_buffer_dash_d() -> None:
-    runner = RecordingRunner(default=result(rc=0, stdout="build\tINC-1\n"))
+    runner = RecordingRunner(
+        default=result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n")
+    )
     sent = adapter(runner).send("build", text="echo hi\n")
 
     load_argv, load_stdin = next(c for c in runner.calls if "load-buffer" in c[0])
@@ -310,7 +314,7 @@ def test_send_text_uses_load_buffer_from_stdin_and_paste_buffer_dash_d() -> None
     assert paste_argv[paste_argv.index("-b") + 1] == buffer_name
     assert paste_argv[paste_argv.index("-t") + 1] == "=build:"
     assert sent.submitted_bytes == len(b"echo hi\n")
-    assert sent.incarnation == "INC-1"
+    assert sent.incarnation == "00000000-0000-4000-8000-000000000001"
     # Nothing here may be read as a delivery receipt: per H4 the bytes reaching the pane
     # PROCESS are not knowable to shellbox.
     assert sent.delivery == "unverified"
@@ -318,7 +322,9 @@ def test_send_text_uses_load_buffer_from_stdin_and_paste_buffer_dash_d() -> None
 
 def test_buffer_names_are_unique_per_call() -> None:
     """Required, not stylistic: a shared name lets pooled agents paste into each other."""
-    runner = RecordingRunner(default=result(rc=0, stdout="build\tINC-1\n"))
+    runner = RecordingRunner(
+        default=result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n")
+    )
     ad = adapter(runner)
     ad.send("build", text="a\n")
     ad.send("build", text="b\n")
@@ -335,7 +341,7 @@ def test_failed_paste_deletes_the_buffer_and_raises() -> None:
     """
     runner = RecordingRunner(
         results=[
-            result(rc=0, stdout="build\tINC-1\n"),  # resolve
+            result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n"),  # resolve
             result(rc=0),  # load-buffer
             result(rc=1, stderr="some paste failure"),  # paste-buffer
             result(rc=0),  # delete-buffer
@@ -353,7 +359,7 @@ def test_cleanup_failure_does_not_mask_the_paste_failure(
 ) -> None:
     runner = RecordingRunner(
         results=[
-            result(rc=0, stdout="build\tINC-1\n"),
+            result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n"),
             result(rc=0),
             result(rc=1, stderr="paste exploded"),
             result(rc=1, stderr="unknown buffer: shellbox-x"),
@@ -366,7 +372,9 @@ def test_cleanup_failure_does_not_mask_the_paste_failure(
 
 
 def test_send_keys_uses_a_double_dash_and_preserves_order() -> None:
-    runner = RecordingRunner(default=result(rc=0, stdout="build\tINC-1\n"))
+    runner = RecordingRunner(
+        default=result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n")
+    )
     sent = adapter(runner).send("build", keys=["C-c", "Enter"])
     argv = runner.sub_argv("send-keys")
     assert argv[argv.index("-t") + 1] == "=build:"
@@ -376,7 +384,9 @@ def test_send_keys_uses_a_double_dash_and_preserves_order() -> None:
 
 def test_text_is_delivered_before_keys() -> None:
     """Ordering is guaranteed (M18) and callers depend on it: paste, then Enter."""
-    runner = RecordingRunner(default=result(rc=0, stdout="build\tINC-1\n"))
+    runner = RecordingRunner(
+        default=result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n")
+    )
     adapter(runner).send("build", text="echo hi", keys=["Enter"])
     order = [argv for argv in runner.argvs if "paste-buffer" in argv or "send-keys" in argv]
     assert "paste-buffer" in order[0]
@@ -391,7 +401,9 @@ def test_text_is_delivered_before_keys() -> None:
 def test_read_preserves_ansi_and_omits_dash_j() -> None:
     runner = RecordingRunner(
         results=[
-            result(rc=0, stdout="build\t80\t24\t0\t7\t20000\tinc-1\n"),
+            result(
+                rc=0, stdout="build\t80\t24\t0\t7\t20000\t00000000-0000-4000-8000-000000000001\n"
+            ),
             result(rc=0, stdout="\x1b[31mRED\x1b[39m\n"),
         ]
     )
@@ -414,7 +426,9 @@ def test_read_preserves_ansi_and_omits_dash_j() -> None:
 def test_read_with_lines_uses_dash_s_negative() -> None:
     runner = RecordingRunner(
         results=[
-            result(rc=0, stdout="build\t80\t24\t0\t7\t20000\tinc-1\n"),
+            result(
+                rc=0, stdout="build\t80\t24\t0\t7\t20000\t00000000-0000-4000-8000-000000000001\n"
+            ),
             result(rc=0, stdout="x\n"),
         ]
     )
@@ -426,7 +440,9 @@ def test_read_with_lines_uses_dash_s_negative() -> None:
 def test_read_reports_a_dead_pane_as_not_alive() -> None:
     runner = RecordingRunner(
         results=[
-            result(rc=0, stdout="build\t80\t24\t1\t3\t20000\tinc-1\n"),
+            result(
+                rc=0, stdout="build\t80\t24\t1\t3\t20000\t00000000-0000-4000-8000-000000000001\n"
+            ),
             result(rc=0, stdout="LASTLINE\n"),
         ]
     )
@@ -662,13 +678,15 @@ def test_duplicate_session_with_a_matching_cwd_is_an_idempotent_reuse(tmp_path) 
     runner = RecordingRunner(
         results=[
             result(rc=1, stderr="duplicate session: build"),
-            result(rc=0, stdout="build\tINC-1\n"),  # existing incarnation
+            result(
+                rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n"
+            ),  # existing incarnation
             result(rc=0, stdout=f"build\t{real}\n"),  # existing @shellbox_cwd
         ]
     )
     created = adapter(runner).create("build", cwd=str(tmp_path))
     assert created.created is False
-    assert created.incarnation == "INC-1"
+    assert created.incarnation == "00000000-0000-4000-8000-000000000001"
 
 
 def test_duplicate_session_with_a_conflicting_cwd_is_already_exists(tmp_path) -> None:
@@ -676,7 +694,7 @@ def test_duplicate_session_with_a_conflicting_cwd_is_already_exists(tmp_path) ->
     runner = RecordingRunner(
         results=[
             result(rc=1, stderr="duplicate session: build"),
-            result(rc=0, stdout="build\tINC-1\n"),
+            result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n"),
             result(rc=0, stdout="build\t/somewhere/else\n"),
         ]
     )
@@ -710,7 +728,9 @@ def test_create_failure_other_than_duplicate_propagates(tmp_path) -> None:
 
 
 def test_every_invocation_carries_the_socket_and_ignores_user_config(tmp_path) -> None:
-    runner = RecordingRunner(default=result(rc=0, stdout="build\tINC-1\n"))
+    runner = RecordingRunner(
+        default=result(rc=0, stdout="build\t00000000-0000-4000-8000-000000000001\n")
+    )
     ad = adapter(runner)
     ad.create("build", cwd=str(tmp_path))
     ad.exists("build")
@@ -721,9 +741,25 @@ def test_every_invocation_carries_the_socket_and_ignores_user_config(tmp_path) -
 
 def test_every_dash_t_value_is_anchored_at_runtime(tmp_path) -> None:
     """The structural test in ``test_target.py`` proved the source; this proves the argv."""
-    # One default that satisfies both readers: `_display_tail` takes everything after the
-    # first TAB as the value (non-empty => owned), and `_display_numeric` sees 6 fields.
-    runner = RecordingRunner(default=result(rc=0, stdout="build\t80\t24\t0\t7\t20000\tinc-1\n"))
+    # One shared default no longer works, and the reason is a real tightening rather than a
+    # test inconvenience: `_display_tail` takes everything AFTER the first TAB as the value, so
+    # the 6-field row read back as "80\t24\t0\t7\t20000\t<uuid>" -- non-empty, and therefore
+    # previously accepted as a valid incarnation. The shape check now rejects it, which is
+    # exactly the laxness it was added to close. So answer per format instead.
+    incarnation = "00000000-0000-4000-8000-000000000001"
+
+    def respond(argv: tuple[str, ...]) -> object:
+        if "display-message" not in argv:
+            return None  # fall through to the empty default
+        wants_metrics = any("window_width" in arg for arg in argv)
+        row = (
+            f"build\t80\t24\t0\t7\t20000\t{incarnation}\n"
+            if wants_metrics
+            else f"build\t{incarnation}\n"
+        )
+        return result(rc=0, stdout=row)
+
+    runner = RecordingRunner(respond=respond)  # type: ignore[arg-type]
     ad = adapter(runner)
     ad.create("build", cwd=str(tmp_path))
     ad.send("build", text="hi\n", keys=["Enter"])

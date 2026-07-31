@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import pytest
 from conftest import TmuxServer, requires_tmux
+from shellbox_mcp.errors import NotFound, TmuxError
+from shellbox_mcp.tmux import INCARNATION_OPTION
 
 pytestmark = requires_tmux
 
@@ -118,3 +120,61 @@ def test_new_session_dash_s_takes_a_name_and_anchoring_it_is_a_category_error(
     assert tmux_server.sessions() == ["=build"]
     assert tmux_server.raw("has-session", "-t", "=build").rc != 0
     assert tmux_server.raw("has-session", "-t", "=build:").rc != 0
+
+
+# --- A malformed incarnation must read as ABSENT (code review of PR #11) -------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("newline", "aaa\nbbb"),
+        ("tab", "aaa\tbbb"),
+        ("not a uuid", "definitely-not-a-uuid"),
+        ("empty", ""),
+    ],
+)
+def test_a_malformed_incarnation_is_never_treated_as_owned(
+    tmux_server: TmuxServer, label: str, value: str
+) -> None:
+    """All four verbs must refuse a session whose incarnation is not a well-formed uuid4.
+
+    The newline case is the one that motivated this. Both display read-backs take
+    ``stdout_raw.split("\\n", 1)[0]``, so ``"aaa\\nbbb"`` read back as ``"aaa"`` -- non-empty,
+    so the emptiness check passed and send/read/resize/kill all proceeded on a session shellbox
+    could not prove it owned.
+
+    Not a privilege escalation: setting the option requires ``tmux set-option`` on the shared
+    server, and anyone with that can ``capture-pane``/``send-keys`` directly. What it damaged is
+    what §9.1 says the incarnation buys -- post-hoc misdelivery DETECTION, since a caller
+    comparing a truncated prefix finds two distinct incarnations equal.
+    """
+    name = "foreign"
+    tmux_server.raw("new-session", "-d", "-s", name, "-x", "80", "-y", "24", "sh")
+    tmux_server.raw("set-option", "-t", f"={name}:", INCARNATION_OPTION, value)
+
+    adapter = tmux_server.adapter()
+    for verb, call in (
+        ("read", lambda: adapter.read(name)),
+        ("send", lambda: adapter.send(name, text="x\n")),
+        ("resize", lambda: adapter.resize(name, cols=90, rows=30)),
+        ("kill", lambda: adapter.kill(name)),
+    ):
+        # The assertion is REFUSAL, not one specific code, because the two hazards are caught
+        # by different guards and forcing a uniform code would mean lying about one of them:
+        #
+        #   LF / non-uuid -> the shape check in `_own_incarnation` -> not_found, the precise
+        #                    answer ("shellbox cannot prove it owns this").
+        #   TAB           -> the display read-back's FIELD-COUNT check fires first, before any
+        #                    shape check runs -> tmux_error. Imprecise but safe, and mapping a
+        #                    field-count mismatch to not_found would be wrong in general: it
+        #                    can equally mean tmux is genuinely misbehaving.
+        #
+        # What must hold for every case is that the verb does not PROCEED.
+        with pytest.raises((NotFound, TmuxError)) as excinfo:
+            call()
+        assert verb  # names the failing verb in the pytest output
+        if label != "tab":
+            assert isinstance(excinfo.value, NotFound), (
+                f"{verb} on a {label} incarnation should be not_found, got {excinfo.value!r}"
+            )

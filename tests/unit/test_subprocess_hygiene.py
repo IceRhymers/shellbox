@@ -72,7 +72,7 @@ def test_every_invocation_uses_the_forced_env_an_argv_list_and_shell_false(
 
     class FakeCompleted:
         returncode = 0
-        stdout = b"build\tINC-1\n"
+        stdout = b"build\t00000000-0000-4000-8000-000000000001\n"
         stderr = b""
 
     def fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]

@@ -157,15 +157,35 @@ def check_b1(trials: int = 15) -> None:
                     # r2 §7.2's prescribed form, verbatim: create, then options
                     # chained in the same invocation.
                     s.run(
-                        "new-session", "-d", "-s", "a", "-x", "80", "-y", "24", "sh",
+                        "new-session",
+                        "-d",
+                        "-s",
+                        "a",
+                        "-x",
+                        "80",
+                        "-y",
+                        "24",
+                        "sh",
                         ";",
-                        "set-option", "-g", "history-limit", "20000",
+                        "set-option",
+                        "-g",
+                        "history-limit",
+                        "20000",
                         ";",
-                        "set-option", "-g", "status", "off",
+                        "set-option",
+                        "-g",
+                        "status",
+                        "off",
                         ";",
-                        "set-option", "-g", "remain-on-exit", "on",
+                        "set-option",
+                        "-g",
+                        "remain-on-exit",
+                        "on",
                         ";",
-                        "set-option", "-g", "window-size", "manual",
+                        "set-option",
+                        "-g",
+                        "window-size",
+                        "manual",
                     )
                 else:
                     s.run("new-session", "-d", "-s", "a", "-x", "80", "-y", "24", "sh")
@@ -206,11 +226,15 @@ def check_b2() -> None:
         with Server() as s:
             s.run("new-session", "-d", "-s", "build", "sh")
             s.run("new-session", "-d", "-s", "envtest", "sh")
-            r = s.run("set-option", "-t", form, "@shellbox_incarnation", "INC-1")
-            readback = s.run(
-                "list-sessions", "-F", "#{session_name}\t#{@shellbox_incarnation}"
+            r = s.run(
+                "set-option",
+                "-t",
+                form,
+                "@shellbox_incarnation",
+                "00000000-0000-4000-8000-000000000001",
             )
-            stored = "INC-1" in readback["stdout"]
+            readback = s.run("list-sessions", "-F", "#{session_name}\t#{@shellbox_incarnation}")
+            stored = "00000000-0000-4000-8000-000000000001" in readback["stdout"]
             # The two that matter: '=name:' must work, '=name' must not.
             ok = True
             if form == "=build:":
@@ -365,9 +389,16 @@ def check_b4() -> None:
         r = s.run(
             "start-server",
             ";",
-            "set-option", "-g", "history-limit", want,
+            "set-option",
+            "-g",
+            "history-limit",
+            want,
             ";",
-            "new-session", "-d", "-s", "a", "sh",
+            "new-session",
+            "-d",
+            "-s",
+            "a",
+            "sh",
         )
         pane = s.run("display-message", "-p", "-t", T("a"), "#{history_limit}")
         emit(
@@ -397,9 +428,7 @@ def check_h4() -> None:
         for length in (500, 1023, 1024, 4095, 4096, 8192):
             with Server() as s:
                 out = os.path.join(tempfile.mkdtemp(prefix="sbx"), "out")
-                reader = (
-                    f"cat > {out}" if mode == "canonical" else f"stty -icanon; cat > {out}"
-                )
+                reader = f"cat > {out}" if mode == "canonical" else f"stty -icanon; cat > {out}"
                 s.run("new-session", "-d", "-s", "a", "sh", "-c", reader)
                 time.sleep(0.3)  # let the reader install its termios state
 
@@ -464,13 +493,16 @@ def check_cwd_injection() -> None:
                 s.run("new-session", "-d", "-s", "build", "-x", "80", "-y", "24", "sh")
                 s.run("set-option", "-t", T("build"), "@shellbox_cwd", d)
                 raw = s.run("list-sessions", "-F", FIELDS_8)["stdout_raw"]
-                lines = [l for l in raw.split("\n") if l]
+                lines = [line for line in raw.split("\n") if line]
                 n = len(lines[0].split("\t")) if lines else 0
                 got_cwd = lines[0].split("\t")[7] if lines and n > 7 else None
 
                 if kind == "plain":
-                    ok = expect("CWD[clean path yields 8 fields, exact]",
-                                n == 8 and got_cwd == d, f"{n} fields, cwd={got_cwd!r}")
+                    ok = expect(
+                        "CWD[clean path yields 8 fields, exact]",
+                        n == 8 and got_cwd == d,
+                        f"{n} fields, cwd={got_cwd!r}",
+                    )
                 else:
                     # Assert the HAZARD is real, so the guard can never be dropped
                     # silently: either the field count breaks or the value is wrong.
@@ -518,14 +550,54 @@ def check_chain_verbatim() -> None:
     with Server() as s:
         chain = s.run(
             "start-server",
-            ";", "set-option", "-g", "history-limit", "20000",
-            ";", "set-option", "-g", "status", "off",
-            ";", "set-option", "-g", "default-terminal", "screen-256color",
-            ";", "set-option", "-g", "remain-on-exit", "on",
-            ";", "new-session", "-d", "-s", "build", "-x", "80", "-y", "24",
-            "-c", "/tmp", "-e", "FOO=a\nb", "-e", "BAR=x;y", "sh",
-            ";", "set-option", "-t", T("build"), "@shellbox_incarnation", inc,
-            ";", "set-option", "-t", T("build"), "@shellbox_cwd", "/tmp",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            "20000",
+            ";",
+            "set-option",
+            "-g",
+            "status",
+            "off",
+            ";",
+            "set-option",
+            "-g",
+            "default-terminal",
+            "screen-256color",
+            ";",
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "on",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            "build",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "-c",
+            "/tmp",
+            "-e",
+            "FOO=a\nb",
+            "-e",
+            "BAR=x;y",
+            "sh",
+            ";",
+            "set-option",
+            "-t",
+            T("build"),
+            "@shellbox_incarnation",
+            inc,
+            ";",
+            "set-option",
+            "-t",
+            T("build"),
+            "@shellbox_cwd",
+            "/tmp",
         )
         pane_hist = s.run("display-message", "-p", "-t", T("build"), "#{history_limit}")
         dterm = s.run("show-options", "-g", "default-terminal")
@@ -536,14 +608,23 @@ def check_chain_verbatim() -> None:
         fields = listing["stdout_raw"].split("\n")[0].split("\t") if listing["stdout"] else []
         oks = [
             expect("CHAIN[rc=0]", chain["rc"] == 0, chain["stderr"]),
-            expect("CHAIN[pane history_limit=20000]", pane_hist["stdout"] == "20000",
-                   f"pane read {pane_hist['stdout']!r}"),
-            expect("CHAIN[default-terminal applied]",
-                   "screen-256color" in dterm["stdout"], dterm["stdout"]),
+            expect(
+                "CHAIN[pane history_limit=20000]",
+                pane_hist["stdout"] == "20000",
+                f"pane read {pane_hist['stdout']!r}",
+            ),
+            expect(
+                "CHAIN[default-terminal applied]",
+                "screen-256color" in dterm["stdout"],
+                dterm["stdout"],
+            ),
             expect("CHAIN[incarnation round-trips]", inc in listing["stdout"], listing["stdout"]),
             expect("CHAIN[second create succeeds]", second["rc"] == 0, second["stderr"]),
-            expect("CHAIN[-F yields exactly 8 fields]", len(fields) == 8,
-                   f"got {len(fields)}: {fields}"),
+            expect(
+                "CHAIN[-F yields exactly 8 fields]",
+                len(fields) == 8,
+                f"got {len(fields)}: {fields}",
+            ),
         ]
         emit(
             "CHAIN",
@@ -590,13 +671,35 @@ def check_composition() -> None:
     with Server() as s:
         steps = []
         out = os.path.join(tempfile.mkdtemp(prefix="sbx"), "out")
-        steps.append(s.run(
-            "start-server",
-            ";", "set-option", "-g", "history-limit", "20000",
-            ";", "set-option", "-g", "remain-on-exit", "on",
-            ";", "new-session", "-d", "-s", "build", "-x", "80", "-y", "24",
-            "-c", "/tmp", "sh", "-c", f"stty -icanon; cat > {out}",
-        ))
+        steps.append(
+            s.run(
+                "start-server",
+                ";",
+                "set-option",
+                "-g",
+                "history-limit",
+                "20000",
+                ";",
+                "set-option",
+                "-g",
+                "remain-on-exit",
+                "on",
+                ";",
+                "new-session",
+                "-d",
+                "-s",
+                "build",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-c",
+                "/tmp",
+                "sh",
+                "-c",
+                f"stty -icanon; cat > {out}",
+            )
+        )
 
         payload = b"echo hello\n"
         buf = f"sb-{uuid.uuid4().hex[:8]}"
@@ -611,10 +714,17 @@ def check_composition() -> None:
         gone = s.run("has-session", "-t", T("build"))
 
         oks = [
-            expect("COMPOSITION[all steps rc=0]", all(st["rc"] == 0 for st in steps),
-                   str([st["argv"] for st in steps if st["rc"] != 0])),
-            expect("COMPOSITION[bytes delivered exactly]", delivered == len(payload),
-                   f"{delivered}/{len(payload)}"),
+            expect("COMPOSITION[resize rc=0]", resize["rc"] == 0, resize["stderr"]),
+            expect(
+                "COMPOSITION[all steps rc=0]",
+                all(st["rc"] == 0 for st in steps),
+                str([st["argv"] for st in steps if st["rc"] != 0]),
+            ),
+            expect(
+                "COMPOSITION[bytes delivered exactly]",
+                delivered == len(payload),
+                f"{delivered}/{len(payload)}",
+            ),
             expect("COMPOSITION[capture-pane rc=0]", read["rc"] == 0, read["stderr"]),
             expect("COMPOSITION[resize applied]", "100x30" in after["stdout"], after["stdout"]),
             expect("COMPOSITION[kill rc=0]", killed["rc"] == 0, killed["stderr"]),
@@ -661,22 +771,33 @@ def check_display_message_multifield() -> None:
         )
 
         oks = [
-            expect("F11[single-field missing target is empty]", single["stdout"] == "",
-                   f"got {single['stdout']!r}"),
+            expect(
+                "F11[single-field missing target is empty]",
+                single["stdout"] == "",
+                f"got {single['stdout']!r}",
+            ),
             # The trap: this is NOT empty, so `if not stdout: not_found` fails here.
-            expect("F11[multi-field missing target emits the literal separators]",
-                   multi["stdout_raw"].strip("\n") != "" and multi["rc"] == 0,
-                   f"got {multi['stdout_raw']!r} rc={multi['rc']}"),
-            expect("F11[and only separators -- every placeholder expanded empty]",
-                   multi["stdout_raw"].replace("\t", "").strip() == "",
-                   f"got {multi['stdout_raw']!r}"),
+            expect(
+                "F11[multi-field missing target emits the literal separators]",
+                multi["stdout_raw"].strip("\n") != "" and multi["rc"] == 0,
+                f"got {multi['stdout_raw']!r} rc={multi['rc']}",
+            ),
+            expect(
+                "F11[and only separators -- every placeholder expanded empty]",
+                multi["stdout_raw"].replace("\t", "").strip() == "",
+                f"got {multi['stdout_raw']!r}",
+            ),
             # The fix, both directions.
-            expect("F11[session_name-prefixed: first field EMPTY when missing]",
-                   prefixed_missing["stdout_raw"].split("\t")[0] == "",
-                   f"got {prefixed_missing['stdout_raw']!r}"),
-            expect("F11[session_name-prefixed: first field is the NAME when present]",
-                   prefixed_present["stdout_raw"].split("\t")[0] == "build",
-                   f"got {prefixed_present['stdout_raw']!r}"),
+            expect(
+                "F11[session_name-prefixed: first field EMPTY when missing]",
+                prefixed_missing["stdout_raw"].split("\t")[0] == "",
+                f"got {prefixed_missing['stdout_raw']!r}",
+            ),
+            expect(
+                "F11[session_name-prefixed: first field is the NAME when present]",
+                prefixed_present["stdout_raw"].split("\t")[0] == "build",
+                f"got {prefixed_present['stdout_raw']!r}",
+            ),
         ]
         emit(
             "F11",
@@ -713,9 +834,7 @@ def check_stderr_signatures() -> None:
         s.run("new-session", "-d", "-s", "build", "-x", "80", "-y", "24", "sh")
         observed["kill_missing"] = s.run("kill-session", "-t", T("nosuch"))["stderr"]
         observed["capture_missing"] = s.run("capture-pane", "-p", "-t", T("nosuch"))["stderr"]
-        observed["set_option_missing"] = s.run(
-            "set-option", "-t", T("nosuch"), "@a", "b"
-        )["stderr"]
+        observed["set_option_missing"] = s.run("set-option", "-t", T("nosuch"), "@a", "b")["stderr"]
         observed["duplicate"] = s.run("new-session", "-d", "-s", "build")["stderr"]
         observed["no_tty"] = s.run("new-session", "-d", "-A", "-s", "build")["stderr"]
 
@@ -738,9 +857,13 @@ def check_stderr_signatures() -> None:
     dummy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         dummy.bind(stale_sock)
-        observed["no_server"] = subprocess.run(
-            [TMUX, "-S", stale_sock, "-f", "/dev/null", "list-sessions"], capture_output=True
-        ).stderr.decode(errors="replace").strip()
+        observed["no_server"] = (
+            subprocess.run(
+                [TMUX, "-S", stale_sock, "-f", "/dev/null", "list-sessions"], capture_output=True
+            )
+            .stderr.decode(errors="replace")
+            .strip()
+        )
     finally:
         dummy.close()
         try:
@@ -749,14 +872,22 @@ def check_stderr_signatures() -> None:
             pass
 
     missing_sock = os.path.join(SOCKET_ROOT, f"sbxmissing{uuid.uuid4().hex[:8]}")
-    observed["cold_start"] = subprocess.run(
-        [TMUX, "-S", missing_sock, "-f", "/dev/null", "list-sessions"], capture_output=True
-    ).stderr.decode(errors="replace").strip()
+    observed["cold_start"] = (
+        subprocess.run(
+            [TMUX, "-S", missing_sock, "-f", "/dev/null", "list-sessions"], capture_output=True
+        )
+        .stderr.decode(errors="replace")
+        .strip()
+    )
 
     long_sock = os.path.join(SOCKET_ROOT, "s" * 200)
-    observed["path_too_long"] = subprocess.run(
-        [TMUX, "-S", long_sock, "-f", "/dev/null", "list-sessions"], capture_output=True
-    ).stderr.decode(errors="replace").strip()
+    observed["path_too_long"] = (
+        subprocess.run(
+            [TMUX, "-S", long_sock, "-f", "/dev/null", "list-sessions"], capture_output=True
+        )
+        .stderr.decode(errors="replace")
+        .strip()
+    )
 
     # (scenario, every substring errors.py requires for its classification)
     required = {
@@ -845,15 +976,38 @@ def check_adapter_forms() -> None:
         out = os.path.join(tempfile.mkdtemp(prefix="sbx"), "out")
         s.run(
             "start-server",
-            ";", "set-option", "-g", "history-limit", "20000",
-            ";", "set-option", "-g", "remain-on-exit", "on",
-            ";", "new-session", "-d", "-s", "build", "-x", "80", "-y", "24",
-            "-c", "/tmp", "sh", "-c", f"stty -icanon; cat > {out}",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            "20000",
+            ";",
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "on",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            "build",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "-c",
+            "/tmp",
+            "sh",
+            "-c",
+            f"stty -icanon; cat > {out}",
         )
 
         # (a) the numeric group read, TAB-joined -- none of these can contain a TAB.
         numeric = s.run(
-            "display-message", "-p", "-t", T("build"),
+            "display-message",
+            "-p",
+            "-t",
+            T("build"),
             "#{session_name}\t#{window_width}\t#{window_height}\t#{pane_dead}"
             "\t#{history_size}\t#{history_limit}",
         )
@@ -877,14 +1031,19 @@ def check_adapter_forms() -> None:
 
         oks = [
             expect("F14[numeric group yields 6 fields]", len(fields) == 6, str(fields)),
-            expect("F14[numeric group leads with the session name]", fields[0] == "build",
-                   str(fields)),
-            expect("F14[pane history_limit in the group is 20000]", fields[5] == "20000",
-                   str(fields)),
+            expect(
+                "F14[numeric group leads with the session name]", fields[0] == "build", str(fields)
+            ),
+            expect(
+                "F14[pane history_limit in the group is 20000]", fields[5] == "20000", str(fields)
+            ),
             expect("F14[capture-pane -S -N rc=0]", capture["rc"] == 0, capture["stderr"]),
             expect("F14[send-keys -- <key> rc=0]", keys["rc"] == 0, keys["stderr"]),
-            expect("F14[the named key reached the pane]", delivered >= 1,
-                   f"{delivered} bytes at the reader"),
+            expect(
+                "F14[the named key reached the pane]",
+                delivered >= 1,
+                f"{delivered} bytes at the reader",
+            ),
             expect("F14[buffer was present before delete]", buf in listed_before, listed_before),
             expect("F14[delete-buffer rc=0]", deleted["rc"] == 0, deleted["stderr"]),
             expect("F14[no buffer left behind]", listed_after == "", listed_after),
@@ -946,7 +1105,13 @@ def check_locale_tab_dependence() -> None:
 
     with Server() as s:
         s.run("new-session", "-d", "-s", "build", "-x", "80", "-y", "24", "sh")
-        s.run("set-option", "-t", T("build"), "@shellbox_incarnation", "INC-1")
+        s.run(
+            "set-option",
+            "-t",
+            T("build"),
+            "@shellbox_incarnation",
+            "00000000-0000-4000-8000-000000000001",
+        )
 
         results = {}
         oks = []
@@ -956,8 +1121,16 @@ def check_locale_tab_dependence() -> None:
                 errors="replace"
             )
             argv = [
-                TMUX, "-S", s.sock, "-f", "/dev/null",
-                "display-message", "-p", "-t", T("build"), fmt,
+                TMUX,
+                "-S",
+                s.sock,
+                "-f",
+                "/dev/null",
+                "display-message",
+                "-p",
+                "-t",
+                T("build"),
+                fmt,
             ]
             displayed = subprocess.run(argv, capture_output=True, env=env).stdout.decode(
                 errors="replace"
@@ -966,8 +1139,7 @@ def check_locale_tab_dependence() -> None:
             oks.append(
                 expect(
                     f"F15[{label}: TAB survives == {tab_expected}]",
-                    (("\t" in listed) == tab_expected)
-                    and (("\t" in displayed) == tab_expected),
+                    (("\t" in listed) == tab_expected) and (("\t" in displayed) == tab_expected),
                     f"list={listed!r} display={displayed!r}",
                 )
             )
@@ -1030,8 +1202,13 @@ def check_self() -> None:
 
 
 def main() -> int:
-    emit("ENV", "what is under test?", tmux_version=tmux_version(),
-         platform=sys.platform, tmux_bin=TMUX)
+    emit(
+        "ENV",
+        "what is under test?",
+        tmux_version=tmux_version(),
+        platform=sys.platform,
+        tmux_bin=TMUX,
+    )
     check_self()
     check_b1()
     check_b2()
@@ -1048,12 +1225,16 @@ def main() -> int:
     check_adapter_forms()
     check_locale_tab_dependence()
 
-    emit("SUMMARY", "did every assertion hold?",
-         failures=FAILURES, failure_count=len(FAILURES), ok=not FAILURES)
+    emit(
+        "SUMMARY",
+        "did every assertion hold?",
+        failures=FAILURES,
+        failure_count=len(FAILURES),
+        ok=not FAILURES,
+    )
     if FAILURES:
         print(
-            f"\nFAILED: {len(FAILURES)} assertion(s)\n  "
-            + "\n  ".join(FAILURES),
+            f"\nFAILED: {len(FAILURES)} assertion(s)\n  " + "\n  ".join(FAILURES),
             file=sys.stderr,
         )
         return 1

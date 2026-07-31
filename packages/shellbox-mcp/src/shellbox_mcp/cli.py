@@ -47,8 +47,12 @@ Deferred subcommands: enroll, bootstrap (W7/W8) and doctor (W8).
 # of "unknown command", which is the difference between a reader checking the plan and a
 # reader checking their spelling.
 _DEFERRED = {
-    "enroll": "W7 (identity.py/enroll.py)",
-    "bootstrap": "W8 (databrickscfg.py)",
+    # `identity.py` has landed and `serve` uses it, so a host now has a real, stable identity
+    # and a resolved owner_email without this command. What `enroll` still owes is the rest of
+    # E1-E7: resolving the sandbox CREATOR from the ambient credential (D4), writing the `hosts`
+    # row, orphan reconciliation, and the heartbeat.
+    "enroll": "W7c (enroll.py: E1-E7, hosts row, orphan reconciliation, heartbeat)",
+    "bootstrap": "W8 (boot_templated.py: per-boot PAT reset and sandbox_id stamp)",
     "doctor": "W8 (doctor)",
 }
 

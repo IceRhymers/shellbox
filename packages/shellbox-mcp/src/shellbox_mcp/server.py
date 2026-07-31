@@ -34,6 +34,7 @@ import functools
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 
@@ -42,7 +43,7 @@ from mcp.server.fastmcp import FastMCP
 from shellbox_registry import NullRegistry, Registry, create_registry
 from shellbox_registry import SessionRecord as RegistrySessionRecord
 
-from shellbox_mcp import naming
+from shellbox_mcp import identity, naming
 from shellbox_mcp.config import Settings
 from shellbox_mcp.errors import (
     InvalidName,
@@ -58,6 +59,11 @@ logger = logging.getLogger(__name__)
 __all__ = ["build_server", "error_payload", "serve"]
 
 SERVER_NAME = "shellbox"
+
+# A sentinel rather than `None`, because `SessionRecord.owner_email` is typed `str` and the
+# column is NOT NULL. Making the unresolved case a distinct object means `project` can refuse
+# it by identity, and no code path can smuggle it into the database by treating it as a name.
+_OWNER_UNRESOLVED = "\x00unresolved"
 
 INSTRUCTIONS = """\
 tmux-backed shell sessions that outlive this MCP server process.
@@ -250,6 +256,53 @@ def _install_error_boundary(mcp: FastMCP[Any]) -> None:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class HostContext:
+    """Who this host is and whose it is, resolved once per process.
+
+    Separate from ``Settings`` on purpose: ``Settings`` is a pure function of the environment,
+    while this is the result of reading (and possibly writing) the identity cache under a lock.
+    See ``config.py``'s docstring for why that split is load-bearing.
+    """
+
+    host_id: str
+    kind: str
+    owner_email: str | None
+    """``None`` means enrollment is DEFERRED (E2d): no credential, nothing cached, and
+    ``SHELLBOX_OWNER_EMAIL`` unset. Shell tools still work -- only the inventory waits."""
+    sandbox_id: str | None = None
+    gateway_host: str | None = None
+
+
+def resolve_host_context(settings: Settings) -> HostContext:
+    """Resolve identity explicitly, at a point where writing a file is expected.
+
+    ⚠️ ``credential_email=None``: resolving the *creating user* from the sandbox's ambient
+    credential (D4, ``current_user.me()``) belongs to ``enroll.py`` and is not wired up yet. So
+    ``owner_email`` currently comes from the cache, then ``SHELLBOX_OWNER_EMAIL``, then defers.
+    That is E2b/E2c/E2d working as specified -- not a stub -- and E2a's reconciliation arrives
+    with the credential.
+    """
+    host = identity.resolve_host_id(
+        settings.state_dir,
+        explicit=settings.host_id_override,
+        # `recovered` (the @shellbox_host_id tmux stamp) is W7's: nothing stamps it yet, so
+        # passing it would be passing None with extra steps.
+    )
+    owner = identity.resolve_owner_email(
+        settings.state_dir,
+        credential_email=None,
+        env_email=settings.owner_email,
+    )
+    return HostContext(
+        host_id=host.host_id,
+        kind=host.kind,
+        owner_email=owner.owner_email,
+        sandbox_id=host.sandbox_id,
+        gateway_host=host.gateway_host,
+    )
+
+
 def _open_registry(settings: Settings) -> Registry:
     """Pick a registry. NEVER fatal -- an unusable one degrades to ``NullRegistry``.
 
@@ -270,7 +323,9 @@ def _open_registry(settings: Settings) -> Registry:
 
 
 def build_server(
-    settings: Settings | None = None, registry: Registry | None = None
+    settings: Settings | None = None,
+    registry: Registry | None = None,
+    host: HostContext | None = None,
 ) -> FastMCP[Any]:
     """Construct a server. Called once per process by ``serve`` -- and twice by a test.
 
@@ -280,6 +335,13 @@ def build_server(
     ``tests/integration/test_no_session_state.py``).
     """
     resolved = Settings.from_env() if settings is None else settings
+    # Before identity resolution, not after: the identity cache lives in this directory, and
+    # `ensure_state_dir` is the only thing that creates it with mode 0700.
+    try:
+        resolved.ensure_state_dir()
+    except OSError as exc:
+        logger.warning("could not create SHELLBOX_STATE_DIR %r: %s", resolved.state_dir, exc)
+    identified = resolve_host_context(resolved) if host is None else host
     store: Registry = _open_registry(resolved) if registry is None else registry
     mcp: FastMCP[Any] = FastMCP(
         SERVER_NAME, instructions=INSTRUCTIONS, log_level=resolved.log_level
@@ -296,16 +358,17 @@ def build_server(
         return TmuxAdapter(resolved.tmux_config())
 
     def session_id(tmux_name: str) -> str:
-        return naming.session_id(resolved.host_id, tmux_name)
+        return naming.session_id(identified.host_id, tmux_name)
 
     def tmux_name_of(session: str) -> str:
         """Accept either a bare tmux name or a full ``<host_id>:<tmux_name>`` session id.
 
-        ``rpartition``, not ``partition``: a derived ``host_id`` is itself
-        ``lakebox:<sandbox_id>``, so the session id has two colons and splitting on the
-        first would yield ``abc123:build`` as the name. Session names cannot contain a
-        colon (``naming.SESSION_NAME_RE``), so the last colon is unambiguously the
-        separator.
+        ``rpartition``, not ``partition``, and it still matters even though a resolved
+        ``host_id`` is now a colon-free uuid4: ``$SHELLBOX_HOST_ID`` can be set to anything,
+        and session names cannot contain a colon (``naming.SESSION_NAME_RE``), so the LAST
+        colon is the only unambiguous separator. (`identity.py` rejects a colon in a cached or
+        overridden id, so the two-colon case that originally motivated this -- the abandoned
+        ``lakebox:<sandbox_id>`` derivation -- can no longer arise.)
 
         A session id carrying a DIFFERENT host is ``invalid_name`` rather than
         ``not_found``: the session may well exist, but not on this host, and this process
@@ -315,10 +378,10 @@ def build_server(
         if ":" not in session:
             return session
         host, _, name = session.rpartition(":")
-        if host != resolved.host_id:
+        if host != identified.host_id:
             raise InvalidName(
                 f"session id {session!r} belongs to host {host!r}, not this host "
-                f"({resolved.host_id!r}); this process can only address its own tmux server",
+                f"({identified.host_id!r}); this process can only address its own tmux server",
                 session=session,
             )
         return name
@@ -334,14 +397,34 @@ def build_server(
         rows means paths and an owner email; the full exception goes to stderr, where it is
         a diagnostic, and not into a payload an agent may echo anywhere.
 
-        ⚠️ **Expected to warn on every call until W7 lands.** ``sessions.host_id`` is a foreign
-        key to ``hosts``, and enrolling the host is W7's (``enroll.py``, E1-E7). Against a
-        reachable-but-unenrolled database this projection therefore fails and every create
-        reports a ``registry_warning`` -- measured, not assumed. That is the correct behaviour
-        for W4 (the shell still works), and it is also why this is worth a comment: the next
-        person to see the warning should look for the missing ``hosts`` row, not for a bug
+        ⚠️ **Expected to warn on every call until ``enroll.py`` lands.** ``sessions.host_id`` is
+        a foreign key to ``hosts``, and writing the ``hosts`` row is W7's (``enroll.py``,
+        E1-E7). Against a reachable-but-unenrolled database this projection therefore fails and
+        every create reports a ``registry_warning`` -- measured, not assumed. That is the
+        correct behaviour (the shell still works), and it is why this is worth a comment: the
+        next person to see the warning should look for the missing ``hosts`` row, not for a bug
         here.
         """
+        if record.owner_email is _OWNER_UNRESOLVED:
+            # 🔴 Never invent an owner. This column is what #7's ACL will filter on, so a
+            # placeholder is not a harmless gap -- it is a row that a future `WHERE
+            # owner_email = ...` either grants to nobody or, worse, matches for whoever ends up
+            # owning the placeholder string. An earlier version wrote the literal "unknown"
+            # here, which would have accumulated real sessions under a fake principal.
+            #
+            # Skipping is E2d working as designed: tools keep working, the inventory waits for a
+            # credential. The warning says so, because a silently missing row is the one outcome
+            # nobody can debug.
+            logger.warning(
+                "not writing session %s to the registry: owner_email is unresolved "
+                "(enrollment deferred). Set SHELLBOX_OWNER_EMAIL, or wait for enroll.py to "
+                "resolve the sandbox creator from its credential.",
+                record.session_id,
+            )
+            return (
+                "inventory deferred: this host has no resolved owner_email yet, so the session "
+                "was not recorded. The shell itself is unaffected."
+            )
         try:
             store.upsert_session(record)
         except Exception as exc:  # noqa: BLE001 -- see the docstring: this may not raise
@@ -366,13 +449,13 @@ def build_server(
         now = datetime.now(UTC)
         return RegistrySessionRecord(
             session_id=session_id(tmux_name),
-            host_id=resolved.host_id,
+            host_id=identified.host_id,
             tmux_name=tmux_name,
             # W7 resolves this from `current_user.me()`. Until then an unset
             # SHELLBOX_OWNER_EMAIL is recorded as "unknown" rather than skipping the write:
             # #7's per-owner filtering is a WHERE clause over this column, and a missing
             # row is harder to notice later than an obviously unresolved one.
-            owner_email=resolved.owner_email or "unknown",
+            owner_email=identified.owner_email or _OWNER_UNRESOLVED,
             last_activity_at=now,
             status=status,
             cwd=cwd,
@@ -418,7 +501,7 @@ def build_server(
             rows=result.rows,
             created=result.created,
             incarnation=result.incarnation,
-            host_id=resolved.host_id,
+            host_id=identified.host_id,
             registry_warning=warning,
         )
 
@@ -512,7 +595,7 @@ def build_server(
         """
         records = adapter().list_sessions()
         return ListResult(
-            host_id=resolved.host_id,
+            host_id=identified.host_id,
             sessions=[_entry(record, session_id(record.tmux_name)) for record in records],
         )
 
@@ -596,11 +679,19 @@ def serve(settings: Settings | None = None) -> None:
         naming.validate_socket_path(resolved.socket_path)
     except ShellboxError as exc:
         logger.error("tmux socket path is unusable: %s", exc.message)
+
+    # Resolved here and passed in, rather than letting `build_server` do it: identity assignment
+    # writes a file and takes a lock, and doing it twice per process to satisfy a log line would
+    # be one arbitrated transaction too many.
+    identified = resolve_host_context(resolved)
     logger.info(
-        "shellbox-mcp serving on stdio: tmux=%s socket=%s host_id=%s registry=%s",
+        "shellbox-mcp serving on stdio: tmux=%s socket=%s host_id=%s (%s, %s) owner=%s registry=%s",
         resolved.tmux_bin,
         resolved.socket_path,
-        resolved.host_id,
+        identified.host_id,
+        identified.kind,
+        f"sandbox {identified.sandbox_id}" if identified.sandbox_id else "no sandbox_id",
+        identified.owner_email or "DEFERRED",
         "postgres" if resolved.database_dsn else "none",
     )
-    build_server(resolved).run()
+    build_server(resolved, host=identified).run()

@@ -107,3 +107,53 @@ def test_a_malformed_dsn_does_not_stop_the_server_from_starting(
     )
     assert created.data["created"] is True
     assert "could not open the registry" in harness.stderr()
+
+
+def test_an_unresolved_owner_defers_the_inventory_instead_of_inventing_a_principal(
+    tmux_server: TmuxServer, tmp_path: Path
+) -> None:
+    """🔴 With no resolvable `owner_email`, the session row is SKIPPED, not written with a
+    placeholder.
+
+    `sessions.owner_email` is NOT NULL and is the column #7's ACL will filter on, so an earlier
+    version writing the literal ``"unknown"`` would have accumulated real sessions under a fake
+    principal — rows a later ``WHERE owner_email = ...`` either grants to nobody or, worse,
+    matches for whoever ends up owning that string. E2d says defer, so it defers.
+
+    The DSN is deliberately the unreachable one: it makes the assertion prove *ordering*. A
+    "deferred" warning rather than "registry unavailable" can only mean the skip happened before
+    any connection was attempted, which is what makes this a policy and not an accident of a
+    database being down.
+    """
+    harness = make_harness(tmux_server, tmp_path)
+    name = "noowner"
+    env = harness.env_with(
+        SHELLBOX_OWNER_EMAIL=None,
+        SHELLBOX_DATABASE_URL=UNREACHABLE_DSN,
+    )
+    created, killed = run_calls(
+        harness,
+        [
+            ("shell_create", {"name": name, "cwd": str(tmp_path)}),
+            ("shell_kill", {"session": name}),
+        ],
+        env=env,
+    )
+
+    # The shell itself is entirely unaffected — that is the whole point of E2d.
+    assert not created.is_error, created.text
+    assert created.data["created"] is True
+
+    warning = created.data["registry_warning"]
+    assert warning and "inventory deferred" in warning, (
+        f"expected a deferred-inventory warning, got {warning!r}"
+    )
+    assert "registry unavailable" not in warning, (
+        "the projection attempted a connection before checking the owner, so this test is not "
+        "proving that the skip is a policy"
+    )
+    assert killed.data["killed"] is True
+
+    stderr = harness.stderr()
+    assert "owner_email is unresolved" in stderr, "the skip was not logged as a diagnostic"
+    assert f"itest-host:{name}" in stderr, "the log does not say which session was affected"

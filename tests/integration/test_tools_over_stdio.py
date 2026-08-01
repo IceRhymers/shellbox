@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import anyio
-from conftest import TmuxServer, requires_tmux
+from conftest import TmuxServer, counted_lines, requires_tmux, sentinel
 from harness import await_content, call, make_harness, run_calls, run_script
 from mcp import ClientSession
 
@@ -63,6 +63,7 @@ def test_create_send_read_resize_list_kill_round_trip(
     """
     harness = make_harness(tmux_server, tmp_path)
     name = harness.name("life")
+    life = sentinel("LIFE")
 
     async def script(client: ClientSession) -> dict[str, object]:
         created = (await call(client, "shell_create", {"name": name, "cwd": str(tmp_path)})).data
@@ -70,12 +71,13 @@ def test_create_send_read_resize_list_kill_round_trip(
             await call(
                 client,
                 "shell_send",
-                # `LIFE''-OK` prints as "LIFE-OK" but echoes differently, so the sentinel
-                # proves the shell RAN the command rather than merely received it.
-                {"session": created["session"], "text": "echo LIFE''-OK\n"},
+                # The sentinel proves the shell RAN the command rather than merely
+                # received it -- `conftest.sentinel` enforces that its token cannot appear
+                # in the command's own echo.
+                {"session": created["session"], "text": life.echo()},
             )
         ).data
-        content = await await_content(client, created["session"], "LIFE-OK")
+        content = await await_content(client, created["session"], life.awaited)
         resized = (
             await call(client, "shell_resize", {"session": name, "cols": 100, "rows": 40})
         ).data
@@ -105,14 +107,14 @@ def test_create_send_read_resize_list_kill_round_trip(
     assert created["incarnation"], "shell_create returned an empty incarnation"
 
     sent = out["sent"]
-    assert sent["submitted_bytes"] == len("echo LIFE''-OK\n")
+    assert sent["submitted_bytes"] == len(life.echo())
     assert sent["keys_sent"] == []
     # Stated in the payload so no caller mistakes submission for receipt (H4).
     assert sent["delivery"] == "unverified"
     # §9.1: the incarnation the send TARGETED, which is what makes misdelivery detectable.
     assert sent["incarnation"] == created["incarnation"]
 
-    assert "LIFE-OK" in out["content"]
+    assert life.awaited in out["content"]
 
     assert out["resized"] == {
         "session": f"itest-host:{name}",
@@ -175,6 +177,7 @@ def test_send_keys_are_delivered_after_text(tmux_server: TmuxServer, tmp_path: P
     """
     harness = make_harness(tmux_server, tmp_path)
     name = harness.name("keys")
+    keys = sentinel("KEYS")
 
     async def script(client: ClientSession) -> tuple[dict[str, object], str]:
         await call(client, "shell_create", {"name": name, "cwd": str(tmp_path)})
@@ -182,20 +185,18 @@ def test_send_keys_are_delivered_after_text(tmux_server: TmuxServer, tmp_path: P
             await call(
                 client,
                 "shell_send",
-                # `KEYS''-OK` echoes to the pane as typed but PRINTS as "KEYS-OK", so the
-                # sentinel exists only in the shell's OUTPUT. Without that, both the wait
-                # and the assertion below are satisfied by the echoed command line -- and
-                # this test would pass even if Enter were never processed, which is the one
-                # thing it exists to prove.
-                {"session": name, "text": "echo KEYS''-OK", "keys": ["Enter"]},
+                # No trailing newline: `Enter` is what must submit the line. The sentinel
+                # exists only in the shell's OUTPUT, so without it this test would pass even
+                # if Enter were never processed -- the one thing it exists to prove.
+                {"session": name, "text": keys.echo(newline=False), "keys": ["Enter"]},
             )
         ).data
-        return sent, await await_content(client, name, "KEYS-OK")
+        return sent, await await_content(client, name, keys.awaited)
 
     sent, content = run_script(harness, script)
     assert sent["keys_sent"] == ["Enter"]
-    assert sent["submitted_bytes"] == len("echo KEYS''-OK")
-    assert "KEYS-OK" in content, (
+    assert sent["submitted_bytes"] == len(keys.echo(newline=False))
+    assert keys.awaited in content, (
         "the shell never ran the command, so Enter was not processed: " + repr(content)
     )
 
@@ -246,16 +247,16 @@ def test_read_reports_a_dead_pane_and_still_returns_its_output(
     """
     harness = make_harness(tmux_server, tmp_path)
     name = harness.name("dead")
+    # A sentinel for the same reason as the others: the closing assertion is what names
+    # "a dead pane still returns ITS OUTPUT", and an echoed command line is not output. The
+    # alive-is-false poll below rescues the timing, so this was never a false green for pane
+    # death -- but it would have passed if `echo` produced nothing and only `exit` ran.
+    bye = sentinel("BYE")
 
     async def script(client: ClientSession) -> dict[str, object]:
         await call(client, "shell_create", {"name": name, "cwd": str(tmp_path)})
-        # BYE''-NOW for the same reason as the others: the closing assertion is what names
-        # "a dead pane still returns ITS OUTPUT", and an echoed command line is not output.
-        # The alive-is-false poll below rescues the timing, so this was not a false green for
-        # pane death -- but it would have passed if `echo` produced nothing and only `exit`
-        # ran.
-        await call(client, "shell_send", {"session": name, "text": "echo BYE''-NOW; exit\n"})
-        await await_content(client, name, "BYE-NOW")
+        await call(client, "shell_send", {"session": name, "text": f"echo {bye.typed}; exit\n"})
+        await await_content(client, name, bye.awaited)
         # Poll for the pane's death rather than sleeping past it: the shell exits when it
         # gets round to it, not when tmux accepted the paste.
         last: dict[str, object] = {}
@@ -269,7 +270,7 @@ def test_read_reports_a_dead_pane_and_still_returns_its_output(
 
     read = run_script(harness, script)
     assert read["alive"] is False
-    assert "BYE-NOW" in str(read["content"])
+    assert bye.awaited in str(read["content"])
 
 
 def test_read_lines_reports_scrollback_facts(tmux_server: TmuxServer, tmp_path: Path) -> None:
@@ -282,17 +283,15 @@ def test_read_lines_reports_scrollback_facts(tmux_server: TmuxServer, tmp_path: 
     harness = make_harness(tmux_server, tmp_path)
     name = harness.name("hist")
 
-    # The sentinel must NOT appear in the command echo, or the wait is satisfied the instant
-    # the line is typed and the read races the output. `seq 1 200` + awaiting "200" did
-    # exactly that: it matched the echoed command, passed on macOS by luck of timing, and
-    # failed on Linux with scrollback_lines == 0. `printf 'L%s\n'` puts "L200" only in the
-    # OUTPUT -- the command text contains "L%s".
-    emit_200_lines = "printf 'L%s\\n' $(seq 1 200)\n"
+    # `counted_lines` puts the awaited token only in the OUTPUT: the command text holds
+    # `L%s`, never `L200`. Awaiting "200" against `seq 1 200` matched the echoed command --
+    # it passed on macOS by luck of timing and failed on Linux with scrollback_lines == 0.
+    lines = counted_lines(200)
 
     async def script(client: ClientSession) -> dict[str, object]:
         await call(client, "shell_create", {"name": name, "cwd": str(tmp_path)})
-        await call(client, "shell_send", {"session": name, "text": emit_200_lines})
-        await await_content(client, name, "L200", lines=300)
+        await call(client, "shell_send", {"session": name, "text": lines.typed + "\n"})
+        await await_content(client, name, lines.awaited, lines=300)
         return (await call(client, "shell_read", {"session": name, "lines": 300})).data
 
     read = run_script(harness, script)

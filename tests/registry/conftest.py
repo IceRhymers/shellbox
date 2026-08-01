@@ -45,7 +45,7 @@ def _local_dev_dsn() -> str:
 
 # Hosts these fixtures may destroy without being asked twice.
 #
-# 🔴 The fixtures below are DESTRUCTIVE: they `drop_all` on teardown. Pointed at a shared
+# CRITICAL: The fixtures below are DESTRUCTIVE: they `drop_all` on teardown. Pointed at a shared
 # or managed database they silently delete its schema — measured, not hypothetical. Running
 # this suite against a real Lakebase endpoint dropped `hosts` and `sessions` while
 # `alembic_version` was left claiming the migrations were applied, which is precisely the
@@ -96,7 +96,7 @@ def pg_engine(_pg_engine_or_skip: Engine) -> Generator[Engine, None, None]:
     afterward — cheaper than driving alembic per-test; alembic itself is exercised by
     ``test_migrations.py``.
 
-    ⚠️ Two things this fixture does NOT give you, both of which have already misled someone:
+    WARNING: Two things this fixture does NOT give you, both of which have already misled someone:
 
     * **It builds the schema from the MODELS, never from the migrations.** So a test passing here
       says nothing about whether a migration exists for what it asserts — deleting migration 0002

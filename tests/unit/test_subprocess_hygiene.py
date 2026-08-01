@@ -42,7 +42,7 @@ def test_the_environment_is_an_allowlist(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_a_utf8_ctype_locale_is_forced(monkeypatch: pytest.MonkeyPatch) -> None:
-    """🔴 The whole 8-field record depends on this, and it is the bug W2 nearly shipped.
+    """CRITICAL: The whole 8-field record depends on this, and it is the bug W2 nearly shipped.
 
     Measured in both lanes: with a non-UTF-8 ctype locale, tmux encodes the TAB in format
     output as ``_`` -- in ``list-sessions -F`` as well as ``display-message`` -- so all eight

@@ -115,7 +115,7 @@ def test_a_malformed_dsn_does_not_stop_the_server_from_starting(
 def test_an_unresolved_owner_defers_the_inventory_instead_of_inventing_a_principal(
     tmux_server: TmuxServer, tmp_path: Path
 ) -> None:
-    """🔴 With no resolvable `owner_email`, the session row is SKIPPED, not written with a
+    """CRITICAL: With no resolvable `owner_email`, the session row is SKIPPED, not written with a
     placeholder.
 
     `sessions.owner_email` is NOT NULL and is the column #7's ACL will filter on, so an earlier
@@ -165,7 +165,7 @@ def test_an_unresolved_owner_defers_the_inventory_instead_of_inventing_a_princip
 def test_enrollment_cannot_delay_the_handshake_even_against_a_hanging_registry(
     tmux_server: TmuxServer, tmp_path: Path
 ) -> None:
-    """🔴 The W7 promise, asserted with a clock: enrollment never blocks the handshake.
+    """CRITICAL: The W7 promise, asserted with a clock: enrollment never blocks the handshake.
 
     This is the one criterion that needs the *wiring* to be real rather than the module to be
     correct. `enroll` resolves the sandbox creator (a network call) and writes a `hosts` row, both
@@ -173,9 +173,9 @@ def test_enrollment_cannot_delay_the_handshake_even_against_a_hanging_registry(
     `initialize`/`tools/list` — which a harness reports as a failed handshake, with nothing to
     suggest an inventory write was the cause. So enrollment runs on a daemon thread.
 
-    ⚠️ The DSN **hangs**; it is deliberately not `UNREACHABLE_DSN`. Port 1 is closed, so a connect
-    there RSTs instantly and this assertion would pass whether or not enrollment blocked — it
-    would measure nothing. 198.51.100.1 is unrouted TEST-NET-2, so a connect stalls, and the only
+    WARNING: The DSN **hangs**; it is deliberately not `UNREACHABLE_DSN`. Port 1 is closed, so a
+    connect there RSTs instantly and this assertion would pass whether or not enrollment blocked —
+    it would measure nothing. 198.51.100.1 is unrouted TEST-NET-2, so a connect stalls, and the only
     way to answer inside the bound is to not be waiting on it.
 
     `shell_list` specifically, because it is the one tool that does **not** project to the
@@ -199,7 +199,7 @@ def test_enrollment_cannot_delay_the_handshake_even_against_a_hanging_registry(
 def test_a_hanging_registry_delays_a_projecting_call_by_a_BOUNDED_amount(
     tmux_server: TmuxServer, tmp_path: Path
 ) -> None:
-    """🔴 "Non-fatal" has to mean bounded, not merely eventually-successful.
+    """CRITICAL: "Non-fatal" has to mean bounded, not merely eventually-successful.
 
     Registry writes are non-fatal by construction — a failure becomes a `registry_warning` on an
     otherwise successful call — but that covers *errors*, not *latency*. `shell_create` projects
@@ -234,7 +234,7 @@ def test_a_hanging_registry_delays_a_projecting_call_by_a_BOUNDED_amount(
 def test_an_owner_resolved_after_startup_starts_being_recorded(
     tmux_server: TmuxServer, tmp_path: Path
 ) -> None:
-    """🔴 The bug a real sandbox run found, and nothing local could have.
+    """CRITICAL: The bug a real sandbox run found, and nothing local could have.
 
     `resolve_host_context` runs before `FastMCP.run()` and deliberately does NOT make the
     network call that resolves the sandbox's creator — `enroll.py` does that on a background

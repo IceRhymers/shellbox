@@ -91,7 +91,7 @@ def test_a_boot_templated_symlink_is_recognised(tree: SandboxTree) -> None:
 
 
 def test_a_dangling_symlink_is_distinguished_from_a_working_one(tree: SandboxTree) -> None:
-    """🔴 Not a nicety — this is the measured state of `~/.databricks/token-cache.json`.
+    """CRITICAL: Not a nicety — this is the measured state of `~/.databricks/token-cache.json`.
 
     The link exists and its target does not, so the OAuth cache is not merely emptied at
     boot: it is absent. Code that only asked "is this a symlink?" would report it healthy,
@@ -114,7 +114,7 @@ def test_a_regular_file_and_an_absent_path_are_not_templated(tree: SandboxTree) 
 
 # --------------------------------------------------------- the contract: never follow
 def test_the_symlink_is_replaced_and_its_target_left_byte_unchanged(tree: SandboxTree) -> None:
-    """🔴 The property the whole module exists for.
+    """CRITICAL: The property the whole module exists for.
 
     Writing *through* the link would put the new content in `/run` — which is wiped between
     boots — and leave the caller believing it succeeded. The proof is not "the file now has
@@ -199,7 +199,7 @@ def test_the_reset_says_in_the_file_that_it_is_per_boot(tree: SandboxTree) -> No
 
 # ------------------------------------------------------------- merge mode 2: the Codex
 def test_codex_registration_preserves_the_harness_model_config(tree: SandboxTree) -> None:
-    """🔴 The case a wholesale writer would have shipped broken.
+    """CRITICAL: The case a wholesale writer would have shipped broken.
 
     `model_provider` and `model_providers` are how Codex reaches its model. An earlier
     version of ADR-7 specified "unlink and write a regular file in its place", which is
@@ -279,7 +279,7 @@ def test_the_placeholder_diagnosis_names_the_actual_cause() -> None:
 
 # --------------------------------------------------- §0.6: the override that hides a reset
 def test_reset_pat_also_resets_the_overridden_path(tree: SandboxTree, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """🔴 The measured hazard: `DATABRICKS_CONFIG_FILE` overrides the `~/` path.
+    """CRITICAL: The measured hazard: `DATABRICKS_CONFIG_FILE` overrides the `~/` path.
 
     PID 1 and `ttyd` both export it in a Lakebox, pointing at `/run/lakebox/databrickscfg`.
     Where an agent inherits it, resetting only `~/.databrickscfg` leaves the baked PAT in
@@ -306,7 +306,7 @@ def test_reset_pat_also_resets_the_overridden_path(tree: SandboxTree, monkeypatc
 def test_reset_pat_refuses_to_report_success_while_a_credential_survives(
     tree: SandboxTree, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
-    """🔴 The criterion, stated as its own test: it must NEVER report success while the
+    """CRITICAL: The criterion, stated as its own test: it must NEVER report success while the
     baked PAT is still in use.
 
     Simulated by making the overridden path un-writable, which is the shape of every real

@@ -293,7 +293,7 @@ def test_tmux_unavailable_for_a_socket_path_over_the_platform_limit(
 def test_unknown_tmux_stderr_is_tmux_error_and_never_an_empty_list(
     tmux_server: TmuxServer, tmp_path: Path
 ) -> None:
-    """🔴 The one that matters most: an unrecognised tmux failure is NOT an empty inventory.
+    """CRITICAL: The one that matters most: an unrecognised tmux failure is NOT an empty inventory.
 
     ``shell_list`` returns ``[]`` for exactly two measured stderr signatures ("no server
     running" and the cold-start "error connecting to ... (No such file or directory)"). Any
@@ -335,7 +335,7 @@ def test_a_too_long_socket_path_is_not_reported_as_no_server(
 def test_no_server_is_never_a_public_code(tmux_server: TmuxServer, tmp_path: Path) -> None:
     """The internal N1 classification does not leak into a tool payload.
 
-    ⚠️ **Where §6 and N1 disagree, and how it is pinned.** §6's table calls
+    WARNING: **Where §6 and N1 disagree, and how it is pinned.** §6's table calls
     ``tmux_unavailable`` "the only code for 'no tmux server'", while N1 says ``no server
     running`` means "an empty list for ``shell_list``; **not_found elsewhere**". This lane
     asserts N1's reading, which is the one ``errors.py`` implements (``tmux_failure``'s

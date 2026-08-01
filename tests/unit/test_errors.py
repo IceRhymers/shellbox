@@ -81,7 +81,7 @@ def test_every_n1_signature_is_covered_by_a_test() -> None:
     ],
 )
 def test_unknown_stderr_is_tmux_error_never_no_server(stderr: str) -> None:
-    """🔴 Unknown stderr must NEVER be classified as "no server", i.e. as an empty list.
+    """CRITICAL: Unknown stderr must NEVER be classified as "no server", i.e. as an empty list.
 
     ``shell_list`` returns an empty inventory for exactly one classification. If an
     unrecognised failure reached it, a broken tmux would be reported as a healthy empty

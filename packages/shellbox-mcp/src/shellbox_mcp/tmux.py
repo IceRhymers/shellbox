@@ -155,7 +155,7 @@ CWD_OPTION = "@shellbox_cwd"
 # `$HOME/.shellbox/host.json` while sessions are still running can re-adopt its real identity
 # instead of re-keying every `session_id` (see `identity.py`).
 #
-# ⚠️ Deliberately NOT a ninth `LIST_FIELDS` entry, and this is a decision, not an oversight.
+# WARNING: Deliberately NOT a ninth `LIST_FIELDS` entry, and this is a decision, not an oversight.
 # `LIST_FIELDS` is exactly 8 with `_LIST_MAXSPLIT = FIELD_COUNT` and a long comment on why
 # maxsplit must be one MORE than a well-formed record needs; `_READ_FIELDS` separately
 # documents why the single possibly-empty field is last; and shipped tests assert "`-F` yields
@@ -217,7 +217,7 @@ class TmuxConfig:
     # Extra env for the tmux CLIENT process (not the pane). TERM and LC_CTYPE are forced
     # separately. LC_ALL is deliberately ABSENT and must stay absent -- see below.
     passthrough_env: tuple[str, ...] = ("HOME", "PATH", "USER", "LOGNAME", "LANG")
-    # 🔴 FORCED, and the whole 8-field record depends on it. Measured in BOTH lanes: when the
+    # CRITICAL: FORCED, and the whole 8-field record depends on it. Measured in BOTH lanes: when the
     # invoking client's ctype locale is not UTF-8, tmux visually encodes the TAB in format
     # output as `_` -- in `list-sessions -F` as well as `display-message`. The entire record
     # then collapses to ONE field (`build_1785…_80_24_0_<inc>_/tmp`), every record is dropped
@@ -360,7 +360,7 @@ class TmuxAdapter:
     def _display_tail(self, name: str, format_field: str) -> str | None:
         """Read ONE user-controlled format field. ``None`` means the target did not resolve.
 
-        ⚠️ ``display-message`` returns **rc=0 for every nonexistent target** (spike F6) --
+        WARNING: ``display-message`` returns **rc=0 for every nonexistent target** (spike F6) --
         it is the only one of the seven verbs measured that does, so an rc check on it is
         worthless. The rule is: **empty output is ``not_found``**.
 
@@ -724,7 +724,7 @@ class TmuxAdapter:
     def list_sessions(self) -> list[SessionRecord]:
         """Every session on the server, parsed from the 8-field format.
 
-        🔴 Only the two exact ``no_server`` signatures yield an empty list -- ``no server
+        CRITICAL: Only the two exact ``no_server`` signatures yield an empty list -- ``no server
         running`` (the socket exists, nothing is listening) and ``error connecting to … (No
         such file or directory)`` (the cold start, no socket file yet). Every other non-zero
         exit raises, including ``error connecting to … (File name too long)``, which shares a
@@ -789,7 +789,7 @@ class TmuxAdapter:
                 )
             )
         if lines and not records:
-            # 🔴 tmux listed sessions and NONE of them parsed. Never return that as an empty
+            # CRITICAL: tmux listed sessions and NONE of them parsed. Never return that as an empty
             # inventory: an empty list is indistinguishable from "this host has no sessions",
             # and orphan reconciliation would mark every live session on the host `orphaned`
             # on the strength of it.

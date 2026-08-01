@@ -58,7 +58,7 @@ def test_doctor_and_bootstrap_are_real_subcommands(tmp_path: Path) -> None:
     `doctor` runs and exits 0 on a healthy host; `bootstrap` with no options refuses rather
     than silently doing nothing, because silence is indistinguishable from success.
     """
-    # ⚠️ An explicit SHORT socket, for the third time in this suite: the default is
+    # WARNING: An explicit SHORT socket, for the third time in this suite: the default is
     # `$SHELLBOX_STATE_DIR/tmux.sock`, and pytest's `tmp_path` alone is 141 bytes here —
     # past macOS's 104-byte `sun_path` limit. Without it `doctor` correctly reports FAIL and
     # this test measures the fixture rather than the command. `tests/conftest.py` documents

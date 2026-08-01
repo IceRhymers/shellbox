@@ -13,7 +13,7 @@ is the variable: the per-window form ``-w -t '=<name>:'`` is safe (0/15). Phase 
 neither, so the grep below is for the string at all -- the cheapest assertion that cannot
 be satisfied by a subtly wrong scope.
 
-⚠️ For whoever adds attach support in Phase 3/4: "set it lazily at first attach" is FATAL if
+WARNING: For whoever adds attach support in Phase 3/4: "set it lazily at first attach" is FATAL if
 implemented with ``-g``. It detonates the shared server on the next agent's ``shell_create``,
 i.e. this same defect with a longer fuse.
 """

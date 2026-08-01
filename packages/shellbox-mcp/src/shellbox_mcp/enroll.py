@@ -105,7 +105,7 @@ def resolve_credential_email(*, timeout: float = 30.0) -> str | None:
     exposes **no owner field**, while the credential baked into `~/.databrickscfg` at boot
     authenticates as the sandbox's *creator* (measured -- `docs/sandbox-environment.md` §5).
 
-    ⚠️ **This credential is a confused deputy, and on the measured sandbox it belongs to a
+    WARNING: **This credential is a confused deputy, and on the measured sandbox it belongs to a
     workspace admin.** Any agent in the sandbox can act as that user, so a hostile agent can
     forge `owner_email`. That is R6, accepted only while access is default-open (D6), and it
     is a hard blocker for #7's ACL -- which must replace this with a per-host enrollment token
@@ -248,8 +248,8 @@ def reconcile_orphans(
     `$HOME`, so the server and every session die, and the rows that describe them are the only
     thing left claiming otherwise (R3).
 
-    🔴 **The guard that makes this safe to run at all.** "No sessions on the server" and "I am
-    looking at the wrong server" produce identical evidence — an empty list — and the two
+    CRITICAL: **The guard that makes this safe to run at all.** "No sessions on the server" and "I
+    am looking at the wrong server" produce identical evidence — an empty list — and the two
     demand opposite responses. If *this* process resolved a different `socket_path` than the
     one the `hosts` row records (a different `$HOME`, an operator's `SHELLBOX_STATE_DIR`, a
     `sudo` invocation), then the live sessions are all on the *other* socket and orphaning every
@@ -584,11 +584,11 @@ def start_enrollment(
 ) -> threading.Thread:
     """Run enrollment on a daemon thread and start the heartbeat if it succeeded.
 
-    🔴 **This is the function that keeps the promise "enrollment never blocks the handshake".**
-    Everything in E2-E7 can be slow or can hang: `current_user.me()` is a network call, and a
-    registry pointed at an unreachable DSN waits out a connect timeout. Doing any of it before
-    `FastMCP.run()` would delay `initialize`/`tools/list` — which a client reports as a failed
-    handshake, with no indication that the cause was an inventory write.
+    CRITICAL: **This is the function that keeps the promise "enrollment never blocks the
+    handshake".** Everything in E2-E7 can be slow or can hang: `current_user.me()` is a network
+    call, and a registry pointed at an unreachable DSN waits out a connect timeout. Doing any of it
+    before `FastMCP.run()` would delay `initialize`/`tools/list` — which a client reports as a
+    failed handshake, with no indication that the cause was an inventory write.
 
     Returns the thread so a test can join it. Nothing on the tool path ever does.
     """

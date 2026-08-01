@@ -35,7 +35,7 @@ Three consequences, each of which this module exists to handle:
    Wholesale replacement is expressed as a merge function that ignores its input, so both
    callers share one code path and the dangerous one is not the default.
 
-⚠️ **`~/.claude.json` is deliberately NOT in this module.** It is a real file in persistent
+WARNING: **`~/.claude.json` is deliberately NOT in this module.** It is a real file in persistent
 `$HOME`, absent from the boot script, holding Claude Code's own state (`projects`, existing
 `mcpServers`). Routing it through a symlink-aware writer would be pointless at best and
 destructive at worst.
@@ -370,7 +370,7 @@ TOKEN_CACHE_VAR = "DATABRICKS_TOKEN_CACHE_FILE"
 def config_file_overrides(env: dict[str, str] | None = None) -> dict[str, str]:
     """Any `DATABRICKS_*_FILE` override in effect, as `{var: path}`.
 
-    🔴 **This is why the PAT reset is not simply "write `~/.databrickscfg`".** PID 1 in a
+    CRITICAL: **This is why the PAT reset is not simply "write `~/.databrickscfg`".** PID 1 in a
     Lakebox exports both of these, pointing at `/run/lakebox/...`, and they **override the
     `~/` defaults** for the CLI and the SDK alike. Measured: an sshd-spawned shell does not
     inherit them, but `ttyd` — which also runs in the image — carries both, so an agent
@@ -409,7 +409,7 @@ class ResetOutcome:
 def reset_pat(env: dict[str, str] | None = None) -> ResetOutcome:
     """Remove the sandbox's baked creator PAT from **every config the SDK would read**.
 
-    🔴 The verification at the end is the point of this function. Writing
+    CRITICAL: The verification at the end is the point of this function. Writing
     `~/.databrickscfg` is the easy part; what makes a reset *true* is that no reachable
     config still carries a token afterwards. With `DATABRICKS_CONFIG_FILE` set — which PID 1
     and `ttyd` both export in a Lakebox — writing only `~/.databrickscfg` leaves the baked
@@ -420,7 +420,7 @@ def reset_pat(env: dict[str, str] | None = None) -> ResetOutcome:
     correct whether or not the process inherited them, which matters because whether
     `login` scrubs them is a util-linux detail an image bump could change silently.
 
-    ⚠️ **Per-boot.** `ln -sfn` re-points these paths at every start, so this must run again
+    WARNING: **Per-boot.** `ln -sfn` re-points these paths at every start, so this must run again
     after every restart. `doctor` reports when it has not.
     """
     source = dict(os.environ if env is None else env)

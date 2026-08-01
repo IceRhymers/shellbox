@@ -381,11 +381,11 @@ def _replace_unusable(
 ) -> HostIdentity | None:
     """Handle EMPTY / CORRUPT / ABSENT-with-a-stamp. ``None`` ⇒ retry the resolution.
 
-    🔴 **This is where six identities came from.** Quarantine-then-assign is two steps, and with
-    no arbitration two processes each quarantined what the other had just assigned: 32 processes
-    produced 6 distinct ids, 5 quarantine files of which 4 held *live valid identities*, and the
-    ERROR log named a file it had not moved. The fix is not a better quarantine — it is that the
-    whole transaction is serialized and re-decided from a read taken **under** the lock.
+    CRITICAL: **This is where six identities came from.** Quarantine-then-assign is two steps, and
+    with no arbitration two processes each quarantined what the other had just assigned: 32
+    processes produced 6 distinct ids, 5 quarantine files of which 4 held *live valid identities*,
+    and the ERROR log named a file it had not moved. The fix is not a better quarantine — it is that
+    the whole transaction is serialized and re-decided from a read taken **under** the lock.
     """
     with _exclusive(path) as acquired:
         if not acquired:
@@ -571,9 +571,9 @@ def _exclusive(path: Path, *, attempts: int = 1) -> Iterator[bool]:
     * ``attempts>1`` — **wait, briefly.** For callers whose work is unconditional and cannot be
       deferred to anyone else.
 
-    🔴 The second mode exists because the first was applied to a caller that needed it. Property
-    writes gave up on contention, and the justification — "the next start records them" — is
-    false when every contender is in the **same boot**: with 16 processes released together,
+    CRITICAL: The second mode exists because the first was applied to a caller that needed it.
+    Property writes gave up on contention, and the justification — "the next start records them" —
+    is false when every contender is in the **same boot**: with 16 processes released together,
     ``sandbox_id`` was absent from the file in 3 of 12 rounds and ``owner_email`` in 4 of 12,
     which is exactly the "`doctor` reports a bootstrapped host as never bootstrapped" symptom
     `_record_properties` exists to prevent. The critical section is two filesystem calls, so
@@ -640,7 +640,7 @@ def _exclusive(path: Path, *, attempts: int = 1) -> Iterator[bool]:
 def _quarantine(path: Path) -> Path:
     """Move a corrupt cache aside, preserving it. Returns its new path.
 
-    ⚠️ **Callers must hold `_exclusive`.** The `exists()`-then-`replace` below is only safe
+    WARNING: **Callers must hold `_exclusive`.** The `exists()`-then-`replace` below is only safe
     because one process at a time runs it; unguarded, two quarantines moved each other's
     freshly-assigned identities aside and split one sandbox six ways.
 
@@ -715,16 +715,16 @@ def _record_properties(
 ) -> None:
     """Persist a `sandbox_id`/`gateway_host` the caller brought that the cache lacks.
 
-    🔴 Without this, ADR-8 does not work past the first boot. The bootstrap path runs **every
+    CRITICAL: Without this, ADR-8 does not work past the first boot. The bootstrap path runs **every
     boot** and is the only actor that knows the sandbox id, but from boot 2 onward it takes the
     cache-hit branch -- so the id was handed back to that one caller and never written, leaving
     the other 1-31 processes in the boot with ``None``, `doctor` reporting a bootstrapped host as
     "never bootstrapped", and the `hosts` row losing a column it had. Invisible to any assertion
     on the *returned* value, which was correct throughout.
 
-    ⚠️ Not best-effort. An earlier version skipped the write when another process held the lock,
-    reasoning that "the next start records them" -- which is false, because **every contender is
-    in the same boot**. If all the processes that were told the `sandbox_id` lose the lock to an
+    WARNING: Not best-effort. An earlier version skipped the write when another process held the
+    lock, reasoning that "the next start records them" -- which is false, because **every contender
+    is in the same boot**. If all the processes that were told the `sandbox_id` lose the lock to an
     owner-email writer, nobody records it, and "the next start" means a sandbox restart. Measured
     at 16 processes: `sandbox_id` absent from the file in 3 of 12 rounds. So this waits.
     """
@@ -851,7 +851,7 @@ def resolve_owner_email(
     no TTL** -- a sandbox that changed hands would keep attributing its shells to the previous
     owner.
 
-    ⚠️ **E2b is weaker than the inherited plan assumed.** Its "no credential, cache present"
+    WARNING: **E2b is weaker than the inherited plan assumed.** Its "no credential, cache present"
     case was documented as *the* normal path after the PAT reset, on the strength of the CLI's
     OAuth token cache serving in-sandbox API calls. That holds **within one boot only**:
     `~/.databricks/token-cache.json` is boot-templated into wiped `/run`

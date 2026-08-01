@@ -68,7 +68,7 @@ def test_bootstrap_records_the_gateway_host_too(tmp_path: Path) -> None:
 
 
 def test_bootstrap_refuses_to_reset_without_recording_which_sandbox() -> None:
-    """🔴 ADR-8's "one invocation does both", in the direction that matters.
+    """CRITICAL: ADR-8's "one invocation does both", in the direction that matters.
 
     A reset-only run produces a host that has lost its credential AND cannot be named in
     the inventory — `doctor` would report "sandbox_id is NULL: never bootstrapped" about a
@@ -148,7 +148,7 @@ def test_help_goes_to_stderr_and_names_the_new_commands(
 def test_doctor_works_when_the_mcp_sdk_is_unavailable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """🔴 `doctor` must not need the thing it is diagnosing.
+    """CRITICAL: `doctor` must not need the thing it is diagnosing.
 
     `cli.py` used to import `server.serve` at module level, which pulls in the MCP SDK and
     pydantic — so `shellbox-mcp doctor` died on an unrelated `ModuleNotFoundError` in

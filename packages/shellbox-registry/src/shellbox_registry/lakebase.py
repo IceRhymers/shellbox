@@ -178,7 +178,7 @@ def sdk_token_minter(
 
         kwargs: dict[str, Any] = {}
         if ttl_seconds is not None:
-            # ⚠️ `ttl` is a protobuf `Duration`, NOT the `"900s"` string the API docs show —
+            # WARNING: `ttl` is a protobuf `Duration`, NOT the `"900s"` string the API docs show —
             # the SDK calls `.ToJsonString()` on whatever it is given, so a string raises
             # `AttributeError: 'str' object has no attribute 'ToJsonString'`. Measured
             # against the live API; the fake minter in the unit tests cannot see this.
@@ -225,7 +225,7 @@ def sdk_token_minter(
 def _as_datetime(value: Any) -> datetime | None:
     """Coerce the SDK's expiry to an aware UTC datetime, or ``None``.
 
-    ⚠️ **`expire_time` is a protobuf `Timestamp`, not a datetime or a string** — measured
+    WARNING: **`expire_time` is a protobuf `Timestamp`, not a datetime or a string** — measured
     against the live API, after an earlier version of this function handled only the latter
     two, silently returned ``None``, and sent the caller down the "assume the floor" path.
     It assumed **300s against a real 3600s token**, i.e. 12x the necessary minting, and no

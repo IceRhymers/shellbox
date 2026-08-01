@@ -8,7 +8,7 @@ Two reader panes, testing two different things, and they must never be unified:
   ``SHELLBOX_MAX_SEND_LINE_BYTES`` must be refused before tmux is invoked, so the bytes the
   line discipline would destroy never reach the pty.
 
-⚠️ The tempting "fix" if a byte-exactness assertion ever fails is to add ``stty -icanon`` to
+WARNING: The tempting "fix" if a byte-exactness assertion ever fails is to add ``stty -icanon`` to
 the canonical case. That deletes the second property, keeps CI green, and leaves production
 dropping bytes on macOS and TRUNCATING them on Linux -- rc=0 both ways.
 ``test_the_h4_hazard_is_real_in_this_lane`` is the assertion that keeps the reason executable.
@@ -44,8 +44,8 @@ BIG_LINE_BYTES = 20_000
 # The raw-mode cases need the guard out of the way -- 20 KB on one line is `line_too_long`
 # under the shipping default of 1000, which is the correct production behaviour.
 #
-# 🔴 Raising the limit is legitimate ONLY together with a raw-mode reader, and the two must be
-# changed as a pair. A raised limit pointed at a canonical-mode pane is not a test setting: it
+# CRITICAL: Raising the limit is legitimate ONLY together with a raw-mode reader, and the two must
+# be changed as a pair. A raised limit pointed at a canonical-mode pane is not a test setting: it
 # is the production hazard, reproduced below and measured in both lanes as spike F5.
 RAW_MODE_LIMIT = 1 << 20
 
@@ -184,7 +184,7 @@ def test_the_h4_hazard_is_real_in_this_lane(tmux_server: TmuxServer, tmp_path) -
     (the sandbox) silently truncates to 4096, which is the worse of the two because a
     truncated command is a different, still-executable command.
 
-    ⚠️ **The one assertion in this suite that needs a deadline**, because it is a claim that
+    WARNING: **The one assertion in this suite that needs a deadline**, because it is a claim that
     something never arrives, and no condition can be polled for that. It fails in the safe
     direction: a timeout waiting for completeness IS the property holding, and the loss is
     deterministic in both lanes (spike F5, which is the oracle for it). The ordinary

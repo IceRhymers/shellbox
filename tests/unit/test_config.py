@@ -28,7 +28,7 @@ def test_the_defaults_are_ss_table() -> None:
 
 # --------------------------------------------------------------- the deleted derivation
 def test_settings_has_no_host_id_at_all() -> None:
-    """🔴 `Settings` must not carry a resolved identity, only an override.
+    """CRITICAL: `Settings` must not carry a resolved identity, only an override.
 
     Asserted as the *absence* of the attribute rather than by grepping for `_machine_id`,
     because the failure mode to prevent is someone re-adding a convenient `settings.host_id`

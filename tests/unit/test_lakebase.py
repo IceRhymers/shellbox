@@ -109,7 +109,7 @@ def test_the_server_stated_expiry_is_trusted_rather_than_a_hardcoded_ttl() -> No
 
 
 def test_the_token_is_refreshed_BEFORE_it_expires_not_when_it_expires() -> None:
-    """🔴 The margin is the point, and asserting it needs the clock.
+    """CRITICAL: The margin is the point, and asserting it needs the clock.
 
     A token that passes the check and then expires *during* the TCP connect and TLS
     handshake fails the connect — and surfaces as an authentication error, which sends
@@ -160,7 +160,7 @@ def test_a_mint_failure_with_no_valid_token_raises() -> None:
 
 
 def test_backoff_is_asserted_by_TIME_not_by_call_count() -> None:
-    """🔴 The distinction the criterion insists on, and it needs the clock to be real.
+    """CRITICAL: The distinction the criterion insists on, and it needs the clock to be real.
 
     A count assertion ("the minter was called twice") passes for a hot loop that called it
     twice in a microsecond. What must hold is that after a failure the next *attempt* is
@@ -354,13 +354,13 @@ def test_the_engine_injects_a_fresh_token_as_the_password() -> None:
 
 
 def test_the_pool_recycles_inside_the_token_lifetime_the_api_actually_issues() -> None:
-    """🔴 The criterion that went missing between plan revisions, restored — and corrected.
+    """CRITICAL: The criterion that went missing between plan revisions, restored — and corrected.
 
     Refresh does not make recycling redundant: Postgres authenticates a connection once, at
     connect, so a pooled connection outlives its token and the *server* decides when to drop
     it. Recycling first makes that our decision.
 
-    ⚠️ The bound is the lifetime the API **issues** (measured 3600s), not the 300s floor it
+    WARNING: The bound is the lifetime the API **issues** (measured 3600s), not the 300s floor it
     documents. An earlier revision asserted the floor, which would have recycled every 240s
     and discarded good connections roughly 15x more often than necessary. Both numbers are
     named here so the distinction cannot quietly collapse again.
@@ -416,7 +416,7 @@ class _FakeProtobufTimestamp:
     ],
 )
 def test_every_expiry_shape_the_api_might_return_is_understood(raw: object) -> None:
-    """🔴 Regression guard for a bug the unit tests could not have caught.
+    """CRITICAL: Regression guard for a bug the unit tests could not have caught.
 
     `_as_datetime` originally handled only datetimes and strings. The live API returns a
     protobuf `Timestamp`, so it fell through to ``None``, the minter took its

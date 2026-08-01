@@ -476,11 +476,14 @@ def build_server(
             session_id=session_id(tmux_name),
             host_id=identified.host_id,
             tmux_name=tmux_name,
-            # W7 resolves this from `current_user.me()`. Until then an unset
-            # SHELLBOX_OWNER_EMAIL is recorded as "unknown" rather than skipping the write:
-            # #7's per-owner filtering is a WHERE clause over this column, and a missing
-            # row is harder to notice later than an obviously unresolved one.
+            # `enroll.py` resolves this from `current_user.me()` on its background thread and
+            # corrects the identity cache; `resolve_host_context` reads that cache. When nothing
+            # can supply an owner, `project` REFUSES the write rather than inventing one -- see
+            # `_OWNER_UNRESOLVED`.
             owner_email=identified.owner_email or _OWNER_UNRESOLVED,
+            # OQ5: this advances on SEND, not on read. `last_read_at` is the read-side column
+            # and is deliberately left `None` here, which `upsert_session`'s `GREATEST` preserves
+            # rather than clears (Postgres's GREATEST ignores NULLs).
             last_activity_at=now,
             status=status,
             cwd=cwd,
@@ -558,6 +561,15 @@ def build_server(
         """
         name = tmux_name_of(session)
         result = adapter().send(name, text=text, keys=keys)
+        # OQ5's send side. Without this nothing advances `last_activity_at` on a session being
+        # DRIVEN -- only create and kill wrote it -- so #5's reaper would see a session under
+        # active use as idle since creation and reap it mid-build.
+        #
+        # ⚠️ The cost, stated because it is on the hot path: this is one registry round-trip per
+        # send. It is bounded (R22's `connect_timeout`) and non-fatal (a failure is a warning on
+        # a successful call), but it is not free, and if send volume ever makes it matter the fix
+        # is to coalesce -- not to drop the column #5 depends on.
+        project(session_row(name, "live"))
         return SendResult(
             session=session_id(result.tmux_name),
             tmux_name=result.tmux_name,

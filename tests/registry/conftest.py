@@ -43,9 +43,42 @@ def _local_dev_dsn() -> str:
     return resolved
 
 
+# Hosts these fixtures may destroy without being asked twice.
+#
+# 🔴 The fixtures below are DESTRUCTIVE: they `drop_all` on teardown. Pointed at a shared
+# or managed database they silently delete its schema — measured, not hypothetical. Running
+# this suite against a real Lakebase endpoint dropped `hosts` and `sessions` while
+# `alembic_version` was left claiming the migrations were applied, which is precisely the
+# divergence migration 0002's docstring exists to warn about, arrived at from the other
+# direction.
+#
+# So: a throwaway host runs unchanged (CI's service container and the dev docker instance
+# are both localhost), and anything else demands an explicit opt-in. Deliberately running
+# the suite against Lakebase is valuable — it is how ADR-3's "Lakebase is only a credential
+# concern" got verified — it just must not happen by leaving an env var set.
+_THROWAWAY_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "postgres", "db"})
+_DESTRUCTIVE_OPT_IN = "SHELLBOX_ALLOW_DESTRUCTIVE_TESTS"
+
+
+def _refuse_to_destroy_a_real_database(dsn: str) -> None:
+    from urllib.parse import urlparse
+
+    host = (urlparse(dsn).hostname or "").lower()
+    if host in _THROWAWAY_HOSTS or os.environ.get(_DESTRUCTIVE_OPT_IN) == "1":
+        return
+    pytest.fail(
+        f"REFUSING to run the destructive registry fixtures against {host!r}. These "
+        f"fixtures drop `hosts` and `sessions` on teardown, so pointing them at a shared "
+        f"or managed database (Lakebase, staging) deletes its schema — and leaves "
+        f"alembic_version claiming the migrations are still applied.\n\n"
+        f"If that is genuinely what you want, set {_DESTRUCTIVE_OPT_IN}=1."
+    )
+
+
 @pytest.fixture(scope="session")
 def _pg_engine_or_skip() -> Iterator[Engine]:
     dsn = normalize_postgres_dsn(_test_dsn())
+    _refuse_to_destroy_a_real_database(dsn)
     engine = create_engine(dsn)
     try:
         with engine.connect():

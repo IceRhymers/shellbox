@@ -50,7 +50,18 @@ def dsn_from_env() -> str | None:
 
     user = quote(part("USER"), safe="")
     secret = quote(part("PASSWORD"), safe="")
-    return f"{_PLAIN_SCHEME}{user}:{secret}@{part('HOST')}:{part('PORT')}/{part('DB')}"
+    dsn = f"{_PLAIN_SCHEME}{user}:{secret}@{part('HOST')}:{part('PORT')}/{part('DB')}"
+
+    # `SHELLBOX_PG_SSLMODE` has NO default, deliberately: a local Postgres has no TLS
+    # configured, so defaulting to `require` would break every developer and CI run. It
+    # exists because Lakebase *demands* TLS, and the alternative for reaching it through
+    # this function is putting a complete credential-bearing URL in an env var --
+    # precisely the shape this docstring argues against. Assembling it here keeps the
+    # OAuth token in its own variable.
+    sslmode = os.environ.get("SHELLBOX_PG_SSLMODE")
+    if sslmode:
+        dsn = f"{dsn}?sslmode={quote(sslmode, safe='')}"
+    return dsn
 
 
 def redact(dsn: str) -> str:

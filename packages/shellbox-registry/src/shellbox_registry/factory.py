@@ -15,9 +15,12 @@ from shellbox_registry.postgres import PostgresRegistry
 def create_registry(dsn: str | None) -> Registry:
     """Select a `Registry` implementation from a DSN (typically `SHELLBOX_DATABASE_URL`).
 
-    Unset/empty -> `NullRegistry`. Anything else -> `PostgresRegistry` (this is also the
-    Lakebase path once W9's `lakebase.py` credential hook is wired in; the DSN, not this
-    function, is what changes).
+    Unset/empty -> `NullRegistry`. Anything else -> `PostgresRegistry`.
+
+    This is **also** the Lakebase path when the DSN already carries a usable password —
+    verified: the whole registry suite passes against a real Lakebase endpoint through
+    exactly this function. Use `lakebase.lakebase_registry` instead when the password must
+    be an OAuth token that expires, since that needs a per-connect hook rather than a DSN.
     """
     if not dsn:
         return NullRegistry()

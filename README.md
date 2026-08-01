@@ -12,6 +12,15 @@ Sessions are created by agents, attached to by humans, and reaped on inactivity.
 Work in progress. Design and phased plan: [epic #9](https://github.com/IceRhymers/shellbox/issues/9).
 Registering `shellbox-mcp` with a harness (Claude Code, Codex): [`docs/registration.md`](docs/registration.md).
 
+Docs in this repo follow a writing standard adapted from ASD-STE100 (Simplified Technical
+English). Read it before you write docs, comments, or a PR description:
+
+- [`docs/writing-style.md`](docs/writing-style.md) — the standard, and its two tiers.
+- [`docs/glossary.md`](docs/glossary.md) — what *incarnation*, *foreign*, *orphaned*, and
+  *projection* mean here.
+- [`docs/plan-sections.md`](docs/plan-sections.md) — what `§7`, `W4`, `ADR-8`, `F12`, and the
+  other short identifiers refer to, and which committed file is authoritative for each.
+
 ---
 
 ## What survives what
@@ -22,12 +31,13 @@ and it is not symmetric. Read it before filing a bug about a session that vanish
 | Event | Sessions survive? | Why |
 |---|---|---|
 | **`shellbox-mcp` restarts** (crash, `SIGKILL`, agent session rotation, MCP reconnect) | **YES** | A tmux client forks a server that *reparents away*. The tmux server is a **sibling** of the MCP process, never a descendant, so it is not killed with it. `shellbox-mcp` holds **zero session state in-process** — tmux is the authority — so a fresh process rediscovers every session. |
-| **The sandbox stops and starts** (`sandbox stop`/`start`, or a 10-minute idle autostop) | **NO** | tmux's socket lives in `/tmp`, which is **wiped** on restart. The tmux server and every session go with it. `$HOME` files survive; a *running process* does not. |
+| **The sandbox stops and starts** (`sandbox stop`/`start`, or a 10-minute idle autostop) | **NO** | The VM stops, so the tmux **server process** stops with it, and every session goes with the server. `$HOME` files survive; a *running process* does not. The socket file survives too — it defaults to `$SHELLBOX_STATE_DIR/tmux.sock` in `$HOME` — but a socket file with no process listening on it is inert. |
 
-The first row is a guarantee with a test behind it (`T-RESTART`: `SIGKILL` the MCP process, assert
-the tmux server outlives it, the session is still usable, and its incarnation token is unchanged).
-**If that test's assertion ever changes, this table is wrong by construction** — they are meant to
-say the same thing.
+The first row is a guarantee, and a test stands behind it. `T-RESTART` sends `SIGKILL` to the
+MCP process. It then asserts three things: the tmux server outlives that signal, the session
+is still usable, and its incarnation token did not change.
+**If that test's assertion ever changes, this table is wrong by construction** — the two are
+meant to say the same thing.
 
 The second row cannot be fixed in v1, and it is worth being explicit about why rather than leaving
 it to be rediscovered. **There is no in-VM boot hook available:**
@@ -40,22 +50,25 @@ it to be rediscovered. **There is no in-VM boot hook available:**
   there is silently clobbered
 
 The only boot-time hooks are Databricks' own `setup-home-directory.sh` / `setup-user.sh`.
-Consequently **re-enrolment and session re-creation must be driven from the agent side on next
-start**, not by anything inside the VM. shellbox reports this honestly instead of hiding it: when a
-session's tmux counterpart is gone, its registry row is marked `orphaned`, so the inventory stays
-accurate rather than advertising sessions that no longer exist.
+Consequently **the agent side must drive re-enrolment and session re-creation on next start**,
+not anything inside the VM.
 
-A newly created sandbox also defaults to `idleTimeout: 600s` with `noAutostop: false`, so it will
-**autostop after 10 minutes idle** unless reconfigured. Keepalive is Phase 5's job
-([#5](https://github.com/IceRhymers/shellbox/issues/5)); Phase 2 records the observed values at
-enrolment and warns when autostop is enabled, so the condition is visible rather than mysterious.
+shellbox reports this rather than hiding it. When a session's tmux counterpart is gone,
+shellbox marks its registry row `orphaned`. The inventory therefore stays accurate, instead of
+advertising sessions that no longer exist.
+
+A newly created sandbox also defaults to `idleTimeout: 600s` with `noAutostop: false`. It
+therefore **autostops after 10 minutes idle** unless you reconfigure it. Keepalive is Phase 5's
+job ([#5](https://github.com/IceRhymers/shellbox/issues/5)). Phase 2 records the observed values
+at enrolment and warns when autostop is enabled, so the condition is visible rather than
+mysterious.
 
 ## Corrections to issue #2
 
-[Issue #2](https://github.com/IceRhymers/shellbox/issues/2) was written before the Phase 1 transport
-probe ([#1](https://github.com/IceRhymers/shellbox/issues/1)) ran. Three of its statements are
-**measured false**, and they are recorded here so a later reader does not follow the issue text into
-a wrong assumption:
+Someone wrote [issue #2](https://github.com/IceRhymers/shellbox/issues/2) before the Phase 1
+transport probe ([#1](https://github.com/IceRhymers/shellbox/issues/1)) ran. Three of its
+statements are **measured false**. They are recorded here so that a later reader does not
+follow the issue text into a wrong assumption.
 
 | Issue #2 says | Measured |
 |---|---|
@@ -63,8 +76,13 @@ a wrong assumption:
 | *"do not assume sudo/apt (unprobed for uid 10086)"* | **Passwordless root** — `(ALL) NOPASSWD: ALL`. shellbox still does not *use* it, since depending on root would break the host-agnostic model. |
 | *"`shell_send(session, text?, keys?)` — `text` → `tmux send-keys -l`"* | **Rejected.** `send-keys -l` **silently drops a lone `;`** (rc=0, the character never arrives, and `--` does not help) and errors on text starting with `-`. `text` is delivered through a tmux **buffer** (`load-buffer -` / `paste-buffer`); `send-keys` is used only for named keys from a strict allowlist. |
 
-Full probe results: [`probe/FINDINGS.md`](probe/FINDINGS.md). tmux behaviour that `§7` of the plan
-depends on is measured by an executable suite, [`spike/tmux_spike.py`](spike/tmux_spike.py), which
-runs in two lanes — tmux 3.6b locally and **tmux 3.4 under `ubuntu:24.04`**, the sandbox's version —
-and is a CI gate: if either lane fails, the tmux adapter's specification is not considered valid.
-Findings: [`spike/FINDINGS.md`](spike/FINDINGS.md).
+Full probe results: [`probe/FINDINGS.md`](probe/FINDINGS.md).
+
+An executable suite, [`spike/tmux_spike.py`](spike/tmux_spike.py), measures the tmux behaviour
+that the tmux adapter depends on. (`§7` names that part of the plan; see
+[`docs/plan-sections.md`](docs/plan-sections.md) for what the plan's section numbers refer to.)
+
+The suite runs in two lanes: tmux 3.6b on the developer's machine, and **tmux 3.4 under
+`ubuntu:24.04`**, which is the sandbox's version. The 3.4 lane is the **gate** — if it fails,
+the tmux adapter's specification is not considered valid, and the host lane passing on its own
+does not substitute. Findings: [`spike/FINDINGS.md`](spike/FINDINGS.md).

@@ -69,10 +69,16 @@ _OWNER_UNRESOLVED = "\x00unresolved"
 INSTRUCTIONS = """\
 tmux-backed shell sessions that outlive this MCP server process.
 
-Sessions are addressed by name (`shell_create(name=...)`) and by the `session` id returned
-by every tool. Output is returned with ANSI escapes preserved. `shell_send` submits input;
-it cannot confirm the pane's process consumed it, which is why every send reports
-`delivery: "unverified"` -- read the pane back to observe an effect.
+Address a session by name, or by the `session` id that every tool returns.
+`shell_create(name=...)` creates one.
+
+`shell_read` preserves ANSI escapes.
+
+`shell_send` submits input to a session. It cannot confirm that the pane's process consumed
+the input. Every send therefore reports `delivery: "unverified"`. Read the session back to
+observe an effect.
+
+Sessions survive a restart of this server. They do not survive a sandbox restart.
 """
 
 
@@ -217,7 +223,7 @@ def _shellbox_cause(exc: BaseException) -> ShellboxError | None:
 def _install_error_boundary(mcp: FastMCP[Any]) -> None:
     """Render tool failures as §6's envelope, exactly.
 
-    ⚠️ This replaces the ``CallToolRequest`` handler ``FastMCP`` installed, reaching through
+    WARNING: This replaces the ``CallToolRequest`` handler ``FastMCP`` installed, reaching through
     ``_mcp_server`` to do it. Deliberate, and narrow: ``FastMCP`` is kept for everything it
     is good at (schemas derived from type hints, so schema and implementation cannot drift),
     while the error text stops being ``"Error executing tool shell_read: {...}"`` and becomes
@@ -266,9 +272,9 @@ def _recover_host_stamp(settings: Settings) -> str | None:
     N subprocesses on every process start to detect a fork that has never happened is the wrong
     trade against ADR-5's "zero extra subprocesses".
 
-    ⚠️ The consequence, stated rather than hidden: a genuine cache-vs-tmux fork on a host whose
-    cache is intact is **not** detected here. It is detected by `enroll.py`, which stamps every
-    session on every pass and would find its own value disagreeing.
+    WARNING: The consequence, stated rather than hidden: a genuine cache-vs-tmux fork on a
+    host whose cache is intact is **not** detected here. It is detected by `enroll.py`, which
+    stamps every session on every pass and would find its own value disagreeing.
     """
     if (Path(settings.state_dir) / identity.HOST_JSON_NAME).exists():
         return None
@@ -302,7 +308,7 @@ class HostContext:
 def resolve_host_context(settings: Settings) -> HostContext:
     """Resolve identity explicitly, at a point where writing a file is expected.
 
-    ⚠️ ``credential_email=None`` **on purpose, and this is not a stub.** Resolving the sandbox
+    WARNING: ``credential_email=None`` **on purpose, and this is not a stub.** Resolving the sandbox
     creator (D4, ``current_user.me()``) is a *network* call, and this function runs synchronously
     before ``FastMCP.run()`` -- so doing it here would put an unreachable control plane between
     the client and its handshake. ``enroll.py`` performs E2 with the credential on a background
@@ -382,7 +388,7 @@ def build_server(
         """
         return TmuxAdapter(resolved.tmux_config())
 
-    # 🔴 `owner_email` is re-checked rather than frozen, and that is a bug fix rather than
+    # CRITICAL: `owner_email` is re-checked rather than frozen, and that is a bug fix rather than
     # caution. `resolve_host_context` runs before `FastMCP.run()` and deliberately does NOT
     # make the network call that resolves the sandbox's creator -- `enroll.py` does that on a
     # background thread, taking ~1.4s against a live workspace, and caches the result.
@@ -439,7 +445,7 @@ def build_server(
     def project(record: RegistrySessionRecord) -> str | None:
         """Write one session row. Returns a warning for the payload, or ``None``.
 
-        🔴 Never raises. Per §9, tmux wins: a registry failure is a stale inventory, not a
+        CRITICAL: Never raises. Per §9, tmux wins: a registry failure is a stale inventory, not a
         failed tool call, and a Lakebase outage must never stop an agent getting a shell.
 
         The warning text deliberately carries only the exception TYPE. A SQLAlchemy error
@@ -447,16 +453,17 @@ def build_server(
         rows means paths and an owner email; the full exception goes to stderr, where it is
         a diagnostic, and not into a payload an agent may echo anywhere.
 
-        ⚠️ **Expected to warn on every call until ``enroll.py`` lands.** ``sessions.host_id`` is
-        a foreign key to ``hosts``, and writing the ``hosts`` row is W7's (``enroll.py``,
-        E1-E7). Against a reachable-but-unenrolled database this projection therefore fails and
-        every create reports a ``registry_warning`` -- measured, not assumed. That is the
+        WARNING: **Expected to warn on every call until ``enroll.py`` lands.**
+        ``sessions.host_id`` is a foreign key to ``hosts``, and writing the ``hosts`` row is
+        W7's (``enroll.py``, E1-E7). Against a reachable-but-unenrolled database this
+        projection therefore fails, and every create reports a ``registry_warning`` --
+        measured, not assumed. That is the
         correct behaviour (the shell still works), and it is why this is worth a comment: the
         next person to see the warning should look for the missing ``hosts`` row, not for a bug
         here.
         """
         if record.owner_email is _OWNER_UNRESOLVED:
-            # 🔴 Never invent an owner. This column is what #7's ACL will filter on, so a
+            # CRITICAL: Never invent an owner. This column is what #7's ACL will filter on, so a
             # placeholder is not a harmless gap -- it is a row that a future `WHERE
             # owner_email = ...` either grants to nobody or, worse, matches for whoever ends up
             # owning the placeholder string. An earlier version wrote the literal "unknown"
@@ -472,8 +479,9 @@ def build_server(
                 record.session_id,
             )
             return (
-                "inventory deferred: this host has no resolved owner_email yet, so the session "
-                "was not recorded. The shell itself is unaffected."
+                "inventory deferred: this host has no resolved owner_email yet, so shellbox "
+                "did not record this session. Enrollment may still resolve one. The shell "
+                "works normally."
             )
         try:
             store.upsert_session(record)
@@ -485,7 +493,10 @@ def build_server(
                 exc,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
-            return f"registry unavailable ({type(exc).__name__}); the inventory may be stale"
+            return (
+                f"registry unavailable ({type(exc).__name__}). The inventory may be stale. "
+                "The shell works normally."
+            )
         return None
 
     def session_row(
@@ -526,17 +537,19 @@ def build_server(
         cols: int | None = None,
         rows: int | None = None,
     ) -> CreateResult:
-        """Create a named tmux shell session, or adopt the existing one of that name.
+        """Create a named tmux shell session, or adopt the existing session of that name.
 
-        `created: false` with a successful call means a session of this name already
-        existed with a matching working directory -- an idempotent re-create, which is what
-        lets a restarted agent call this unconditionally. A CONFLICTING `cwd` is
-        `already_exists` instead: silently handing back a shell pointed at another
-        directory is the more dangerous of the two answers.
+        `created: false` on a successful call means two things. A session of this name
+        already existed, and its working directory matched. That is an idempotent
+        re-create. A restarted agent can therefore call this tool unconditionally.
 
-        `cwd` defaults to this server process's working directory, `cols`/`rows` to
-        SHELLBOX_DEFAULT_COLS/_ROWS (80x24). `env` entries are set in the pane, not in this
-        process.
+        A CONFLICTING `cwd` returns `already_exists` instead. Silently returning a shell that
+        points at another directory is the more dangerous of the two answers, so this tool
+        never does it.
+
+        `cwd` defaults to this server process's working directory. `cols` and `rows`
+        default to SHELLBOX_DEFAULT_COLS and SHELLBOX_DEFAULT_ROWS (80x24). This tool sets
+        each `env` entry in the pane, not in this process.
 
         Errors: invalid_name | already_exists | bad_cwd | tmux_unavailable | tmux_error.
         """
@@ -563,23 +576,34 @@ def build_server(
     def shell_send(
         session: str, text: str | None = None, keys: list[str] | None = None
     ) -> SendResult:
-        """Submit input to a session: `text` first, then `keys`. Ordering is guaranteed.
+        """Submit input to a session. This tool sends `text` first, then `keys`.
 
-        At least one of `text`/`keys` is required. `text` is literal and needs no escaping
-        or quoting -- it is delivered through a tmux buffer, so `;`, a leading `-`, control
-        bytes and multi-byte UTF-8 all arrive as written. Newlines in `text` are submitted
-        as newlines; to press Enter without text, use `keys: ["Enter"]`.
+        **Ordering is guaranteed** (M18). Callers depend on it.
 
-        `keys` are tmux key NAMES from a fixed allowlist (`Enter`, `Escape`, `Tab`, `Up`,
-        `C-c`, `M-x`, `F1`...), lower-case after the modifier. Anything else is
-        `invalid_key`.
+        You must supply `text`, or `keys`, or both. This tool rejects a call with neither as
+        `no_payload`.
 
-        🔴 `delivery` is always "unverified" and `submitted_bytes` counts bytes handed to
-        tmux, NOT bytes the pane's process read. Nothing here is a receipt: read the
-        session back to observe an effect. A single line at or over
-        SHELLBOX_MAX_SEND_LINE_BYTES (1000) is rejected as `line_too_long` before tmux is
-        touched, because the pty line discipline would drop it on macOS and TRUNCATE it on
-        Linux -- and a truncated command is a different, still-executable command.
+        `text` is literal and needs no escaping and no quoting. This tool delivers it through
+        a tmux buffer, so a `;`, a leading `-`, control bytes, and multi-byte UTF-8 all arrive
+        as written.
+
+        A newline in `text` submits as a newline. To press Enter without text, use
+        `keys: ["Enter"]`.
+
+        `keys` are tmux key NAMES from a fixed allowlist: `Enter`, `Escape`, `Tab`, `Up`,
+        `C-c`, `M-x`, `F1`, and others. Write the part after the modifier in lower case.
+        This tool rejects anything else as `invalid_key`.
+
+        CRITICAL: `delivery` is always "unverified". `submitted_bytes` counts the bytes
+        this tool handed to tmux. It does NOT count the bytes the pane's process read.
+        `incarnation` names the session this send TARGETED, which makes misdelivery
+        detectable after the fact. NOTHING in this result is a receipt. Read the session
+        back to observe an effect.
+
+        This tool rejects a single line at or over SHELLBOX_MAX_SEND_LINE_BYTES (1000) as
+        `line_too_long`, before it invokes tmux. The reason is measured: the pty line
+        discipline would drop such a line on macOS and would TRUNCATE it on Linux. A
+        truncated command is a different command, and it still runs.
 
         Errors: not_found | no_payload | invalid_key | too_large | line_too_long |
         invalid_name | tmux_unavailable | tmux_error.
@@ -590,10 +614,10 @@ def build_server(
         # DRIVEN -- only create and kill wrote it -- so #5's reaper would see a session under
         # active use as idle since creation and reap it mid-build.
         #
-        # ⚠️ The cost, stated because it is on the hot path: this is one registry round-trip per
-        # send. It is bounded (R22's `connect_timeout`) and non-fatal (a failure is a warning on
-        # a successful call), but it is not free, and if send volume ever makes it matter the fix
-        # is to coalesce -- not to drop the column #5 depends on.
+        # WARNING: The cost, stated because it is on the hot path: this is one registry
+        # round-trip per send. It is bounded (R22's `connect_timeout`) and non-fatal (a
+        # failure is a warning on a successful call), but it is not free, and if send volume
+        # ever makes it matter the fix is to coalesce -- not to drop the column #5 depends on.
         project(session_row(name, "live"))
         return SendResult(
             session=session_id(result.tmux_name),
@@ -607,16 +631,17 @@ def build_server(
     @mcp.tool()
     @_tool_errors
     def shell_read(session: str, lines: int = 0) -> ReadResult:
-        """Capture a session's screen, with ANSI escapes PRESERVED.
+        """Capture a session's screen. This tool PRESERVES ANSI escapes.
 
-        `lines: 0` (the default) is the visible pane. `lines: N` also includes up to N
-        lines of scrollback above it.
+        `lines: 0` is the default, and returns the visible pane. `lines: N` also returns up
+        to N lines of the scrollback above it.
 
-        `alive: false` means the pane's process has exited -- its final output is still
-        readable, which is why the session is kept rather than destroyed. `scrollback_lines`
-        and `history_limit` are raw tmux facts: a caller that asked for `lines: N` and sees
-        `scrollback_lines < N` received everything that exists. tmux never truncates a
-        capture, so there is no `truncated` field to trust.
+        `alive: false` means the pane's process exited. Its final output is still readable,
+        which is why shellbox keeps the session instead of destroying it.
+
+        `scrollback_lines` and `history_limit` are raw tmux facts. If you asked for
+        `lines: N` and `scrollback_lines` is less than N, you received everything that
+        exists. tmux never truncates a capture, so there is no `truncated` field to trust.
 
         Errors: not_found | invalid_name | invalid_dimensions | tmux_unavailable |
         tmux_error.
@@ -638,20 +663,21 @@ def build_server(
     @mcp.tool()
     @_tool_errors
     def shell_list() -> ListResult:
-        """List every session on this host's tmux server, read from tmux.
+        """List every session on this host's tmux server. This tool reads tmux directly.
 
-        Not from the registry: tmux is the authority, and other agents on this host share
-        the same server. `cwd` is where each shell IS now, not where it was created.
+        It does not read the registry. tmux is the authority, and other agents on this host
+        share the same tmux server. `cwd` is where each shell IS now, not where it started.
 
-        `foreign: true` with `incarnation: null` marks a session shellbox cannot prove it
-        owns -- either created by something else, or observed in the window between its
-        creation and its identity stamp. `shell_send`/`shell_kill` refuse such a session
-        with `not_found`.
+        `foreign: true` with `incarnation: null` marks a session that shellbox cannot prove
+        it owns. There are two causes, and this tool does not distinguish them. Something
+        other than shellbox created the session, or this call observed the session between
+        its creation and its identity stamp. `shell_send` and `shell_kill` refuse such a
+        session with `not_found`.
 
-        An empty list means this host has no sessions. It never means "tmux is broken":
-        any unrecognised tmux failure is reported as `tmux_error` instead, because
-        reporting a broken tmux as a healthy empty inventory is what would let
-        reconciliation mark every live session on the host dead.
+        An empty list means this host has no sessions. It NEVER means that tmux is broken.
+        This tool reports an unrecognised tmux failure as `tmux_error` instead. Reporting a
+        broken tmux as a healthy empty inventory would let reconciliation mark every live
+        session on the host dead.
 
         Errors: tmux_unavailable | tmux_error.
         """
@@ -666,8 +692,9 @@ def build_server(
     def shell_resize(session: str, cols: int, rows: int) -> ResizeResult:
         """Resize a session's window.
 
-        Worth doing before running a TUI: the pane is created at 80x24, and a program that
-        has already drawn itself at one size repaints incrementally after a resize.
+        Resizing before you run a TUI is worth doing. A pane defaults to 80x24 unless
+        `shell_create` was given `cols` and `rows`. A program that already drew itself at one
+        size repaints incrementally after a resize.
 
         Errors: not_found | invalid_dimensions | invalid_name | tmux_unavailable |
         tmux_error.
@@ -679,14 +706,14 @@ def build_server(
     @mcp.tool()
     @_tool_errors
     def shell_kill(session: str) -> KillResult:
-        """Kill a session. Idempotent.
+        """Kill a session. This tool is idempotent.
 
-        `killed: false` with a successful call means there was nothing to kill -- two
-        agents racing a kill must not produce a spurious error for the loser.
+        `killed: false` on a successful call means there was nothing to kill. Two agents
+        that race a kill must not produce a spurious error for the loser.
 
-        `not_found` is a different answer and a real one: it means the session EXISTS but
-        carries no shellbox identity, so this server will not kill it. Killing a session
-        shellbox cannot prove it owns must fail rather than succeed silently.
+        `not_found` is a different answer, and a real one. It means the session EXISTS but
+        carries no shellbox identity, so this server refuses to kill it. A kill on a
+        session that shellbox cannot prove it owns must fail, not succeed silently.
 
         Errors: not_found | invalid_name | tmux_unavailable | tmux_error.
         """

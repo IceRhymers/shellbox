@@ -7,7 +7,7 @@ Two things live here, and they are deliberately separate:
    returns the internal ``no_server`` classification, which the tool boundary maps to
    ``tmux_unavailable`` (or, for ``shell_list`` only, to an empty list).
 
-🔴 **Unknown stderr must NEVER map to "empty list."** Only the exact ``no server running``
+CRITICAL: **Unknown stderr must NEVER map to "empty list."** Only the exact ``no server running``
 signature means "there are no sessions"; every other non-zero exit is an error. A
 permissive "probably no sessions" fallback would report a broken tmux as a healthy empty
 inventory, and orphan reconciliation would then mark every live session on the host
@@ -183,7 +183,7 @@ STDERR_SIGNATURES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("no such session:",), "not_found"),
     (("duplicate session:",), "already_exists"),
     (("no server running",), NO_SERVER),
-    # ⚠️ NOT in the plan's N1 table -- the cold-start case, which nothing had run. Measured
+    # WARNING: NOT in the plan's N1 table -- the cold-start case, which nothing had run. Measured
     # in both lanes: when the socket FILE does not exist (no tmux server has ever started on
     # this host), every verb fails with `error connecting to <path> (No such file or
     # directory)`, NOT with `no server running`. Without this entry the very first
@@ -200,7 +200,7 @@ STDERR_SIGNATURES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("open terminal failed",), "tmux_error"),
 )
 
-# ⚠️ A residual ambiguity that CANNOT be resolved here, recorded so it is not mistaken for
+# WARNING: A residual ambiguity that CANNOT be resolved here, recorded so it is not mistaken for
 # solved: a cold start and a WRONG socket path both produce `No such file or directory`, so
 # `no_server` cannot distinguish "this host has no sessions" from "this process is looking in
 # the wrong place". That is why orphaning authority is guarded elsewhere (§9.2): a process may

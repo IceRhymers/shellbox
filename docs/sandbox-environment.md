@@ -1,8 +1,8 @@
 # The Lakebox sandbox environment — measured
 
 What a Databricks Sandbox ("Lakebox") actually provides, as measured rather than assumed.
-`shellbox-mcp` runs inside one, so several of its design decisions are forced by the facts
-below — and three earlier design premises were **wrong** until they were measured.
+`shellbox-mcp` runs inside one, so the facts below force several of its design decisions.
+Three earlier design premises were **wrong** until they were measured.
 
 **Reproduce everything here** with [`probe/probe_identity.py`](../probe/probe_identity.py); its
 complete output is committed as
@@ -36,11 +36,11 @@ sandbox identifier available from inside:
 | Process environment (login shell) | adds only `DATABRICKS_CONFIG_PROFILE=DEFAULT` |
 | Disk — `grep -rl <id> /etc /run /var/lib /opt /usr/local` | **zero files** |
 | Host naming | `hostname`=`databricks` (from `vminit_hostname=` in `/proc/cmdline`), `/etc/hostname`=`sandbox`, `getfqdn()`=`localhost` — image constants, identical everywhere |
-| `/run/lakebox/` | only the templated credential files (§3) |
+| `/run/lakebox/` | only the templated credential files (section 3, below) |
 | **PID 1's environment** (`sudo cat /proc/1/environ`) | 746 bytes, fully enumerated: **no sandbox id.** `LOCATION` is *region- and cluster*-scoped (`kubernetes-cluster:prod/aws/public/us-west-2/s1/nb78se`), shared by many sandboxes |
 
 The **only** source that knows the id is the workspace API, and
-`GET /api/2.0/lakebox/sandboxes` is **caller-scoped**: it returns every sandbox the caller
+`GET /api/2.0/lakebox/sandboxes` is **caller-scoped**. It returns every sandbox the caller
 owns, with **no locally-readable field to match "which of these am I."**
 
 ### `~/.databricks/sandbox.json` is a trap, not an answer
@@ -59,12 +59,12 @@ A reader who finds this file will reasonably conclude the id is available locall
 
 That it **is** a Lakebox — PID 1 is `sandbox-daemon --enable-sshd --uid 10086`, and
 `/etc/lakebox/` exists. Never **which** one. That asymmetry is why `hosts.kind` can be
-populated and `hosts.sandbox_id` cannot: `sandbox_id` must be **injected** by the bootstrap
+populated and `hosts.sandbox_id` cannot. `sandbox_id` must be **injected** by the bootstrap
 path, which runs from outside and does know the id.
 
 **Consequence for shellbox:** `host_id` is a self-assigned uuid4 persisted to
-`$HOME/.shellbox/host.json`, created under `O_CREAT|O_EXCL` so that concurrent MCP processes
-adopt one winner instead of minting one identity each.
+`$HOME/.shellbox/host.json`, created under `O_CREAT|O_EXCL`. That way, concurrent MCP
+processes adopt one winner instead of minting one identity each.
 
 ## 2. `/etc/machine-id` is baked into the image — never use it as a host identity
 
@@ -75,13 +75,13 @@ adopt one winner instead of minting one identity each.
 ```
 
 Dated to the **image build**, never to a boot, served from the overlay's read-only lower
-layer ⇒ **the same string on every sandbox launched from that image**. Use
+layer. The result: **the same string on every sandbox launched from that image**. Use
 `/proc/sys/kernel/random/boot_id` when you want a value that changes per boot; use neither
 as a host identity.
 
-> A host id derived from `machine-id` does not degrade to "unhelpful but distinct" — it
-> collapses **the entire fleet into one `hosts` row**, each host overwriting the others'
-> `owner_email`, `gateway_host` and `last_seen_at`.
+> A host id derived from `machine-id` does not degrade to "unhelpful but distinct." It
+> collapses **the entire fleet into one `hosts` row**, and each host overwrites the others'
+> `owner_email`, `gateway_host`, and `last_seen_at`.
 
 *Status: the mechanism is established; the direct cross-sandbox comparison is still to run.*
 
@@ -89,7 +89,7 @@ as a host identity.
 
 `/etc/lakebox/setup-home-directory.sh` (root, mode 555, on the read-only image layer) is the
 authority. It runs **once per boot** — `~/.home-setup-complete` stores the current
-`boot_id`, and the run is serialized on `/run/lakebox-home-setup.lock` — and it does this:
+`boot_id`, and `/run/lakebox-home-setup.lock` serializes the run — and it does this:
 
 ```sh
 write_placeholder() { if [[ ! -e "$target" ]]; then printf '%s' "$content" > "$target"; ... }
@@ -105,8 +105,8 @@ link()             { ... ln -sfn "$target" "$linkpath"; ... }   # UNCONDITIONAL,
 
 Four facts follow, each of which changed a design decision:
 
-1. **`ln -sfn` is unconditional**, so a regular file written at any of these paths is
-   **replaced by a symlink at the next boot**. Any reset of these files is therefore a
+1. **`ln -sfn` is unconditional**, so the boot script **replaces any regular file written at
+   these paths with a symlink at the next boot**. Any reset of these files is therefore a
    **per-boot** operation, not once-per-sandbox.
 2. **`/run` is wiped between boots.** Proven rather than assumed: `write_placeholder` writes
    *only if absent*, and the placeholder's mtime is the current boot's, so it was absent.
@@ -125,9 +125,9 @@ Four facts follow, each of which changed a design decision:
 
 `~/.claude` and `~/.codex` are **real directories** (not templated), so a regular file
 written inside them persists. `~/.claude.json` is a genuine 35 KB regular file in persistent
-`$HOME` holding Claude Code's own state (`numStartups`, `projects`, an existing `mcpServers`)
-and is **absent from the boot script** — so MCP registration there is durable, and it must
-**not** be routed through the symlink-aware writer.
+`$HOME`, holding Claude Code's own state (`numStartups`, `projects`, an existing `mcpServers`).
+It is **absent from the boot script**, so MCP registration there is durable. It must **not** be
+routed through the symlink-aware writer.
 
 ### The OAuth token cache does not survive a boot — and is currently absent entirely
 
@@ -135,7 +135,7 @@ and is **absent from the boot script** — so MCP registration there is durable,
 not. So the token cache is not merely emptied at boot; right now there is no file at all.
 
 This breaks a premise elsewhere in the design. "Reset the PAT, then rely on the CLI's OAuth
-token cache" works **within one boot** and not across one: after a reboot a PAT-reset sandbox
+token cache" works **within one boot** and not across one. After a reboot, a PAT-reset sandbox
 has **no workspace credential at all** until the OAuth login is re-run.
 
 ### `DATABRICKS_CONFIG_FILE` can make a PAT reset a silent no-op
@@ -158,8 +158,8 @@ reports success while having no effect.
 
 A 61-byte comment-only `~/.databrickscfg` with zero profiles was previously observed and
 attributed to mis-provisioning. It is **this script's placeholder**. The correct diagnosis is
-*"home setup ran and credential provisioning never landed on top of the placeholder"* — and
-the fix is still to restart the sandbox.
+*"home setup ran and credential provisioning never landed on top of the placeholder."* The
+fix is still to restart the sandbox.
 
 ## 4. Nothing you control runs at boot
 
@@ -173,9 +173,12 @@ the fix is still to restart the sandbox.
 | the only boot hook | Databricks' own `setup-home-directory.sh`, root-owned mode 555 on a read-only image path |
 
 So **tmux sessions cannot survive a sandbox restart**, and no in-VM mechanism can re-create
-them. Re-enrolment has to be driven from the agent side on next start. `$HOME` persists
-across `stop`/`start`; everything else, including `/tmp` (where tmux's socket lives) and
-`/run`, does not.
+them. The agent side has to drive re-enrolment on next start.
+
+The reason is the process, not the filesystem. `$HOME` persists across `stop`/`start`, and
+the tmux socket defaults to `$SHELLBOX_STATE_DIR/tmux.sock` inside it. But the tmux **server**
+is a process on a VM that stops, so it goes, and its sessions go with it. A surviving socket
+file with nothing listening on it is inert. `/tmp` and `/run` do not persist either.
 
 ## 5. What the ambient credential proves
 
@@ -202,8 +205,12 @@ default-open; before any ACL is enforced it must be replaced by a per-host enrol
 ## Operational footgun
 
 **Do not delete `$HOME/.shellbox/host.json`.** It is the sandbox's only durable host
-identity. Deleting it while sessions are live re-keys every `session_id` (they are
-`f"{host_id}:{tmux_name}"`), leaves the old rows `live` forever, and makes every session id
-already handed to an agent permanently unaddressable while its tmux session still runs.
+identity. Deleting it while sessions are live:
+
+- Re-keys every `session_id` (they are `f"{host_id}:{tmux_name}"`).
+- Leaves the old rows `live` forever.
+- Makes every session id already handed to an agent permanently unaddressable, while its
+  tmux session still runs.
+
 `shellbox-mcp` mitigates this by also stamping `@shellbox_host_id` as a tmux user option and
 recovering from it, but the file is the primary record.

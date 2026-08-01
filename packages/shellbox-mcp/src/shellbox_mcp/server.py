@@ -382,6 +382,31 @@ def build_server(
         """
         return TmuxAdapter(resolved.tmux_config())
 
+    # 🔴 `owner_email` is re-checked rather than frozen, and that is a bug fix rather than
+    # caution. `resolve_host_context` runs before `FastMCP.run()` and deliberately does NOT
+    # make the network call that resolves the sandbox's creator -- `enroll.py` does that on a
+    # background thread, taking ~1.4s against a live workspace, and caches the result.
+    #
+    # Capturing the startup value meant a process that began in that window skipped every
+    # projection for its WHOLE LIFE, even after enrollment succeeded. On a fresh sandbox with
+    # no cached owner that is the first `serve`, so its sessions were never recorded at all.
+    # Measured from inside a real sandbox against real Lakebase; nothing local caught it,
+    # because the integration harness sets SHELLBOX_OWNER_EMAIL and never enters the window.
+    _resolved_owner: list[str | None] = [identified.owner_email]
+
+    def owner_email() -> str:
+        """The owner, re-reading the identity cache once if it was unresolved at startup."""
+        if _resolved_owner[0] is None:
+            late = identity.cached_owner_email(resolved.state_dir)
+            if late:
+                logger.info(
+                    "owner_email became resolvable after startup (%s); recording sessions "
+                    "in the inventory from now on",
+                    late,
+                )
+                _resolved_owner[0] = late
+        return _resolved_owner[0] or _OWNER_UNRESOLVED
+
     def session_id(tmux_name: str) -> str:
         return naming.session_id(identified.host_id, tmux_name)
 
@@ -480,7 +505,7 @@ def build_server(
             # corrects the identity cache; `resolve_host_context` reads that cache. When nothing
             # can supply an owner, `project` REFUSES the write rather than inventing one -- see
             # `_OWNER_UNRESOLVED`.
-            owner_email=identified.owner_email or _OWNER_UNRESOLVED,
+            owner_email=owner_email(),
             # OQ5: this advances on SEND, not on read. `last_read_at` is the read-side column
             # and is deliberately left `None` here, which `upsert_session`'s `GREATEST` preserves
             # rather than clears (Postgres's GREATEST ignores NULLs).

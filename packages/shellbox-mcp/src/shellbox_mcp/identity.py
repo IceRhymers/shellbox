@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "HOST_JSON_NAME",
+    "cached_owner_email",
     "HostIdentity",
     "IdentityError",
     "OwnerResolution",
@@ -889,6 +890,18 @@ def resolve_owner_email(
         "why no credential was available."
     )
     return OwnerResolution(None, source="deferred")
+
+
+def cached_owner_email(state_dir: str) -> str | None:
+    """The cached `owner_email`, or ``None``. A cheap re-read, for callers that started
+    before enrollment finished resolving it.
+
+    `enroll.py` resolves the owner from the ambient credential on a background thread --
+    measured at ~1.4s against a live workspace -- and caches it here. A process that started
+    in that window must be able to notice, or it spends its whole life believing the host has
+    no owner. See `server.py`'s `owner_email()`.
+    """
+    return _read_cached_owner(Path(state_dir) / HOST_JSON_NAME)
 
 
 def _read_cached_owner(path: Path) -> str | None:

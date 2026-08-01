@@ -13,11 +13,13 @@ like and which no in-process patch reproduces.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
 from conftest import TmuxServer, requires_tmux
-from harness import blackholed_dsn, make_harness, run_calls, unreachable_dsn
+from harness import blackholed_dsn, call, make_harness, run_calls, run_script, unreachable_dsn
+from mcp import ClientSession
 
 pytestmark = requires_tmux
 
@@ -226,4 +228,57 @@ def test_a_hanging_registry_delays_a_projecting_call_by_a_BOUNDED_amount(
         f"a projecting tool call took {elapsed:.1f}s against an unrouted address; the engine's "
         "connect_timeout is not being applied, so a registry that never answers reads to an "
         "agent as a hung server"
+    )
+
+
+def test_an_owner_resolved_after_startup_starts_being_recorded(
+    tmux_server: TmuxServer, tmp_path: Path
+) -> None:
+    """🔴 The bug a real sandbox run found, and nothing local could have.
+
+    `resolve_host_context` runs before `FastMCP.run()` and deliberately does NOT make the
+    network call that resolves the sandbox's creator — `enroll.py` does that on a background
+    thread, measured at ~1.4s against a live workspace, and caches the result.
+
+    Capturing the startup value meant a process that began inside that window skipped every
+    projection for its **whole life**, even after enrollment succeeded. On a fresh sandbox
+    with no cached owner that is the first `serve`, so its sessions were never recorded at
+    all. The integration harness sets `SHELLBOX_OWNER_EMAIL`, so it never enters the window —
+    which is exactly why this went unseen until it was run for real.
+
+    Asserted by the warning CHANGING: "inventory deferred" means the write was skipped before
+    any connection; "registry unavailable" means it was attempted and the (deliberately
+    unreachable) database refused. The transition is the proof that the owner was picked up.
+    """
+    harness = make_harness(tmux_server, tmp_path)
+    state_dir = Path(harness.env["SHELLBOX_STATE_DIR"])
+    # SHELLBOX_HOST_ID is unset too: it is an OVERRIDE and deliberately not persisted, so
+    # with it set there is no identity cache for enrollment to write an owner into. Unsetting
+    # it makes the host self-assign and cache, which is the real sandbox path.
+    env = harness.env_with(
+        SHELLBOX_OWNER_EMAIL=None, SHELLBOX_HOST_ID=None, SHELLBOX_DATABASE_URL=UNREACHABLE_DSN
+    )
+
+    async def script(client: ClientSession) -> dict[str, object]:
+        first = (await call(client, "shell_create", {"name": "late-a", "cwd": str(tmp_path)})).data
+
+        # Enrollment completes on its background thread and caches the owner. Simulated by
+        # writing exactly what `identity` writes, because the point under test is whether the
+        # server NOTICES, not how the value got there.
+        cache = state_dir / "host.json"
+        payload = json.loads(cache.read_text())
+        payload["owner_email"] = "resolved-later@example.com"
+        cache.write_text(json.dumps(payload))
+
+        second = (await call(client, "shell_create", {"name": "late-b", "cwd": str(tmp_path)})).data
+        return {"first": first, "second": second}
+
+    out = run_script(harness, script, env=env)
+
+    assert "inventory deferred" in out["first"]["registry_warning"], (
+        "the first create should have skipped the write before connecting"
+    )
+    assert "registry unavailable" in out["second"]["registry_warning"], (
+        "the second create still reported 'deferred', so the owner resolved by enrollment was "
+        "never picked up and this process would ignore the inventory for its whole life"
     )

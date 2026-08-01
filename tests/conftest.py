@@ -131,6 +131,76 @@ def canonical_reader(path: str) -> list[str]:
     return ["sh", "-c", f"cat > {path}"]
 
 
+# --------------------------------------------------------------------------------------
+# Sentinels: strings that prove a shell RAN a command, not merely received it.
+#
+# 🔴 The property, and it has been got wrong more than once in this suite: **a sentinel must
+# not be a substring of the command that produces it.** A pty echoes whatever is pasted, so
+# a needle visible in the command line as typed is found on the pane whether or not the
+# shell ever executed it. Tests built that way pass against a session that is listed but
+# dead, or where `Enter` was never delivered -- which is the one thing they exist to prove.
+#
+# It has bitten twice for real: `echo KEYS-OK` awaiting `"KEYS-OK"` matched the echo, and
+# `seq 1 200` awaiting `"200"` matched `seq 1 200` itself (passing on macOS by luck of
+# timing, failing on Linux with `scrollback_lines == 0`).
+#
+# So the invariant is enforced in `Sentinel.__post_init__` rather than re-derived in a
+# comment at each call site. A pair that violates it cannot be constructed.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Sentinel:
+    """A token that can appear only in a command's OUTPUT, with its command-line spelling.
+
+    ``awaited`` is what to poll for; ``typed`` is what to put in the command. They are
+    separate fields because they must differ -- see the block comment above.
+    """
+
+    awaited: str
+    typed: str
+
+    def __post_init__(self) -> None:
+        if self.awaited in self.typed:
+            raise AssertionError(
+                f"sentinel {self.awaited!r} appears in the command text {self.typed!r}, so a "
+                "poll for it is satisfied by the pty's echo of the command line and the test "
+                "would pass without the shell ever running it"
+            )
+
+    def echo(self, *, newline: bool = True) -> str:
+        """``echo <typed>`` -- the usual way to put the token on the pane's output."""
+        return f"echo {self.typed}" + ("\n" if newline else "")
+
+
+def sentinel(label: str = "OK") -> Sentinel:
+    """A unique sentinel whose command-line spelling cannot contain it.
+
+    Two mechanisms in one token:
+
+    * **The split.** ``L''IFE-OK`` is what gets typed; the shell removes the empty quotes,
+      so only ``echo``'s output holds the contiguous ``LIFE-OK``.
+    * **A nonce.** The token is unique per call, so a poll cannot be satisfied by output an
+      *earlier* test or an earlier send left in the pane's scrollback -- panes are reused and
+      `history-limit` is 20000, so stale matches are a live hazard, not a theoretical one.
+    """
+    token = f"{label}-{uuid.uuid4().hex[:12]}"
+    return Sentinel(awaited=token, typed=f"{token[:1]}''{token[1:]}")
+
+
+def counted_lines(count: int, *, label: str = "L") -> Sentinel:
+    """A command emitting ``count`` lines whose last line is the awaited token.
+
+    For scrollback assertions, where the point is to produce more output than the pane can
+    show. The token comes out of a format expansion -- the command text holds ``L%s``, never
+    ``L200`` -- which is the same guarantee by a different route.
+    """
+    return Sentinel(
+        awaited=f"{label}{count}",
+        typed=f"printf '{label}%s\\n' $(seq 1 {count})",
+    )
+
+
 @dataclass
 class TmuxServer:
     """One tmux server on its own short socket, torn down after the test."""

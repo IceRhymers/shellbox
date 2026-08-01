@@ -57,14 +57,14 @@ should always fail, because no session `bui` exists.
 
 | verb | `bui` | `=bui` | `=build` | `=build:` | `=bui:` |
 |---|---|---|---|---|---|
-| `has-session` | rc=0 ⚠ | rc=1 ✅ | rc=0 | rc=0 | rc=1 ✅ |
-| `kill-session` | rc=0 ⚠ **kills `build`** | rc=1 ✅ | rc=0 | rc=0 | rc=1 ✅ |
-| `resize-window` | rc=0 ⚠ **resizes `build`** | **rc=0 ⚠ resizes `build`** | rc=0 | rc=0 | rc=1 ✅ |
-| `capture-pane` | rc=0 ⚠ | rc=1 | **rc=1 ✗** | rc=0 | rc=1 ✅ |
-| `send-keys` | rc=0 ⚠ | rc=1 | **rc=1 ✗** | rc=0 | rc=1 ✅ |
-| `set-option` | rc=0 ⚠ | rc=1 | **rc=1 ✗** | rc=0 | rc=1 ✅ |
+| `has-session` | rc=0 unsafe | rc=1 correct | rc=0 | rc=0 | rc=1 correct |
+| `kill-session` | rc=0 unsafe, **kills `build`** | rc=1 correct | rc=0 | rc=0 | rc=1 correct |
+| `resize-window` | rc=0 unsafe, **resizes `build`** | **rc=0 unsafe, resizes `build`** | rc=0 | rc=0 | rc=1 correct |
+| `capture-pane` | rc=0 unsafe | rc=1 | **rc=1 rejected** | rc=0 | rc=1 correct |
+| `send-keys` | rc=0 unsafe | rc=1 | **rc=1 rejected** | rc=0 | rc=1 correct |
+| `set-option` | rc=0 unsafe | rc=1 | **rc=1 rejected** | rc=0 | rc=1 correct |
 
-⚠ = prefix match reached a session the caller did not name. ✗ = valid session rejected.
+unsafe = prefix match reached a session the caller did not name. rejected = valid session rejected.
 
 **`=name:` is the single universal safe form** — correct for all six verbs, and the only form
 that rejects the `=bui:` control everywhere. This is *simpler* than the architect's proposed
@@ -88,9 +88,9 @@ A pane's history limit is fixed when the pane is created.
 
 | approach | global reads | **pane** reads | works? |
 |---|---|---|---|
-| r2 §7.2: `set-option -g` *after* `new-session` | `20000` | **`2000`** | ❌ |
-| `tmux -f <conf>` with `set -g history-limit` | — | `20000` | ✅ |
-| `start-server ; set-option -g ; new-session` (one invocation) | — | `20000` | ✅ |
+| r2 §7.2: `set-option -g` *after* `new-session` | `20000` | **`2000`** | no |
+| `tmux -f <conf>` with `set -g history-limit` | — | `20000` | yes |
+| `start-server ; set-option -g ; new-session` (one invocation) | — | `20000` | yes |
 
 Identical in both lanes. W2's criterion "`show-options` confirms `history-limit`" reads the
 **global** and passes green while every real pane runs at the 2000 default — the same
@@ -266,7 +266,7 @@ a misconfiguration as a healthy empty inventory, which is precisely the "misconf
 poisons the registry" hazard (§9.2): that process would then mark every live session on the
 host `orphaned`.
 
-⚠️ **One ambiguity is NOT resolved by this and must not be treated as solved:** a cold start
+**One ambiguity is NOT resolved by this and must not be treated as solved:** a cold start
 and a *wrong socket path* produce the identical message. Classification cannot tell them
 apart, which is why §9.2's orphaning guard (compare the resolved socket against the `hosts`
 row) is load-bearing rather than belt-and-braces.
@@ -308,7 +308,7 @@ New forms go into the spike first and into `tmux.py` second. Verified in both la
 leaks the buffer, and `buffer-limit` is **50 server-wide** across all pooled agents, so a leak
 both evicts other agents' buffers and retains arbitrary agent input.
 
-## F15 — 🔴 the TAB separator survives **only** under a UTF-8 ctype locale
+## F15 — the TAB separator survives **only** under a UTF-8 ctype locale
 
 The most consequential finding in W2, and structurally invisible to every earlier lane.
 
@@ -370,7 +370,7 @@ deletes `LANG`/`LC_ALL`/`LC_CTYPE` from the process — the sandbox's condition 
 adapter still parses, then asserts the same tmux on the same server **does** mangle without the
 forced locale, so the reason for the fix stays visible.
 
-⚠️ **A note for W10 (sandbox verification):** §7's env rules force `TERM` and say nothing about
+**A note for W10 (sandbox verification):** §7's env rules force `TERM` and say nothing about
 the locale. This finding means the sandbox's locale must be treated as **absent until measured**,
 and any future code path that invokes tmux outside `TmuxAdapter` inherits this hazard.
 

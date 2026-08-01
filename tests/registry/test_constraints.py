@@ -116,3 +116,26 @@ def test_sessions_owner_email_not_null(registry) -> None:
                     status="live",
                 )
             )
+
+
+def test_sessions_host_id_foreign_key_rejects_an_unknown_host(registry) -> None:
+    """The FK was removable from both the model and migration 0001 with nothing failing.
+
+    It is load-bearing rather than decorative: `host_id` is the identity every `session_id`
+    embeds, and the `_insert_host` helper above exists *because* of this constraint. Without it,
+    a session row can outlive or precede its host and Phase 4's inventory joins silently lose
+    rows.
+    """
+    with pytest.raises(IntegrityError):
+        with registry._engine.begin() as conn:
+            conn.execute(
+                insert(Session).values(
+                    session_id="ghost:build",
+                    host_id="no-such-host",
+                    tmux_name="build",
+                    owner_email="a@example.com",
+                    created_at=NOW,
+                    last_activity_at=NOW,
+                    status="live",
+                )
+            )

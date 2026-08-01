@@ -9,6 +9,16 @@ dependencies = [
     "sqlalchemy>=2.0,<3",
 ]
 
+# `lakebase.py` mints an OAuth token to use as the Postgres password, which needs the
+# Databricks SDK. It is an EXTRA rather than a dependency on purpose: the three above are
+# deliberately SDK-free, and that is what lets local-Postgres CI, `NullRegistry` and the
+# whole test suite run with no Databricks install at all. Importing `lakebase` does not
+# require the SDK; minting a token does, and says so.
+#
+# Phase 4's App declares `shellbox-registry[lakebase]`.
+[project.optional-dependencies]
+lakebase = ["databricks-sdk>=0.40,<1"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

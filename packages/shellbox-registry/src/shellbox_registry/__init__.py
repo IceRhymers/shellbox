@@ -2,8 +2,12 @@
 
 Implements W6 (see .omc/plans/phase-2-session-plane.md §4, §10, §12, ADR-3): `hosts`/
 `sessions` models, the `Registry` protocol, `NullRegistry`/`PostgresRegistry`, and the
-alembic environment + migration 0001. `lakebase.py` (OAuth-token-as-password, token
-refresh) is out of scope here — that is W9.
+alembic environment + migrations.
+
+`lakebase.py` (OAuth-token-as-password) lives here too but is deliberately **not**
+re-exported below: it is the only module needing the optional `databricks-sdk` extra, and
+an unqualified export would make that dependency look mandatory. Import it explicitly:
+``from shellbox_registry.lakebase import lakebase_registry``.
 """
 
 from shellbox_registry.base import HostRecord, Registry, SessionRecord

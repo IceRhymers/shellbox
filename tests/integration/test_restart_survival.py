@@ -41,14 +41,13 @@ import signal
 import subprocess
 import sys
 import threading
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from conftest import TmuxServer, await_file, requires_tmux
+from conftest import TmuxServer, await_file, requires_tmux, sentinel
 from harness import Harness, Outcome, await_content, call, make_harness, run_script
 from mcp import ClientSession
 from mcp.types import LATEST_PROTOCOL_VERSION
@@ -219,15 +218,13 @@ def test_a_session_survives_a_sigkilled_mcp_server(tmux_server: TmuxServer, tmp_
     # Two distinct tokens: one written BEFORE the kill (so finding it afterwards proves
     # survival) and one produced AFTER it (so the successor process's send cannot be
     # satisfied by output the first process already left on the pane).
-    before = f"BEFORE-{uuid.uuid4().hex[:12]}"
-    after = f"AFTER-{uuid.uuid4().hex[:12]}"
-    # The pty ECHOES whatever is pasted, so a needle that appears in the command line as
-    # typed would be found on the pane whether or not the shell ever ran it -- step 9 would
-    # then pass against a session that is listed but dead. The empty quotes split the token
-    # in the echoed command and the shell removes them, so the contiguous `after` can only
-    # come from `echo`'s OUTPUT.
-    typed = f'{after[:1]}""{after[1:]}'
-    assert after not in typed, "the needle must not appear in the command line as typed"
+    # The pty ECHOES whatever is pasted, so a needle visible in the command line as typed
+    # would be found on the pane whether or not the shell ever ran it -- steps 8 and 9 would
+    # then pass against a session that is listed but dead. `conftest.sentinel` splits the
+    # token so only the shell's OUTPUT holds it contiguously, and enforces that invariant in
+    # its constructor rather than leaving it to a hand-written assertion here.
+    before = sentinel("BEFORE")
+    after = sentinel("AFTER")
 
     with live_server(harness) as first:
         # Steps 1-2: create, and record the incarnation.
@@ -244,12 +241,12 @@ def test_a_session_survives_a_sigkilled_mcp_server(tmux_server: TmuxServer, tmp_
         # find it after the restart). The ECHOED command line is no good for step 8 -- the
         # pane is 80 columns and the prompt pushes the token across a wrap, which splits it.
         sent = first.call(
-            "shell_send", {"session": name, "text": f"echo {before} | tee {marker}\n"}
+            "shell_send", {"session": name, "text": f"echo {before.typed} | tee {marker}\n"}
         ).data
         assert sent["incarnation"] == incarnation
-        assert before.encode() in await_file(
+        assert before.awaited.encode() in await_file(
             str(marker),
-            lambda data: before.encode() in data,
+            lambda data: before.awaited.encode() in data,
             timeout=15.0,
             what="the pre-kill sentinel",
         )
@@ -285,10 +282,10 @@ def test_a_session_survives_a_sigkilled_mcp_server(tmux_server: TmuxServer, tmp_
     async def successor(client: ClientSession) -> dict[str, Any]:
         listed = (await call(client, "shell_list")).data
         read = (await call(client, "shell_read", {"session": name})).data
-        sent = (await call(client, "shell_send", {"session": name, "text": f"echo {typed}\n"})).data
+        sent = (await call(client, "shell_send", {"session": name, "text": after.echo()})).data
         # §11.1: the send returns once tmux accepted the paste, strictly before the shell
         # has run anything, so the effect is POLLED for -- never slept on.
-        content = await await_content(client, name, after, timeout=20.0, lines=200)
+        content = await await_content(client, name, after.awaited, timeout=20.0, lines=200)
         killed = (await call(client, "shell_kill", {"session": name})).data
         gone = (await call(client, "shell_list")).data
         return {
@@ -315,13 +312,13 @@ def test_a_session_survives_a_sigkilled_mcp_server(tmux_server: TmuxServer, tmp_
     assert entry["alive"] is True
 
     # Step 8: the pane's scrollback survived too -- the pre-kill command line is still there.
-    assert before in out["read"]["content"]
+    assert before.awaited in out["read"]["content"]
 
     # Step 9 -- property (b). The send reports the SAME incarnation, so the successor is
     # addressing the surviving session rather than a replacement, and `after` can only come
     # from a command the successor delivered.
     assert out["sent"]["incarnation"] == incarnation
-    assert after in out["content"]
+    assert after.awaited in out["content"]
     assert out["killed"]["killed"] is True
     assert out["gone"]["sessions"] == []
     assert tmux_server.sessions() == []

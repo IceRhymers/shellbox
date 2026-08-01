@@ -44,6 +44,7 @@ def _session_to_record(row: SessionModel) -> SessionRecord:
         cols=row.cols,
         rows=row.rows,
         created_at=row.created_at,
+        last_read_at=row.last_read_at,
     )
 
 
@@ -52,18 +53,37 @@ class PostgresRegistry(Registry):
     responsible for catching that and degrading to a `registry_warning` rather than
     failing the tool call (§9)."""
 
+    # 🔴 A registry that never answers must not be indistinguishable from a shell that never
+    # starts. Registry writes are non-fatal by construction -- a failure becomes a
+    # `registry_warning` on a successful tool call -- but that guarantee covers *errors*, not
+    # *latency*: with no connect timeout, a DSN pointing at an unrouted address makes
+    # `shell_create` sit on the tool path until the OS gives up, which was measured at **63
+    # seconds** against a blackholed host. The agent does get its shell, and by then nobody is
+    # waiting.
+    #
+    # This is deliberately short. The cost of being wrong is one retried write on the next
+    # enrollment pass; the cost of being generous is a tool call an agent reads as a hang.
+    # (A closed port cannot expose this -- it RSTs immediately -- which is why it went unnoticed:
+    # every existing non-fatal test points at port 1.)
+    CONNECT_TIMEOUT_SECONDS = 5
+
     def __init__(
         self,
         dsn: str,
         *,
         pool_size: int = 3,
         pool_pre_ping: bool = True,
+        connect_timeout: int = CONNECT_TIMEOUT_SECONDS,
         engine: Engine | None = None,
     ) -> None:
         self._engine = engine or create_engine(
             normalize_postgres_dsn(dsn),
             pool_size=pool_size,
             pool_pre_ping=pool_pre_ping,
+            # libpq's own option, passed through psycopg. NOT a SQLAlchemy pool setting:
+            # `pool_timeout` bounds waiting for a free connection from the pool, which is a
+            # different failure and does nothing when the problem is the TCP connect itself.
+            connect_args={"connect_timeout": connect_timeout},
         )
 
     def dispose(self) -> None:
@@ -111,6 +131,7 @@ class PostgresRegistry(Registry):
             rows=record.rows,
             created_at=created_at,
             last_activity_at=record.last_activity_at,
+            last_read_at=record.last_read_at,
             status=record.status,
         )
         stmt = stmt.on_conflict_do_update(
@@ -125,6 +146,18 @@ class PostgresRegistry(Registry):
                 # created_at intentionally NOT set here -> preserved on conflict.
                 "last_activity_at": func.greatest(
                     stmt.excluded.last_activity_at, SessionModel.last_activity_at
+                ),
+                # GREATEST is doing two jobs here, and the second one is why `last_read_at`
+                # needs no special-casing in callers:
+                #   1. a delayed/stale write cannot move the timestamp backwards, as above;
+                #   2. Postgres's GREATEST *ignores NULLs* (returning NULL only when every
+                #      argument is NULL), so a send-only upsert -- which carries
+                #      last_read_at=None -- preserves whatever read timestamp is already
+                #      there instead of clearing it.
+                # Note (2) is NOT portable intuition: it is the opposite of how NULL behaves
+                # in most expressions, and `MAX` over a column set would not give it.
+                "last_read_at": func.greatest(
+                    stmt.excluded.last_read_at, SessionModel.last_read_at
                 ),
                 "status": stmt.excluded.status,
             },

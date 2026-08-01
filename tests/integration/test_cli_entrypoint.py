@@ -52,17 +52,47 @@ def test_help_goes_to_stderr_and_stdout_stays_empty(tmp_path: Path) -> None:
     assert "usage: shellbox-mcp" in result.stderr
 
 
-def test_a_deferred_subcommand_says_so_and_exits_non_zero(tmp_path: Path) -> None:
-    """``doctor``/``enroll``/``bootstrap`` are named, so the error is "not yet", not "no such".
+def test_doctor_and_bootstrap_are_real_subcommands(tmp_path: Path) -> None:
+    """W8 landed, so these two no longer say "not implemented yet".
 
-    The difference decides where the reader looks next: at the plan, or at their spelling.
+    `doctor` runs and exits 0 on a healthy host; `bootstrap` with no options refuses rather
+    than silently doing nothing, because silence is indistinguishable from success.
     """
-    for command, work_item in (("doctor", "W8"), ("enroll", "W7"), ("bootstrap", "W8")):
-        result = _run([command], tmp_path)
-        assert result.returncode != 0, command
-        assert result.stdout == ""
-        assert "not implemented yet" in result.stderr
-        assert work_item in result.stderr
+    # ⚠️ An explicit SHORT socket, for the third time in this suite: the default is
+    # `$SHELLBOX_STATE_DIR/tmux.sock`, and pytest's `tmp_path` alone is 141 bytes here —
+    # past macOS's 104-byte `sun_path` limit. Without it `doctor` correctly reports FAIL and
+    # this test measures the fixture rather than the command. `tests/conftest.py` documents
+    # the same trap for the tmux lane.
+    doctor = _run(["doctor"], tmp_path, SHELLBOX_TMUX_SOCKET="/tmp/sbx-doctor-itest.sock")
+    assert doctor.returncode == 0, doctor.stderr
+    assert doctor.stdout == "", "doctor wrote to stdout, which may be a JSON-RPC stream"
+    assert "shellbox-mcp doctor" in doctor.stderr
+
+    bootstrap = _run(["bootstrap"], tmp_path)
+    assert bootstrap.returncode != 0
+    assert bootstrap.stdout == ""
+    assert "nothing to do" in bootstrap.stderr
+
+
+def test_bootstrap_refuses_to_reset_a_credential_without_saying_which_sandbox(
+    tmp_path: Path,
+) -> None:
+    """ADR-8 at the process boundary: a reset-only run would leave a host that has lost its
+    credential AND cannot be named in the inventory."""
+    result = _run(["bootstrap", "--reset-pat"], tmp_path)
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "requires --sandbox-id" in result.stderr
+
+
+def test_the_one_remaining_deferred_subcommand_explains_itself(tmp_path: Path) -> None:
+    """`enroll` is not missing work — `serve` runs E1-E7 automatically on a background
+    thread. The message must say that, rather than "not implemented yet", which would send a
+    reader to the plan hunting for something that is already done."""
+    result = _run(["enroll"], tmp_path)
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "serve` runs enrollment automatically" in result.stderr
 
 
 def test_an_unknown_subcommand_exits_non_zero_with_usage_on_stderr(tmp_path: Path) -> None:

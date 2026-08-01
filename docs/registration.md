@@ -59,12 +59,12 @@ Verify:
 $ claude mcp get shellbox
 shellbox:
   Scope: Local config (private to you in this project)
-  Status: ✔ Connected
+  Status: Connected
   Type: stdio
   Command: /absolute/path/to/.venv/bin/shellbox-mcp
 ```
 
-`✔ Connected` means Claude Code actually spawned the process and completed the MCP
+`Connected` means Claude Code actually spawned the process and completed the MCP
 `initialize` handshake — it is not just a config-file syntax check.
 
 ### Calling a tool
@@ -84,12 +84,12 @@ This ran a real create → send → read → kill sequence against a real tmux s
 returned the real tool payloads, e.g.:
 
 ```json
-{"session":"unknown:<host>:w11-claude-test","tmux_name":"w11-claude-test","cwd":"/private/tmp",
- "cols":80,"rows":24,"created":true,"incarnation":"a1c6ecf0-...","host_id":"unknown:<host>",
+{"session":"3f9c1e70-...:w11-claude-test","tmux_name":"w11-claude-test","cwd":"/private/tmp",
+ "cols":80,"rows":24,"created":true,"incarnation":"a1c6ecf0-...","host_id":"3f9c1e70-...",
  "registry_warning":null}
 ```
 
-(`host_id` reads `unknown:<host>` because `SHELLBOX_HOST_ID` was intentionally left
+(`host_id` is a self-assigned uuid4 here because `SHELLBOX_HOST_ID` was intentionally left
 unset for this test — see §10/W7; it is not a defect.)
 
 ### Protocol version
@@ -131,6 +131,26 @@ anyone debugging a Claude Code + shellbox-mcp session to re-run with `--debug` f
 
 ## Codex
 
+> **Inside a Lakebox sandbox, `~/.codex/config.toml` is a symlink into `/run/lakebox/`
+> and the platform re-points it on EVERY boot.** So a registration written by `codex mcp
+> add` — or by hand — is destroyed at the next start, and writing *through* the symlink puts
+> it in `/run`, which is wiped. Measured from the platform's own boot script; see
+> [`sandbox-environment.md`](sandbox-environment.md) §3.
+>
+> In a sandbox, register with the command that knows this, **once per boot**:
+>
+> ```sh
+> shellbox-mcp bootstrap --register-codex
+> ```
+>
+> It replaces the *symlink* with a regular 0600 file and **merges** shellbox in, preserving
+> the `model_provider`/`model_providers` keys Codex needs to reach its model at all — which
+> a wholesale overwrite would discard. Running it twice is a no-op. Verified against a live
+> sandbox's real template.
+>
+> `~/.claude.json` is **not** affected: it is a genuine file in persistent `$HOME`, so
+> Claude Code registration is durable and needs no per-boot step.
+
 ### Registering
 
 ```sh
@@ -151,7 +171,7 @@ command = "/absolute/path/to/.venv/bin/shellbox-mcp"
 SHELLBOX_LOG_LEVEL = "DEBUG"
 ```
 
-⚠️ **Observed side effect, worth knowing before running this on a machine with other
+**Observed side effect, worth knowing before running this on a machine with other
 MCP servers already configured:** `codex mcp add` rewrites the *entire*
 `config.toml`, not just the new stanza. On this test machine that reordered
 unrelated keys and normalized at least one value's type (`startup_timeout_sec = 120`
@@ -292,8 +312,9 @@ Every environment variable `shellbox-mcp` reads, transcribed from `config.py` (a
 | `SHELLBOX_LOG_LEVEL` | `INFO` | One of `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`; an unrecognised value **warns and falls back to `INFO`** rather than failing startup — stderr is the only diagnostic channel, so refusing to start would be worse. |
 | `SHELLBOX_DATABASE_URL` | unset | A full `postgresql://...` DSN. Wins over the `SHELLBOX_PG_*` parts below if both are set. |
 | `SHELLBOX_PG_USER` / `_PASSWORD` / `_HOST` / `_PORT` / `_DB` | `shellbox` / `shellbox` / `localhost` / `55432` / `shellbox` | Used to assemble a DSN only if `SHELLBOX_DATABASE_URL` is unset **and** at least one of these is set. |
-| `SHELLBOX_OWNER_EMAIL` | unset | Escape hatch (OQ2); recorded as `"unknown"` in registry rows until W7's identity resolution lands. |
-| `SHELLBOX_HOST_ID` | unset | Overrides §10's derivation. Left unset, falls back to `unknown:<machine-id>` and **logs a WARNING every process start** — deliberately loud, since an `unknown:` host makes the Phase 4 inventory useless. |
+| `SHELLBOX_OWNER_EMAIL` | unset | An **override**, honoured but deliberately **not cached** — symmetrically with `SHELLBOX_HOST_ID`. Debugging one process must not permanently change what the host claims about itself. With no owner resolvable from anywhere, the inventory write is **skipped** (never written as a placeholder) and says so. |
+| `SHELLBOX_HOST_ID` | unset | An **override**, not cached. Left unset, the host **self-assigns a uuid4** and remembers it in `$SHELLBOX_STATE_DIR/host.json`. There is no `unknown:<machine-id>` fallback any more: `/etc/machine-id` is baked into the sandbox image, so it was identical on every sandbox and would have collapsed the whole fleet into one `hosts` row. See [`sandbox-environment.md`](sandbox-environment.md) §2. |
+| *(the sandbox id)* | n/a | **Not an environment variable.** A sandbox cannot learn which sandbox it is, so it is injected once per boot by `shellbox-mcp bootstrap --sandbox-id <id>`, run from outside. `shellbox-mcp doctor` reports `sandbox_id: NULL` when that has not happened. |
 
 **No database configuration at all ⇒ `NullRegistry`.** This is the documented design
 (§5), not a missing feature: every `upsert_host`/`upsert_session`/`get_host`/

@@ -64,6 +64,23 @@ class Session(Base):
     rows: Mapped[int | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(_TIMESTAMPTZ, nullable=False)
     last_activity_at: Mapped[datetime] = mapped_column(_TIMESTAMPTZ, nullable=False)
+    # `last_activity_at` advances on SEND only; `last_read_at` on READ. Two columns, because
+    # one cannot express both of Phase 5's hazards and a single column would force Phase 2 to
+    # pick Phase 5's reaping policy:
+    #
+    #   * count reads as activity  -> an agent polling `shell_read` keeps a session alive forever
+    #   * ignore reads entirely    -> an agent watching a 40-minute build without sending gets
+    #                                 its session reaped mid-build
+    #
+    # Recording both leaves the predicate to #5 (`last_activity_at` alone, `GREATEST(...)`, or a
+    # different timeout per column). Added by migration 0002 rather than folded into the merged
+    # 0001: alembic records only a revision *id* and never fingerprints content, so amending a
+    # migration a developer has already applied gives them a schema missing this column while
+    # `alembic current` reports up to date -- the same silent divergence the `_TIMESTAMPTZ`
+    # comment above exists to prevent.
+    # Nullable because a session that has never been read has no honest value for it — do NOT
+    # default it to `created_at`, which would read as "someone looked at this".
+    last_read_at: Mapped[datetime | None] = mapped_column(_TIMESTAMPTZ, default=None)
     status: Mapped[str] = mapped_column(nullable=False)
 
     __table_args__ = (

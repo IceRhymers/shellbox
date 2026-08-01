@@ -9,11 +9,23 @@ Two properties this module exists to preserve:
   ``TmuxConfig`` and never reads ``os.environ``, so its tests never mutate the
   environment. That split only works if exactly one module does the reading -- this one.
 
-``host_id`` derivation here is deliberately the *degraded* form: §10's steps 2 and 3 (the
-``$SHELLBOX_STATE_DIR/host.json`` cache and the ``lakebox:<sandbox_id>`` derivation) belong
-to W7's ``identity.py``/``enroll.py``. Until W7 lands, an un-set ``SHELLBOX_HOST_ID`` lands
-on §10's step 4 -- ``unknown:<machine-id>``, logged loudly -- which is exactly what §10 says
-should happen and is why it is logged rather than silently accepted.
+⚠️ **This module does not resolve ``host_id``, and must not start.** It reads
+``SHELLBOX_HOST_ID`` as an *override* and stops there; the identity itself is assigned and
+cached by ``identity.py``, called explicitly by ``server.py``. Three reasons that split is
+load-bearing rather than tidiness:
+
+* Assigning an identity **writes a file** under ``$HOME`` (and takes a lock to do it). This
+  module is a pure function of an injected ``Mapping``, unit-tested with synthetic
+  environments; a write behind it would make those tests touch a real home directory.
+* The assignment is arbitrated across 1-32 concurrent processes. Putting that inside a frozen
+  dataclass's constructor hides a multi-process transaction behind an attribute access.
+* ``ensure_state_dir()`` is called *after* configuration resolves, so resolving identity here
+  would need the state directory before anything had created it.
+
+An earlier version derived ``unknown:<machine-id>`` here as a last resort. That was not a weak
+identity but a **fleet-merging** one: ``/etc/machine-id`` is baked into the sandbox image, so
+every host would have shared one ``hosts`` row, each overwriting the others' ``owner_email``.
+It is deleted rather than deprecated -- see ``docs/sandbox-environment.md`` §2.
 """
 
 from __future__ import annotations
@@ -21,7 +33,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,7 +78,6 @@ class Settings:
     tmux_bin: str
     socket_path: str
     state_dir: str
-    host_id: str
     history_limit: int
     default_cols: int
     default_rows: int
@@ -76,6 +86,12 @@ class Settings:
     log_level: LogLevel
     database_dsn: str | None = None
     owner_email: str | None = None
+    host_id_override: str | None = None
+    """``$SHELLBOX_HOST_ID``: an override, NOT a resolved identity.
+
+    ``None`` is the normal case and means "assign or read one from the cache" -- which
+    ``identity.resolve_host_id`` does. Named ``_override`` so no caller can mistake it for the
+    host's identity and skip that call."""
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -96,7 +112,6 @@ class Settings:
             tmux_bin=env.get("SHELLBOX_TMUX_BIN") or shutil.which("tmux") or "tmux",
             socket_path=env.get("SHELLBOX_TMUX_SOCKET") or str(Path(state_dir) / "tmux.sock"),
             state_dir=state_dir,
-            host_id=_resolve_host_id(env),
             history_limit=_int_env(env, "SHELLBOX_HISTORY_LIMIT"),
             default_cols=_int_env(env, "SHELLBOX_DEFAULT_COLS"),
             default_rows=_int_env(env, "SHELLBOX_DEFAULT_ROWS"),
@@ -108,6 +123,7 @@ class Settings:
             # explicit mapping resolves the one variable this module reads directly.
             database_dsn=dsn_from_env() if environ is None else env.get("SHELLBOX_DATABASE_URL"),
             owner_email=env.get("SHELLBOX_OWNER_EMAIL") or None,
+            host_id_override=env.get("SHELLBOX_HOST_ID") or None,
         )
 
     def tmux_config(self) -> TmuxConfig:
@@ -158,36 +174,3 @@ def _int_env(env: Mapping[str, str], key: str) -> int:
     if value <= 0:
         raise ConfigError(f"{key}={raw!r} must be positive")
     return value
-
-
-def _resolve_host_id(env: Mapping[str, str]) -> str:
-    """§10's derivation, steps 1 and 4 only. Steps 2 and 3 are W7's.
-
-    Step 4 is logged at WARNING because §10 requires it to be loud: every host landing on
-    ``kind="unknown"`` makes the ``hosts`` table useless for the Phase 4 inventory, and the
-    plan's own §10 flags that as OQ-A rather than an accepted outcome.
-    """
-    explicit = env.get("SHELLBOX_HOST_ID")
-    if explicit:
-        return explicit
-    host_id = f"unknown:{_machine_id()}"
-    logger.warning(
-        "SHELLBOX_HOST_ID is unset and identity resolution (W7) is not wired up yet; "
-        "falling back to §10 step 4: %r. Set SHELLBOX_HOST_ID for a stable inventory.",
-        host_id,
-    )
-    return host_id
-
-
-def _machine_id() -> str:
-    """A stable per-host string. Determinism is the requirement, not uniqueness.
-
-    ``/etc/machine-id`` where it exists (Linux, and the sandbox image), the hostname
-    otherwise. NOT ``uuid.getnode()``: it fabricates a random node id when no hardware
-    address is readable, which would make ``host_id`` change across restarts -- and §10's
-    whole point is that it does not.
-    """
-    try:
-        return Path("/etc/machine-id").read_text(encoding="utf-8").strip() or socket.gethostname()
-    except OSError:
-        return socket.gethostname()

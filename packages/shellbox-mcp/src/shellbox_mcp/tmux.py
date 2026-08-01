@@ -151,6 +151,20 @@ def _own_incarnation(raw: str) -> str:
 
 CWD_OPTION = "@shellbox_cwd"
 
+# The host identity, stamped on every session shellbox creates so that a host which loses
+# `$HOME/.shellbox/host.json` while sessions are still running can re-adopt its real identity
+# instead of re-keying every `session_id` (see `identity.py`).
+#
+# ⚠️ Deliberately NOT a ninth `LIST_FIELDS` entry, and this is a decision, not an oversight.
+# `LIST_FIELDS` is exactly 8 with `_LIST_MAXSPLIT = FIELD_COUNT` and a long comment on why
+# maxsplit must be one MORE than a well-formed record needs; `_READ_FIELDS` separately
+# documents why the single possibly-empty field is last; and shipped tests assert "`-F` yields
+# 8 raw fields". A ninth option would break a thrice-reviewed invariant, and would put a
+# SECOND possibly-empty field into a format whose whole safety argument is that there is one.
+# It is read through `read_host_stamp` instead: one extra subprocess against ADR-5's "zero
+# extra subprocesses", paid only on the rare cold path where the identity cache is missing.
+HOST_ID_OPTION = "@shellbox_host_id"
+
 
 class CommandResult(NamedTuple):
     """One tmux invocation's outcome.
@@ -888,6 +902,66 @@ class TmuxAdapter:
         if classify_stderr(result.stderr) in {"not_found", NO_SERVER}:
             return False
         raise tmux_failure(result.stderr, session=name, context="has-session failed")
+
+    # -- the host stamp (W7f) ------------------------------------------------------------
+    #
+    # Read and written through `show-options`/`set-option` rather than the `-F` group, for the
+    # reason given at `HOST_ID_OPTION`. Both are deliberately NON-RAISING on a missing session
+    # or a dead server: they are called from enrollment, which runs in the background and must
+    # never be able to fail a tool call.
+
+    def read_host_stamp(self, name: str) -> str | None:
+        """The session's ``@shellbox_host_id``, or ``None`` if absent/unusable/unreachable.
+
+        ``None`` collapses four cases on purpose -- no server, no session, no option, and an
+        option whose value cannot have come from shellbox. Every caller wants the same answer
+        for all four ("this session tells me nothing about my identity"), and the *reason* is
+        already logged where it matters.
+
+        Only shape problems that break the read-back mechanically are rejected here:
+        ``show-options -v`` output is read as a single line, so a value containing an LF or TAB
+        would be silently truncated and a truncated `host_id` is a DIFFERENT host_id -- which
+        would then be adopted and stamped into every `session_id` on the host. Semantic
+        validation (colons, which make `'<host_id>:<tmux_name>'` ambiguous) belongs to
+        `identity.py`, the layer that owns what a `host_id` may be.
+        """
+        naming.validate_session_name(name)
+        result = self._run("show-options", "-v", "-t", target(name), HOST_ID_OPTION)
+        if result.rc != 0:
+            return None
+        # `-v` on an unset option prints an empty line rather than failing, so emptiness is
+        # the normal "not stamped" answer and not an error.
+        raw = result.stdout_raw.split("\n", 1)[0]
+        if not raw or raw != raw.strip() or any(char.isspace() for char in raw):
+            if raw:
+                logger.error(
+                    "ignoring %s=%r on session %r: it contains whitespace, so the value read "
+                    "back cannot be trusted to be the value that was written",
+                    HOST_ID_OPTION,
+                    raw,
+                    name,
+                )
+            return None
+        return raw
+
+    def stamp_host_id(self, name: str, host_id: str) -> bool:
+        """Stamp ``@shellbox_host_id`` on a session. False if it could not be written.
+
+        Idempotent by nature (``set-option`` overwrites), and never raises: a host that cannot
+        stamp is a host whose identity cache is merely un-backed-up, which is a degradation and
+        not a failure.
+        """
+        naming.validate_session_name(name)
+        result = self._run("set-option", "-t", target(name), HOST_ID_OPTION, host_id)
+        if result.rc != 0:
+            logger.warning(
+                "could not stamp %s on session %r: %s",
+                HOST_ID_OPTION,
+                name,
+                result.stderr.strip(),
+            )
+            return False
+        return True
 
 
 def _encode_text(text: str, name: str) -> bytes:

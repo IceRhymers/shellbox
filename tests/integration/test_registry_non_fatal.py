@@ -13,10 +13,11 @@ like and which no in-process patch reproduces.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from conftest import TmuxServer, requires_tmux
-from harness import make_harness, run_calls, unreachable_dsn
+from harness import blackholed_dsn, make_harness, run_calls, unreachable_dsn
 
 pytestmark = requires_tmux
 
@@ -157,3 +158,72 @@ def test_an_unresolved_owner_defers_the_inventory_instead_of_inventing_a_princip
     stderr = harness.stderr()
     assert "owner_email is unresolved" in stderr, "the skip was not logged as a diagnostic"
     assert f"itest-host:{name}" in stderr, "the log does not say which session was affected"
+
+
+def test_enrollment_cannot_delay_the_handshake_even_against_a_hanging_registry(
+    tmux_server: TmuxServer, tmp_path: Path
+) -> None:
+    """🔴 The W7 promise, asserted with a clock: enrollment never blocks the handshake.
+
+    This is the one criterion that needs the *wiring* to be real rather than the module to be
+    correct. `enroll` resolves the sandbox creator (a network call) and writes a `hosts` row, both
+    at startup. Doing either before `FastMCP.run()` would sit between the client and its
+    `initialize`/`tools/list` — which a harness reports as a failed handshake, with nothing to
+    suggest an inventory write was the cause. So enrollment runs on a daemon thread.
+
+    ⚠️ The DSN **hangs**; it is deliberately not `UNREACHABLE_DSN`. Port 1 is closed, so a connect
+    there RSTs instantly and this assertion would pass whether or not enrollment blocked — it
+    would measure nothing. 198.51.100.1 is unrouted TEST-NET-2, so a connect stalls, and the only
+    way to answer inside the bound is to not be waiting on it.
+
+    `shell_list` specifically, because it is the one tool that does **not** project to the
+    registry. That isolates the question to startup: any delay here is enrollment's, not a
+    projection's. The projecting tools are the next test's subject.
+    """
+    harness = make_harness(tmux_server, tmp_path)
+    env = harness.env_with(SHELLBOX_DATABASE_URL=blackholed_dsn())
+
+    started = time.monotonic()
+    (listed,) = run_calls(harness, [("shell_list", {})], env=env)
+    elapsed = time.monotonic() - started
+
+    assert not listed.is_error, listed.text
+    assert elapsed < 15.0, (
+        f"handshake plus a non-projecting tool call took {elapsed:.1f}s against a registry that "
+        "never answers; enrollment is on the startup path instead of a background thread"
+    )
+
+
+def test_a_hanging_registry_delays_a_projecting_call_by_a_BOUNDED_amount(
+    tmux_server: TmuxServer, tmp_path: Path
+) -> None:
+    """🔴 "Non-fatal" has to mean bounded, not merely eventually-successful.
+
+    Registry writes are non-fatal by construction — a failure becomes a `registry_warning` on an
+    otherwise successful call — but that covers *errors*, not *latency*. `shell_create` projects
+    synchronously, so with no connect timeout a DSN pointing at an unrouted address made it wait
+    out the OS default: **63 seconds, measured**, for a shell the agent had already got. An agent
+    cannot tell that from a hung server.
+
+    Every pre-existing non-fatal test points at port 1, which RSTs immediately — so none of them
+    could have caught this, and the fix (`connect_timeout` on the engine) is asserted here
+    against an address that actually stalls.
+    """
+    harness = make_harness(tmux_server, tmp_path)
+    env = harness.env_with(SHELLBOX_DATABASE_URL=blackholed_dsn())
+
+    started = time.monotonic()
+    (created,) = run_calls(
+        harness, [("shell_create", {"name": "bounded", "cwd": str(tmp_path)})], env=env
+    )
+    elapsed = time.monotonic() - started
+
+    # The shell still works. That part was never in doubt and is the whole point of §9.
+    assert not created.is_error, created.text
+    assert created.data["created"] is True
+    assert created.data["registry_warning"], "a hanging registry produced no warning"
+    assert elapsed < 30.0, (
+        f"a projecting tool call took {elapsed:.1f}s against an unrouted address; the engine's "
+        "connect_timeout is not being applied, so a registry that never answers reads to an "
+        "agent as a hung server"
+    )

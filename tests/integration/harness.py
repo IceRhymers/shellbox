@@ -78,6 +78,18 @@ def unreachable_dsn(*, user: str = "sbx", password: str = LEAK_CANARY) -> str:
     return f"postgresql://{user}:{password}@127.0.0.1:1/shellbox"
 
 
+def blackholed_dsn(*, user: str = "sbx", password: str = LEAK_CANARY) -> str:
+    """A DSN that **hangs** rather than failing fast. For the does-not-block assertions.
+
+    ``unreachable_dsn`` above is the wrong tool for those: port 1 is closed, so a connect gets
+    an immediate RST and every "did this block?" test passes without ever reaching the code path
+    that could block. 198.51.100.0/24 is TEST-NET-2 (RFC 5737) and is not routed, so packets are
+    dropped and the connect sits there until the driver's own timeout — which is precisely the
+    condition enrollment must survive without delaying the handshake.
+    """
+    return f"postgresql://{user}:{password}@198.51.100.1:5432/shellbox"
+
+
 @dataclass
 class Outcome:
     """One ``tools/call`` result, as the client saw it.

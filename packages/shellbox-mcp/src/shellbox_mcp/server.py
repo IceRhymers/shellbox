@@ -36,6 +36,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, TypedDict
 
 import mcp.types as types
@@ -43,7 +44,7 @@ from mcp.server.fastmcp import FastMCP
 from shellbox_registry import NullRegistry, Registry, create_registry
 from shellbox_registry import SessionRecord as RegistrySessionRecord
 
-from shellbox_mcp import identity, naming
+from shellbox_mcp import enroll, identity, naming
 from shellbox_mcp.config import Settings
 from shellbox_mcp.errors import (
     InvalidName,
@@ -256,6 +257,30 @@ def _install_error_boundary(mcp: FastMCP[Any]) -> None:
             )
 
 
+def _recover_host_stamp(settings: Settings) -> str | None:
+    """A `host_id` recovered from the live tmux server -- **only when the cache is missing**.
+
+    Gated on the cache's absence rather than run unconditionally, because it costs one
+    subprocess per session and the answer is only ever *used* on the cold path: with a usable
+    cache, `identity.resolve_host_id` needs a stamp solely to detect disagreement, and paying
+    N subprocesses on every process start to detect a fork that has never happened is the wrong
+    trade against ADR-5's "zero extra subprocesses".
+
+    ⚠️ The consequence, stated rather than hidden: a genuine cache-vs-tmux fork on a host whose
+    cache is intact is **not** detected here. It is detected by `enroll.py`, which stamps every
+    session on every pass and would find its own value disagreeing.
+    """
+    if (Path(settings.state_dir) / identity.HOST_JSON_NAME).exists():
+        return None
+    try:
+        return enroll.recover_host_id(TmuxAdapter(settings.tmux_config()))
+    except Exception as exc:  # noqa: BLE001 -- identity resolution may not fail on this
+        # A missing tmux binary, an over-long socket path: all reported per tool call as
+        # `tmux_unavailable`. None of them may stop a host resolving its own identity.
+        logger.debug("could not read a host stamp from tmux (%s)", type(exc).__name__)
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class HostContext:
     """Who this host is and whose it is, resolved once per process.
@@ -277,17 +302,17 @@ class HostContext:
 def resolve_host_context(settings: Settings) -> HostContext:
     """Resolve identity explicitly, at a point where writing a file is expected.
 
-    ⚠️ ``credential_email=None``: resolving the *creating user* from the sandbox's ambient
-    credential (D4, ``current_user.me()``) belongs to ``enroll.py`` and is not wired up yet. So
-    ``owner_email`` currently comes from the cache, then ``SHELLBOX_OWNER_EMAIL``, then defers.
-    That is E2b/E2c/E2d working as specified -- not a stub -- and E2a's reconciliation arrives
-    with the credential.
+    ⚠️ ``credential_email=None`` **on purpose, and this is not a stub.** Resolving the sandbox
+    creator (D4, ``current_user.me()``) is a *network* call, and this function runs synchronously
+    before ``FastMCP.run()`` -- so doing it here would put an unreachable control plane between
+    the client and its handshake. ``enroll.py`` performs E2 with the credential on a background
+    thread and corrects the cache from there (E2a). What runs here is E2b/E2c/E2d: cache, then
+    ``SHELLBOX_OWNER_EMAIL``, then defer.
     """
     host = identity.resolve_host_id(
         settings.state_dir,
         explicit=settings.host_id_override,
-        # `recovered` (the @shellbox_host_id tmux stamp) is W7's: nothing stamps it yet, so
-        # passing it would be passing None with extra steps.
+        recovered=_recover_host_stamp(settings),
     )
     owner = identity.resolve_owner_email(
         settings.state_dir,
@@ -684,6 +709,11 @@ def serve(settings: Settings | None = None) -> None:
     # writes a file and takes a lock, and doing it twice per process to satisfy a log line would
     # be one arbitrated transaction too many.
     identified = resolve_host_context(resolved)
+    # Opened here and passed in, so `serve` and the enrollment thread share ONE registry with
+    # one connection pool. Letting `build_server` open a second would double the pool against a
+    # database whose scale-to-zero behaviour is the reason `pool_pre_ping` exists.
+    store = _open_registry(resolved)
+    server = build_server(resolved, registry=store, host=identified)
     logger.info(
         "shellbox-mcp serving on stdio: tmux=%s socket=%s host_id=%s (%s, %s) owner=%s registry=%s",
         resolved.tmux_bin,
@@ -694,4 +724,24 @@ def serve(settings: Settings | None = None) -> None:
         identified.owner_email or "DEFERRED",
         "postgres" if resolved.database_dsn else "none",
     )
-    build_server(resolved, host=identified).run()
+    # E1-E7 on a daemon thread, started BEFORE `run()` but never waited on. Both halves are
+    # deliberate: enrollment needs to be in flight while the client handshakes (so the row lands
+    # promptly on a healthy host), and it must not be able to delay the handshake on an unhealthy
+    # one -- `current_user.me()` is a network call and a registry pointed at an unreachable DSN
+    # waits out a connect timeout. A client cannot tell a slow inventory write from a broken
+    # server; it sees only that `initialize` did not answer.
+    if identified.owner_email or resolved.database_dsn:
+        enroll.start_enrollment(
+            store,
+            lambda: TmuxAdapter(resolved.tmux_config()),
+            state_dir=resolved.state_dir,
+            host_id=identified.host_id,
+            kind=identified.kind,
+            tmux_socket=resolved.socket_path,
+            tmux_bin=resolved.tmux_bin,
+            sandbox_id=identified.sandbox_id,
+            gateway_host=identified.gateway_host,
+            env_email=resolved.owner_email,
+        )
+
+    server.run()

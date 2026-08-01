@@ -38,7 +38,7 @@ def test_create_chain_reaches_the_pane_and_a_second_create_succeeds(
     assert created.created is True
     assert created.incarnation
 
-    # 🔴 The PANE's history_limit is the only valid oracle. A pane fixes its limit at
+    # CRITICAL: The PANE's history_limit is the only valid oracle. A pane fixes its limit at
     # creation, so the earlier form -- global set AFTER new-session -- left every pane at
     # tmux's 2000 default while `show-options -g` reported 20000 and the acceptance test
     # passed green.
@@ -170,7 +170,7 @@ def test_an_unstamped_session_yields_eight_raw_fields_with_two_empty(
 def test_the_record_parses_when_the_process_has_no_locale(
     tmux_server: TmuxServer, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """🔴 The regression test for the defect W2 nearly shipped, end to end on real tmux.
+    """CRITICAL: The regression test for the defect W2 nearly shipped, end to end on real tmux.
 
     With a non-UTF-8 ctype locale, tmux encodes the TAB in format output as ``_`` -- in
     ``list-sessions -F`` as well as ``display-message`` -- so all eight fields collapse into

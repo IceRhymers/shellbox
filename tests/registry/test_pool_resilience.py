@@ -4,7 +4,7 @@ Lakebase suspends compute after an idle timeout, which **kills every pooled conn
 Without `pool_pre_ping` the next checkout hands back a dead connection and the failure
 surfaces on whatever query happened to be next, rather than at connect where it belongs.
 
-⚠️ **This file exists because the obvious version of the test proves nothing.** Killing
+WARNING: **This file exists because the obvious version of the test proves nothing.** Killing
 *one* backend and asserting the next query works passes with `pool_pre_ping=False` — the
 pool simply hands back one of the other live connections. So every test here terminates
 **all** backends matching a per-test `application_name`, and the central one carries a

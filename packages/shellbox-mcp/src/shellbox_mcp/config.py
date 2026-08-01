@@ -9,7 +9,7 @@ Two properties this module exists to preserve:
   ``TmuxConfig`` and never reads ``os.environ``, so its tests never mutate the
   environment. That split only works if exactly one module does the reading -- this one.
 
-⚠️ **This module does not resolve ``host_id``, and must not start.** It reads
+WARNING: **This module does not resolve ``host_id``, and must not start.** It reads
 ``SHELLBOX_HOST_ID`` as an *override* and stops there; the identity itself is assigned and
 cached by ``identity.py``, called explicitly by ``server.py``. Three reasons that split is
 load-bearing rather than tidiness:

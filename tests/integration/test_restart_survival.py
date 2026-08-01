@@ -24,7 +24,7 @@ c. **``@shellbox_incarnation`` is UNCHANGED.** Without (c) this test passes just
 needed**, so no cleanup handler may be given the chance to run. A graceful shutdown could
 tear the session down and hide exactly the failure this test exists to catch.
 
-⚠️ **Why this module spawns the server itself instead of using ``run_script``.** The harness
+WARNING: **Why this module spawns the server itself instead of using ``run_script``.** The harness
 drives the child through the SDK's ``stdio_client``, which owns the process and never
 exposes it -- and this test's whole subject is that process's pid and its violent death.
 Everything else is reused: ``make_harness`` builds the environment, ``run_script`` drives the

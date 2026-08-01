@@ -6,11 +6,11 @@ has consumed anything, so ``sleep``-based tmux suites pass locally and fail unde
 Everything here polls for a *condition* with a deadline. Nothing here sleeps for a duration
 and then asserts.
 
-⚠️ **A warning for whoever maintains this suite.** Byte-exactness is asserted against the
+WARNING: **A warning for whoever maintains this suite.** Byte-exactness is asserted against the
 **file the pane process wrote**, never against ``capture-pane``: the pane renders, wraps and
 normalises, so a screen scrape is not an oracle for delivered bytes.
 
-⚠️ **And the trap that would make CI green while production drops bytes:** the canonical-mode
+WARNING: **And the trap that would make CI green while production drops bytes:** the canonical-mode
 and raw-mode reader panes test *different things* and must never be unified. A canonical-mode
 pane exists to prove the ``line_too_long`` guard fires before tmux is touched; a raw-mode pane
 (``stty -icanon``) exists to prove shellbox's delivery path is byte-exact. "Fixing" a flaky
@@ -124,7 +124,7 @@ def raw_reader(path: str) -> list[str]:
 def canonical_reader(path: str) -> list[str]:
     """A CANONICAL-mode reader pane: plain ``cat``, the pty's default line discipline.
 
-    ⚠️ Never assert byte-exactness against this. It exists for one purpose: to prove the
+    WARNING: Never assert byte-exactness against this. It exists for one purpose: to prove the
     ``line_too_long`` guard fires *before* tmux is invoked, so the bytes the line discipline
     would destroy never reach the pty at all. See the warning at the top of this module.
     """
@@ -134,7 +134,7 @@ def canonical_reader(path: str) -> list[str]:
 # --------------------------------------------------------------------------------------
 # Sentinels: strings that prove a shell RAN a command, not merely received it.
 #
-# 🔴 The property, and it has been got wrong more than once in this suite: **a sentinel must
+# CRITICAL: The property, and it has been got wrong more than once in this suite: **a sentinel must
 # not be a substring of the command that produces it.** A pty echoes whatever is pasted, so
 # a needle visible in the command line as typed is found on the pane whether or not the
 # shell ever executed it. Tests built that way pass against a session that is listed but

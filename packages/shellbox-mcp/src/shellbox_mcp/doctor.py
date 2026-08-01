@@ -20,7 +20,7 @@ because the OAuth login that replaces it is Phase 3's and does not exist yet. So
 PAT is currently the *correct* state, and reporting it as a failure would train operators
 to ignore a red doctor. It is a WARN that says exactly that.
 
-⚠️ **`doctor` never prints a credential.** It reports whether one exists, its length and
+WARNING: **`doctor` never prints a credential.** It reports whether one exists, its length and
 its 4-character prefix — the same discipline `probe/probe_identity.py` follows, for the
 same reason: this output is exactly what someone pastes into an issue.
 """
@@ -99,7 +99,7 @@ def run_checks(settings: Settings | None = None) -> Report:
 def _check_identity(report: Report, settings: Settings) -> None:
     """Who this host thinks it is — and ADR-8's "was this ever bootstrapped?" line.
 
-    🔴 **Read-only, deliberately.** An earlier version called `resolve_host_id`, which
+    CRITICAL: **Read-only, deliberately.** An earlier version called `resolve_host_id`, which
     *assigns and persists* a uuid4 when no cache exists — so merely running the diagnostic
     minted a permanent identity, in a real `$HOME`, on a machine that may never serve.
     A command you run *because* something is wrong must not change what it is inspecting.
@@ -344,7 +344,7 @@ def _check_credential_state(report: Report) -> None:
 
 
 def _check_config_overrides(report: Report) -> None:
-    """🔴 The variables that can make the PAT reset a silent no-op (§0.6)."""
+    """CRITICAL: The variables that can make the PAT reset a silent no-op (§0.6)."""
     overrides = boot_templated.config_file_overrides()
     if not overrides:
         report.add(

@@ -55,7 +55,7 @@ def test_an_unanchored_prefix_reaches_a_session_the_caller_did_not_name(
 
 
 def test_the_half_anchored_form_is_accepted_by_resize_window(two_sessions: TmuxServer) -> None:
-    """🔴 ``resize-window -t '=bui'`` IS accepted (rc=0) and resizes ``build``.
+    """CRITICAL: ``resize-window -t '=bui'`` IS accepted (rc=0) and resizes ``build``.
 
     This is the assertion that makes ``=<name>`` unusable, and the one an earlier revision
     generalised away after measuring only ``has-session`` and ``kill-session``. If a future

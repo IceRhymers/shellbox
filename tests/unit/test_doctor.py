@@ -26,7 +26,7 @@ CFG_PROVISIONED = "[DEFAULT]\nhost = https://x.cloud.databricks.com\ntoken = dke
 def _settings(tmp_path: Path, **environ: str) -> Settings:
     """Settings pointing at a temp state dir, with a deliberately SHORT socket path.
 
-    ⚠️ Without the explicit socket, these tests fail for a reason that has nothing to do
+    WARNING: Without the explicit socket, these tests fail for a reason that has nothing to do
     with `doctor`: the default socket is `$SHELLBOX_STATE_DIR/tmux.sock`, and pytest's
     `tmp_path` alone exceeds macOS's 104-byte `sun_path` limit — so `doctor` correctly
     reports FAIL and every "no failures" assertion collapses. `tests/conftest.py` documents
@@ -61,7 +61,7 @@ def _as_lakebox(monkeypatch: pytest.MonkeyPatch, marker: Path) -> None:
 
 # --------------------------------------------------------------------- read-only
 def test_doctor_never_assigns_an_identity(tmp_path: Path) -> None:
-    """🔴 The bug found by running it: a diagnostic minted a permanent `host_id`.
+    """CRITICAL: The bug found by running it: a diagnostic minted a permanent `host_id`.
 
     `resolve_host_id` assigns and persists when no cache exists, so merely *diagnosing* a
     machine gave it an identity — in a real `$HOME`, on a host that may never serve. A
@@ -157,7 +157,7 @@ def test_a_malformed_setting_fails_immediately_and_stops(tmp_path: Path) -> None
 
 # --------------------------------------------------- sandbox-conditional reporting
 def test_sandbox_claims_are_not_made_on_a_laptop(tmp_path: Path) -> None:
-    """🔴 The second bug found by running it.
+    """CRITICAL: The second bug found by running it.
 
     On a developer machine there are no `/run/lakebox` symlinks and the credential in
     `~/.databrickscfg` is that developer's own. Reporting it as "the sandbox's baked creator
@@ -235,7 +235,7 @@ def test_the_credential_states_are_reported_distinctly_on_a_lakebox(
 def test_a_present_pat_is_a_WARN_and_says_not_to_reset_it_yet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """🔴 Deliberately not a FAIL.
+    """CRITICAL: Deliberately not a FAIL.
 
     The PAT is a confused-deputy hazard (R6), but resetting it *today* strands the sandbox:
     the OAuth login that replaces it is Phase 3's and does not exist, and the CLI's token
@@ -307,7 +307,7 @@ def test_registry_absence_is_informational_not_a_failure(tmp_path: Path) -> None
 def test_an_unreachable_registry_warns_and_redacts(tmp_path: Path) -> None:
     """Shell tools still work, so this is a WARN — and the DSN must not leak its password.
 
-    ⚠️ The DSN is assembled from parts rather than written as a literal, and that is not
+    WARNING: The DSN is assembled from parts rather than written as a literal, and that is not
     cosmetic: a complete credential-bearing URL in source trips credential scanners (this
     project's own pre-commit hook blocked exactly that), and the habit is what eventually
     leaks a real one. `tests/integration/harness.py`'s `unreachable_dsn` exists for the same

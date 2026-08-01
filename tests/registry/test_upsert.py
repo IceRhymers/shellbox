@@ -349,7 +349,7 @@ def test_last_read_at_is_null_until_a_read_happens(registry: PostgresRegistry) -
 def test_a_send_only_upsert_preserves_an_existing_last_read_at(
     registry: PostgresRegistry,
 ) -> None:
-    """🔴 The subtle one, and the reason `last_read_at` needs no special-casing in callers.
+    """CRITICAL: The subtle one, and the reason `last_read_at` needs no special-casing in callers.
 
     Postgres's GREATEST *ignores* NULLs -- returning NULL only when every argument is NULL --
     so a send-only upsert carrying last_read_at=None leaves the stored read timestamp alone

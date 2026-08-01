@@ -26,7 +26,7 @@ def test_the_token_never_appears_in_the_command_that_produces_it() -> None:
 
 
 def test_a_violating_pair_cannot_be_constructed() -> None:
-    """🔴 The point of the class. A convention can be forgotten; a constructor cannot.
+    """CRITICAL: The point of the class. A convention can be forgotten; a constructor cannot.
 
     The message has to explain the consequence, not just the rule — someone hitting this is
     about to "fix" it by loosening the assertion.

@@ -79,7 +79,8 @@ def test_upgrade_head_downgrade_base_upgrade_head_round_trips(
 def test_the_migrated_schema_matches_the_models_column_for_column(
     alembic_config: Config, _pg_engine_or_skip
 ) -> None:
-    """🔴 The migrations were only ever checked by table NAME, so a whole column could go missing.
+    """CRITICAL: The migrations were only ever checked by table NAME, so a whole column could go
+    missing.
 
     Deleting `0002_sessions_last_read_at.py` outright passed both `make migrate-roundtrip` and
     `make test-registry`. Two reasons, and they compound: `tests/registry/conftest.py` builds the

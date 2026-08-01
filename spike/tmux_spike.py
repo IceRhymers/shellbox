@@ -1062,7 +1062,7 @@ def check_adapter_forms() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F15 -- 🔴 the TAB separator survives ONLY under a UTF-8 ctype locale.
+# F15 -- CRITICAL: the TAB separator survives ONLY under a UTF-8 ctype locale.
 #
 # The single most consequential finding in W2, and no prior lane could see it:
 # this spike, the plan's §7 and every earlier measurement invoked tmux with the

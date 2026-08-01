@@ -3,7 +3,7 @@
 The headline test is `test_concurrent_first_boot_yields_exactly_one_host_id`, and it took two
 attempts to make it test anything.
 
-⚠️ **Do not "simplify" it back.** The first version spawned N workers and asserted they agreed
+WARNING: **Do not "simplify" it back.** The first version spawned N workers and asserted they agreed
 on one `host_id`. That assertion is satisfiable **without the code under test ever running**:
 absent a barrier the OS serializes process startup, so worker 1 creates the cache and workers
 2..N take the ordinary step-2 *cache-hit* path. All ids agree, the suite is green, and the
@@ -392,7 +392,7 @@ def test_a_fresh_sandbox_id_wins_over_the_cached_one(tmp_path: Path) -> None:
 
 
 def test_a_sandbox_id_arriving_after_the_first_boot_is_persisted(tmp_path: Path) -> None:
-    """🔴 The bug this test exists for: ADR-8 does not work past boot 1 without it.
+    """CRITICAL: The bug this test exists for: ADR-8 does not work past boot 1 without it.
 
     The bootstrap path runs **every boot** and is the only actor that knows the sandbox id. On
     every boot after the first, `resolve_host_id` takes the cache-hit branch — which returned
@@ -539,7 +539,7 @@ def test_owner_is_not_cached_when_it_would_risk_the_host_id(tmp_path: Path) -> N
 def test_concurrent_resolution_against_a_corrupt_cache_yields_one_host_id(
     tmp_path: Path,
 ) -> None:
-    """🔴 Regression guard for the worst bug found in this module.
+    """CRITICAL: Regression guard for the worst bug found in this module.
 
     Quarantine-then-assign is two steps, and nothing arbitrated them. P1 moved the corrupt file
     aside and linked identity U; P2 — still acting on its own earlier read — then "quarantined"
@@ -606,9 +606,9 @@ def test_a_tmux_stamp_shared_by_every_process_yields_exactly_that_id(tmp_path: P
 def test_a_mixed_stamp_race_converges_on_the_stamp_and_invents_nothing(tmp_path: Path) -> None:
     """Only some processes carry a stamp — a `show-options` against a contended server can fail.
 
-    ⚠️ **Two ids is the correct outcome here, and that is not a weaker assertion than it looks.**
-    A process that resolves *before* the override legitimately returns the assigned uuid; it
-    cannot know a stamp is about to win. What must hold is that the race invents nothing beyond
+    WARNING: **Two ids is the correct outcome here, and that is not a weaker assertion than it
+    looks.** A process that resolves *before* the override legitimately returns the assigned uuid;
+    it cannot know a stamp is about to win. What must hold is that the race invents nothing beyond
     those two, the file converges on the stamp so every later start agrees, and each stamp-carrier
     returns the stamp rather than a silent no-op — which is exactly what the old code did: it
     logged "re-adopting it" while writing nothing, and returned an id in no cache.
@@ -696,7 +696,7 @@ def test_a_bad_tmux_stamp_is_ignored_not_fatal(tmp_path: Path, bad: str) -> None
 
 
 def test_concurrent_property_writers_all_land(tmp_path: Path) -> None:
-    """🔴 Two writers, disjoint fields, both must survive — the defect the lock introduced.
+    """CRITICAL: Two writers, disjoint fields, both must survive — the defect the lock introduced.
 
     Serializing property writes fixed a lost update and created a *dropped* one: the lock was
     acquired non-blockingly, so a loser logged at debug and threw its field away. The excuse
@@ -888,7 +888,7 @@ def test_an_unusable_link_fails_loudly_instead_of_writing_racily(
 
 # ------------------------------------------------- the lock-wait, deterministically
 #
-# ⚠️ These two carry the regression guarantee for the lock-wait fix, NOT the 32-process test
+# WARNING: These two carry the regression guarantee for the lock-wait fix, NOT the 32-process test
 # above. That test's assertion needs a field to be ABSENT from the file, which requires *every*
 # writer of that field to lose the lock — so its power is a coincidence, not a consequence, and
 # raising the worker count makes it WEAKER (more writers, more chances one wins and the

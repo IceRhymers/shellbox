@@ -177,7 +177,7 @@ def test_the_cache_serves_when_no_credential_is_available(tmp_path: Path) -> Non
 
 
 def test_nothing_available_defers_and_writes_no_row_at_all(tmp_path: Path) -> None:
-    """🔴 E2d. No placeholder, not even a plausible one.
+    """CRITICAL: E2d. No placeholder, not even a plausible one.
 
     `hosts.owner_email` is NOT NULL and is the column #7's ACL will filter on, so a fake
     principal is not a harmless gap — it accumulates real rows under a name that a later
@@ -194,7 +194,7 @@ def test_nothing_available_defers_and_writes_no_row_at_all(tmp_path: Path) -> No
 def test_enrolling_without_a_resolved_identity_warns_rather_than_pretending(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """🔴 The ordering dependency, pinned because it is invisible from either side alone.
+    """CRITICAL: The ordering dependency, pinned because it is invisible from either side alone.
 
     `enroll` persists E2's result by merging into `host.json`, and `identity.py` will not
     *create* that file outside its arbitrated assignment path — a merge that could create one
@@ -327,7 +327,7 @@ def test_orphaning_does_not_advance_activity_timestamps(tmp_path: Path) -> None:
 
 
 def test_a_socket_mismatch_refuses_to_orphan_anything(tmp_path: Path) -> None:
-    """🔴 The Critic-9 guard. "No sessions here" and "wrong server" are the same evidence.
+    """CRITICAL: The Critic-9 guard. "No sessions here" and "wrong server" are the same evidence.
 
     If this process resolved a different socket than the `hosts` row records — a different
     `$HOME`, an operator's `SHELLBOX_STATE_DIR`, a `sudo` invocation — then every live session
@@ -366,7 +366,7 @@ def test_a_socket_mismatch_is_logged_at_critical(
 
 
 def test_a_failed_tmux_read_orphans_nothing(tmp_path: Path) -> None:
-    """🔴 A broken tmux must never be read as "no sessions".
+    """CRITICAL: A broken tmux must never be read as "no sessions".
 
     `list_sessions` raises for everything except the two measured no-server signatures, so
     treating an exception as an empty set would orphan every live session on the host on the
@@ -413,7 +413,7 @@ def test_no_stamps_recovers_nothing() -> None:
 
 
 def test_disagreeing_stamps_resolve_deterministically(caplog: pytest.LogCaptureFixture) -> None:
-    """🔴 Not "the first one" — that would reintroduce the split this mechanism prevents.
+    """CRITICAL: Not "the first one" — that would reintroduce the split this mechanism prevents.
 
     Two concurrent processes reading the same disagreeing set must adopt the *same* value, or
     the mitigation for the fork becomes a second cause of it. Lexicographically smallest is a
@@ -493,7 +493,7 @@ def test_the_heartbeat_thread_is_a_daemon_and_stops_promptly() -> None:
 def test_a_null_sandbox_id_warns_about_why_it_cannot_check(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """🔴 The warning must fire *especially* when the check is impossible.
+    """CRITICAL: The warning must fire *especially* when the check is impossible.
 
     Selecting this sandbox's row from `sandbox list` requires the `sandbox_id`, and a sandbox
     cannot learn its own. So on exactly the un-bootstrapped hosts ADR-6 exists to support, the

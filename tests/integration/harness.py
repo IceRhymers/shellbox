@@ -15,7 +15,7 @@ Synchronization follows §11.1: poll for a condition with a deadline (``await_co
 never ``sleep`` then assert. Tests are ordinary synchronous functions -- ``run_script``
 owns the event loop -- so this lane needs no async pytest plugin.
 
-⚠️ **This is deliberately not a ``conftest.py``.** Under pytest's ``prepend`` import mode a
+WARNING: **This is deliberately not a ``conftest.py``.** Under pytest's ``prepend`` import mode a
 second ``conftest.py`` is imported under the module name ``conftest`` as well, which shadows
 ``tests/conftest.py`` -- so ``from conftest import TmuxServer`` inside it resolves to the
 file being imported and fails as a circular import. Tests therefore call ``make_harness``

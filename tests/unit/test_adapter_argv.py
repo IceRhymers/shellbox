@@ -591,7 +591,7 @@ def test_no_server_running_is_an_empty_list() -> None:
     ["some unknown tmux failure", "error connecting to /tmp/sbx (File name too long)", ""],
 )
 def test_unknown_stderr_never_becomes_an_empty_list(stderr: str) -> None:
-    """🔴 The mapping that must not exist.
+    """CRITICAL: The mapping that must not exist.
 
     A permissive "probably no sessions" fallback would report a broken tmux as a healthy
     empty inventory, and orphan reconciliation would mark every live session on the host
@@ -603,7 +603,7 @@ def test_unknown_stderr_never_becomes_an_empty_list(stderr: str) -> None:
 
 
 def test_records_that_all_fail_to_parse_raise_instead_of_returning_an_empty_list() -> None:
-    """🔴 The same rule one layer down: tmux SUCCEEDED but nothing parsed.
+    """CRITICAL: The same rule one layer down: tmux SUCCEEDED but nothing parsed.
 
     This is the shape of the locale bug -- a non-UTF-8 ctype locale makes tmux encode the
     record's TABs as ``_``, so all eight fields collapse into one and every record is

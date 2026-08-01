@@ -11,7 +11,7 @@ from a record here. That is the point of committing it: r1 of that plan asserted
 prose in an uncommitted file, and the JSONL it cited contained none of the observations the
 conclusions rested on.
 
-⚠️ **This script must never emit a credential value.** It runs against four files that hold
+WARNING: **This script must never emit a credential value.** It runs against four files that hold
 live secrets (`~/.databrickscfg`, `~/.databricks/token-cache.json`,
 `~/.claude/settings.json`'s `apiKeyHelper`, `~/.codex/config.toml`). The whole premise of
 enrollment (D4) is that the first of these authenticates as the sandbox creator — a
@@ -139,7 +139,7 @@ def oq_a():
     rec("cli_sandbox_list", run=run("databricks", "sandbox", "list", "-o", "json"))
     rec("cli_version", run=run("databricks", "--version"))
 
-    # ⚠️ THE TRAP. ~/.databricks/sandbox.json is a REGULAR file in persistent $HOME and does
+    # WARNING: THE TRAP. ~/.databricks/sandbox.json is a REGULAR file in persistent $HOME and does
     # contain this sandbox's id -- but it is the CLI's own client-side cache of the
     # CALLER-SCOPED list, written by whoever last ran `databricks sandbox list`, and it holds
     # the right id only when the caller owns exactly one sandbox. Its mtime versus the boot

@@ -53,7 +53,7 @@ class PostgresRegistry(Registry):
     responsible for catching that and degrading to a `registry_warning` rather than
     failing the tool call (§9)."""
 
-    # 🔴 A registry that never answers must not be indistinguishable from a shell that never
+    # CRITICAL: A registry that never answers must not be indistinguishable from a shell that never
     # starts. Registry writes are non-fatal by construction -- a failure becomes a
     # `registry_warning` on a successful tool call -- but that guarantee covers *errors*, not
     # *latency*: with no connect timeout, a DSN pointing at an unrouted address makes

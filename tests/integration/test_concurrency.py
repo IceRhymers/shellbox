@@ -12,7 +12,7 @@ failing -- which is the opposite of the property.
 **T-CONC-2 -- concurrent sends do not interleave.** ``paste-buffer`` was measured atomic per
 call (M29), so N concurrent payloads arrive as N unbroken runs.
 
-⚠️ **A label collision worth knowing about before you go looking.** §11.4 uses the name
+WARNING: **A label collision worth knowing about before you go looking.** §11.4 uses the name
 "T-CONC-2" for a different scenario -- A creates, B lists, B kills, A reads → ``not_found``,
 the stale-cache test -- which is §9.2's *"``shell_read`` races another agent's kill"* row.
 That one is **already covered**, by ``test_no_session_state.py`` at both the two-process and
@@ -26,7 +26,7 @@ it is real, accepted and documented (§9.1, R12). What ``@shellbox_incarnation``
 misdelivery stops being silent -- ``shell_send`` reports the incarnation it targeted, and a
 caller holding the old one can tell. **No test here claims prevention.**
 
-⚠️ Two traps this module is written to stay out of, both of which have already cost this
+WARNING: Two traps this module is written to stay out of, both of which have already cost this
 project a revision:
 
 * **``#{session_id}`` cannot discriminate incarnations.** It resets with the tmux *server*
@@ -106,7 +106,7 @@ def tmux_format(tmux: TmuxServer, name: str, format_field: str) -> str:
     expose: ``#{session_id}`` is the value §9.1 rejects as an identity, and a test that
     could only see it through shellbox could not show why it was rejected.
 
-    🔴 ``display-message`` returns **rc=0 with empty output for any nonexistent target**
+    CRITICAL: ``display-message`` returns **rc=0 with empty output for any nonexistent target**
     (spike F6), so an rc check on it is worthless -- and an unresolved target here would hand
     two callers ``""`` and ``""``, which compare equal. That is the same shape of defect this
     module exists to guard against, so the empty case is rejected rather than returned.
@@ -211,7 +211,7 @@ def test_concurrent_sends_to_one_session_arrive_as_unbroken_runs(
 ) -> None:
     """T-CONC-2. Four processes paste into one pane at once; each payload arrives whole.
 
-    ⚠️ **The reader pane is RAW mode (``stty -icanon``) and that is not optional.** A
+    WARNING: **The reader pane is RAW mode (``stty -icanon``) and that is not optional.** A
     canonical-mode pane buffers a line until the newline and destroys anything past the
     line-discipline limit -- dropped on macOS, silently TRUNCATED on Linux -- so a
     canonical-mode version of this test would show mangled payloads that look exactly like

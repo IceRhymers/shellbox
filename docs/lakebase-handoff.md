@@ -1,9 +1,11 @@
 # Lakebase hand-off — what is proven, and what each later phase still owes
 
-`shellbox-registry` can talk to Lakebase today. This is the evidence for that claim, and
-the list of things it deliberately does **not** settle, addressed to the phases that own
-them: [#3](https://github.com/IceRhymers/shellbox/issues/3) (transport / OAuth login) and
-[#4](https://github.com/IceRhymers/shellbox/issues/4) (App + provisioning).
+`shellbox-registry` can talk to Lakebase today. This is the evidence for that claim. It
+also lists what this phase deliberately leaves unsettled. Later phases own those items:
+[#3](https://github.com/IceRhymers/shellbox/issues/3) (transport / OAuth login),
+[#4](https://github.com/IceRhymers/shellbox/issues/4) (App + provisioning), and
+[#5](https://github.com/IceRhymers/shellbox/issues/5) (lifecycle). Section 5 lists what
+each one owes.
 
 Everything below was measured on **2026-07-31** against a real Autoscaling Lakebase
 project (`projects/shellbox`, `fevm-west`, us-west-2, Postgres 17.10), not inferred.
@@ -13,8 +15,8 @@ project (`projects/shellbox`, `fevm-west`, us-west-2, Postgres 17.10), not infer
 ## 1. ADR-3 holds: Lakebase is a credential concern, not a second registry
 
 The claim was that `PostgresRegistry` connects to a DSN and does not care who minted the
-password, so Lakebase adds a credential path and nothing else. That is now verified rather
-than asserted:
+password. So Lakebase adds a credential path and nothing else. That is now verified
+rather than asserted:
 
 | Evidence | Result |
 |---|---|
@@ -23,9 +25,10 @@ than asserted:
 | A `hosts` + `sessions` row written through `lakebase_registry()` | Landed with a real `owner_email` (`current_user.me()`), `sandbox_id`, `cwd`, dimensions |
 | `pool_pre_ping` under total connection loss | Survives every backend being terminated — **with a negative control** proving the same test fails without the flag |
 
-**So the DoD sentence "rows land in Lakebase with a correct `owner_email`" is proven.** The
-remaining half of #2's clause is *"from inside a Lakebox sandbox"*, which is W10c — and
-§4 below removes the mechanism that was blocking it.
+**So the DoD sentence "rows land in Lakebase with a correct `owner_email`" is proven.**
+The remaining half of [#2](https://github.com/IceRhymers/shellbox/issues/2)'s clause is
+*"from inside a Lakebox sandbox"*, which is W10c. Section 4 below removes the mechanism
+that was blocking it.
 
 ## 2. Measured facts about the credential — three of which contradict the obvious guess
 
@@ -46,28 +49,35 @@ touches the SDK.
 
 - **Refresh is lazy by default; the background refresher is opt-in.** `shellbox-mcp` is
   spawned **per agent session**, 1–32 concurrent and short-lived. A 45-minute background
-  refresher in that process means 32 threads that never fire once, a token minted per
-  process on the path enrollment promises is non-blocking, and — if non-daemon — a hung
-  process exit after stdio closes, invisible to an MCP client except as a child that never
-  reaps. **Phase 4's App is the opposite case and should call `start_refresher()`.**
-- **The server's stated expiry is trusted, never a hardcoded TTL.** See §2; a policy change
-  then costs nothing.
-- **`pool_recycle = 1800 s`**, half the *measured* lifetime — not derived from the
-  documented floor, which would recycle every 240 s and discard good connections ~15× more
-  often than needed. A caller requesting a short `ttl` must lower it; the minter **warns**
-  when it observes a token shorter than the recycle, so the mismatch is observable.
-- **The token is injected per-connect via `do_connect`, never baked into the DSN.** The URL
-  outlives any single token, and a DSN in a log or a `repr` then carries no credential.
-- **`databricks-sdk` is an optional extra** (`shellbox-registry[lakebase]`). The package's
-  three real dependencies are alembic, psycopg and SQLAlchemy — deliberately SDK-free,
-  which is what lets local-Postgres CI and `NullRegistry` run with no Databricks install.
-  Importing `lakebase` does not need the SDK; minting a token does, and says so.
+  refresher in that process would mean:
+  - 32 threads that never fire once.
+  - A token minted per process, on the path enrollment promises is non-blocking.
+  - If non-daemon, a hung process exit after stdio closes — invisible to an MCP client
+    except as a child that never reaps.
+
+  **Phase 4's App is the opposite case and should call `start_refresher()`.**
+- **The server's stated expiry is trusted, never a hardcoded TTL.** See section 2 above;
+  a policy change then costs nothing.
+- **`pool_recycle = 1800 s`**, half the *measured* lifetime. That is not derived from the
+  documented floor, which would recycle every 240 s and discard good connections ~15×
+  more often than needed. A caller requesting a short `ttl` must lower it. The minter
+  **warns** when it observes a token shorter than the recycle, so the mismatch is
+  observable.
+- **The token is injected per-connect via `do_connect`, never baked into the DSN.** The
+  URL outlives any single token, and a DSN in a log or a `repr` then carries no
+  credential.
+- **`databricks-sdk` is an optional extra** (`shellbox-registry[lakebase]`). The
+  package's three real dependencies are alembic, psycopg and SQLAlchemy — deliberately
+  SDK-free. That is what lets local-Postgres CI and `NullRegistry` run with no
+  Databricks install. Importing `lakebase` does not need the SDK; minting a token does,
+  and says so.
 
 ## 4. For #4 — the reverse tunnel is not needed
 
-The plan assumed a sandbox could not reach Lakebase directly, because sandbox egress was
-measured only to pypi, the workspace control plane and the Apps host — arbitrary outbound
-TCP to 5432 was **unmeasured**. It is now measured, from inside the sandbox:
+The plan assumed a sandbox could not reach Lakebase directly. That assumption rested on
+sandbox egress measured only to pypi, the workspace control plane, and the Apps host.
+Arbitrary outbound TCP to 5432 was **unmeasured**. It is now measured, from inside the
+sandbox:
 
 ```
 ep-broad-grass-….database.us-west-2.cloud.databricks.com -> 192.168.200.30
@@ -88,41 +98,46 @@ rather than over the public internet. **W10c needs no `ssh -R` tunnel**, and the
 3. **Grant the App's service principal a Postgres role.** Everything above authenticated as
    a *workspace user*; the App authenticates as its SP, whose role name is the SP client id.
    Untested here, and it is the most likely thing to be missing on first deploy.
-4. **Render a NULL `sandbox_id`.** A host that was never bootstrapped has one, by design
-   (ADR-6) — a sandbox cannot learn its own id, so it is injected from outside or absent.
-   With `host_id` an opaque uuid4, `sandbox_id` is the only human-meaningful label a `hosts`
-   row carries, so its absence is a real rendering case and not an edge case.
-5. **Re-run §1's row assertions** against the provisioned endpoint. That is a re-run, not an
-   open question.
+4. **Render a NULL `sandbox_id`.** A host that was never bootstrapped has a NULL
+   `sandbox_id`, by design (ADR-6: a sandbox cannot learn its own id). The value is
+   injected from outside, or is absent. With `host_id` an opaque uuid4, `sandbox_id` is
+   the only human-meaningful label a `hosts` row carries. Its absence is therefore a
+   real rendering case, not an edge case.
+5. **Re-run section 1's row assertions** against the provisioned endpoint. That is a
+   re-run, not an open question.
 
 ### #3 (transport / OAuth login)
 **A PAT-reset sandbox has no workspace credential at all after a reboot.**
 `~/.databricks/token-cache.json` is a boot-templated symlink into `/run`, which is wiped
-between boots — and it is currently *dangling*, so the cache does not merely empty, it
-ceases to exist. Combined with the per-boot PAT reset, a rebooted sandbox can reach neither
-the workspace API nor anything needing that identity until the OAuth login is re-run. #3
-owns that login. See [`docs/sandbox-environment.md`](sandbox-environment.md) §3.
+between boots. It is currently *dangling*, so the cache does not merely empty — it
+ceases to exist. Combined with the per-boot PAT reset, a rebooted sandbox can reach
+neither the workspace API nor anything needing that identity. It stays that way until
+the OAuth login is re-run.
 
-### #5 (lifecycle)
+#3 owns that login. See section 3 of
+[`docs/sandbox-environment.md`](sandbox-environment.md).
+
+### [#5](https://github.com/IceRhymers/shellbox/issues/5) (lifecycle)
 **`last_read_at` is recorded but no predicate uses it.** `last_activity_at` advances on
-**send**, `last_read_at` on **read** — two columns because one cannot express both hazards
-(a polling agent keeping a session alive forever; a watched session reaped mid-build).
-The **read** side is not yet written by `server.py`: it needs a value for the `NOT NULL`
-`last_activity_at`, and every option is a Phase 5 semantic. That choice is #5's.
+**send**, `last_read_at` on **read**. Two columns exist because one column cannot
+express both hazards: a polling agent keeping a session alive forever, and a watched
+session reaped mid-build. `server.py` does not yet write the **read** side. It needs a
+value for the `NOT NULL` `last_activity_at`, and every option is a Phase 5 semantic.
+That choice is #5's.
 
 ---
 
 ## 6. Operational notes
 
 **The registry test suite is destructive.** Its fixtures `drop_all` on teardown, so
-running it against a shared database deletes `hosts` and `sessions` — and can leave
+running it against a shared database deletes `hosts` and `sessions`. It can also leave
 `alembic_version` claiming the migrations are still applied. That happened here. The
 fixtures now **refuse** any host that is not obviously throwaway unless
 `SHELLBOX_ALLOW_DESTRUCTIVE_TESTS=1` is set.
 
 **Reaching Lakebase without putting a credential in a URL.** `dsn_from_env` assembles from
 `SHELLBOX_PG_USER` / `_PASSWORD` / `_HOST` / `_PORT` / `_DB`, plus `SHELLBOX_PG_SSLMODE`
-(no default — a local Postgres has no TLS, and Lakebase requires it). The OAuth token goes
+(no default). A local Postgres has no TLS, and Lakebase requires it. The OAuth token goes
 in `_PASSWORD` and never appears inside a URL string.
 
 ```sh

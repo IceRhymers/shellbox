@@ -31,7 +31,7 @@ logging.basicConfig(
 
 from shellbox_mcp.config import ConfigError, Settings, log_level_from_env  # noqa: E402
 
-# 🔴 `serve` is imported INSIDE the serve path, not here. It pulls in the MCP SDK and
+# CRITICAL: `serve` is imported INSIDE the serve path, not here. It pulls in the MCP SDK and
 # pydantic, and `doctor` is precisely the command you run when the server will not
 # start -- so a module-level import makes the diagnostic unavailable in exactly the
 # situation it exists for. Measured in a real sandbox, where a corrupt cached wheel
@@ -139,7 +139,7 @@ def _doctor(args: list[str]) -> None:
 def _bootstrap(args: list[str]) -> None:
     """Record what only an outside caller knows, and optionally reset the baked PAT.
 
-    ⚠️ **Every operation here is per-boot.** `/etc/lakebox/setup-home-directory.sh` re-points
+    WARNING: **Every operation here is per-boot.** `/etc/lakebox/setup-home-directory.sh` re-points
     the templated `$HOME` paths at every start, and the identity cache is the only thing that
     persists. Running this once per sandbox is not enough; it must run once per boot.
     """

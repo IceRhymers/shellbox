@@ -453,7 +453,7 @@ Measured lifecycle timings:
 | `sandbox start` | **25.0 s** | matches the issue's ~20.5 s expectation |
 
 **`stop` is asynchronous and its success message is premature.** The CLI printed
-`✓ Stopped realistic-phoenix-2742` after 0.8 s, but an immediate `start` was rejected
+`Stopped realistic-phoenix-2742` after 0.8 s, but an immediate `start` was rejected
 with `sandbox … is currently stopping; retry once it settles`. Anything scripting a
 stop/start cycle must poll `status` rather than trust the CLI's exit.
 

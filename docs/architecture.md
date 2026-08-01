@@ -63,7 +63,7 @@ probe and its raw output alongside them.
   "`/run` is tmpfs". That is unverifiable from inside — `/proc/mounts` lists only the overlay root —
   and unnecessary: `/run` is *measurably wiped between boots*, which is what the code needs.
   See [`docs/sandbox-environment.md`](sandbox-environment.md) §3.)
-- ⚠️ **Two things make the reset harder than it looks**, both measured after the plan was
+- **Two things make the reset harder than it looks**, both measured after the plan was
   written: PID 1 exports `DATABRICKS_CONFIG_FILE=/run/lakebox/databrickscfg`, which **overrides
   the `~/` path**, so where an agent inherits it the reset is a silent no-op; and
   `~/.databricks/token-cache.json` is boot-templated too (currently a *dangling* symlink), so the

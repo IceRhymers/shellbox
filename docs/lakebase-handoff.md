@@ -63,7 +63,7 @@ touches the SDK.
   which is what lets local-Postgres CI and `NullRegistry` run with no Databricks install.
   Importing `lakebase` does not need the SDK; minting a token does, and says so.
 
-## 4. 🟢 For #4 — the reverse tunnel is not needed
+## 4. For #4 — the reverse tunnel is not needed
 
 The plan assumed a sandbox could not reach Lakebase directly, because sandbox egress was
 measured only to pypi, the workspace control plane and the Apps host — arbitrary outbound
@@ -96,7 +96,7 @@ rather than over the public internet. **W10c needs no `ssh -R` tunnel**, and the
    open question.
 
 ### #3 (transport / OAuth login)
-🔴 **A PAT-reset sandbox has no workspace credential at all after a reboot.**
+**A PAT-reset sandbox has no workspace credential at all after a reboot.**
 `~/.databricks/token-cache.json` is a boot-templated symlink into `/run`, which is wiped
 between boots — and it is currently *dangling*, so the cache does not merely empty, it
 ceases to exist. Combined with the per-boot PAT reset, a rebooted sandbox can reach neither
@@ -107,14 +107,14 @@ owns that login. See [`docs/sandbox-environment.md`](sandbox-environment.md) §3
 **`last_read_at` is recorded but no predicate uses it.** `last_activity_at` advances on
 **send**, `last_read_at` on **read** — two columns because one cannot express both hazards
 (a polling agent keeping a session alive forever; a watched session reaped mid-build).
-⚠️ The **read** side is not yet written by `server.py`: it needs a value for the `NOT NULL`
+The **read** side is not yet written by `server.py`: it needs a value for the `NOT NULL`
 `last_activity_at`, and every option is a Phase 5 semantic. That choice is #5's.
 
 ---
 
 ## 6. Operational notes
 
-⚠️ **The registry test suite is destructive.** Its fixtures `drop_all` on teardown, so
+**The registry test suite is destructive.** Its fixtures `drop_all` on teardown, so
 running it against a shared database deletes `hosts` and `sessions` — and can leave
 `alembic_version` claiming the migrations are still applied. That happened here. The
 fixtures now **refuse** any host that is not obviously throwaway unless

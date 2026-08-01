@@ -59,12 +59,12 @@ Verify:
 $ claude mcp get shellbox
 shellbox:
   Scope: Local config (private to you in this project)
-  Status: ✔ Connected
+  Status: Connected
   Type: stdio
   Command: /absolute/path/to/.venv/bin/shellbox-mcp
 ```
 
-`✔ Connected` means Claude Code actually spawned the process and completed the MCP
+`Connected` means Claude Code actually spawned the process and completed the MCP
 `initialize` handshake — it is not just a config-file syntax check.
 
 ### Calling a tool
@@ -131,7 +131,7 @@ anyone debugging a Claude Code + shellbox-mcp session to re-run with `--debug` f
 
 ## Codex
 
-> 🔴 **Inside a Lakebox sandbox, `~/.codex/config.toml` is a symlink into `/run/lakebox/`
+> **Inside a Lakebox sandbox, `~/.codex/config.toml` is a symlink into `/run/lakebox/`
 > and the platform re-points it on EVERY boot.** So a registration written by `codex mcp
 > add` — or by hand — is destroyed at the next start, and writing *through* the symlink puts
 > it in `/run`, which is wiped. Measured from the platform's own boot script; see
@@ -171,7 +171,7 @@ command = "/absolute/path/to/.venv/bin/shellbox-mcp"
 SHELLBOX_LOG_LEVEL = "DEBUG"
 ```
 
-⚠️ **Observed side effect, worth knowing before running this on a machine with other
+**Observed side effect, worth knowing before running this on a machine with other
 MCP servers already configured:** `codex mcp add` rewrites the *entire*
 `config.toml`, not just the new stanza. On this test machine that reordered
 unrelated keys and normalized at least one value's type (`startup_timeout_sec = 120`

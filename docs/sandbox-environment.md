@@ -19,7 +19,7 @@ databricks sandbox ssh <id> --profile <profile> -- \
 Measured 2026-07-31 on `realistic-phoenix-2742` (`fevm-west`, us-west-2, tmux 3.4,
 Python 3.12.3, Databricks CLI v1.7.0 in-image, 8274 MB / 4 cores).
 
-> ⚠️ **The probe must never print a credential.** It runs against four files holding live
+> **The probe must never print a credential.** It runs against four files holding live
 > secrets and reports only key names, lengths and 4-character prefixes. Its output is
 > committed to this repo — keep it that way.
 
@@ -43,7 +43,7 @@ The **only** source that knows the id is the workspace API, and
 `GET /api/2.0/lakebox/sandboxes` is **caller-scoped**: it returns every sandbox the caller
 owns, with **no locally-readable field to match "which of these am I."**
 
-### ⚠️ `~/.databricks/sandbox.json` is a trap, not an answer
+### `~/.databricks/sandbox.json` is a trap, not an answer
 
 It is a *regular* file in persistent `$HOME` and it *does* contain this sandbox's id. It is
 still **not** a platform fact:
@@ -129,7 +129,7 @@ written inside them persists. `~/.claude.json` is a genuine 35 KB regular file i
 and is **absent from the boot script** — so MCP registration there is durable, and it must
 **not** be routed through the symlink-aware writer.
 
-### 🔴 The OAuth token cache does not survive a boot — and is currently absent entirely
+### The OAuth token cache does not survive a boot — and is currently absent entirely
 
 `~/.databricks/token-cache.json` is a **dangling symlink**: the link exists, the target does
 not. So the token cache is not merely emptied at boot; right now there is no file at all.
@@ -138,7 +138,7 @@ This breaks a premise elsewhere in the design. "Reset the PAT, then rely on the 
 token cache" works **within one boot** and not across one: after a reboot a PAT-reset sandbox
 has **no workspace credential at all** until the OAuth login is re-run.
 
-### 🔴 `DATABRICKS_CONFIG_FILE` can make a PAT reset a silent no-op
+### `DATABRICKS_CONFIG_FILE` can make a PAT reset a silent no-op
 
 PID 1 exports:
 
@@ -183,7 +183,7 @@ across `stop`/`start`; everything else, including `/tmp` (where tmux's socket li
 `groups: [admins, users]`. The Lakebox API exposes no owner field, so this is the only way to
 answer "whose sandbox is this."
 
-⚠️ It is a **confused deputy**: any agent in the sandbox can act as that user, and here that
+It is a **confused deputy**: any agent in the sandbox can act as that user, and here that
 user is a **workspace admin**. Reading identity from it is acceptable only while access is
 default-open; before any ACL is enforced it must be replaced by a per-host enrollment token.
 

@@ -48,9 +48,14 @@ from shellbox_transport import Frame, Stream
 from shellbox_transport.seq import Discontinuity, Epoch
 
 __all__ = [
+    "CLOSED_DETACHED",
+    "CLOSED_TERMINAL_GONE",
+    "CONTROL_CLOSED",
     "CONTROL_ERROR",
     "CONTROL_HELLO",
+    "CONTROL_INPUT",
     "CONTROL_RESIZE",
+    "CONTROL_RESUME",
     "CONTROL_RESYNC",
     "FIELD_ASKED_SEQ",
     "FIELD_BASE_SEQ",
@@ -63,8 +68,10 @@ __all__ = [
     "FIELD_VIEWER_EMAIL",
     "HEADER_SIZE",
     "MAGIC",
+    "UNORDERED_SEQ",
     "CodecError",
     "ControlMessage",
+    "closed_message",
     "control_frame",
     "decode_control",
     "decode_frame",
@@ -72,7 +79,9 @@ __all__ = [
     "encode_frame",
     "error_message",
     "hello_message",
+    "input_message",
     "resize_message",
+    "resume_message",
     "resync_message",
 ]
 
@@ -93,6 +102,27 @@ CONTROL_HELLO = "hello"
 CONTROL_RESYNC = "resync"
 CONTROL_RESIZE = "resize"
 CONTROL_ERROR = "error"
+CONTROL_INPUT = "input"
+CONTROL_RESUME = "resume"
+CONTROL_CLOSED = "closed"
+
+# Why the pane's stream ended, as a closed set of two. The distinction is the whole point and
+# collapsing it is a session-destroying bug -- see ``closed_message``.
+CLOSED_TERMINAL_GONE = "terminal_gone"
+CLOSED_DETACHED = "detached"
+
+# The ``seq`` a sender that allocates NO ordinals puts on a frame.
+#
+# The publisher owns the session's sequence space: one ``SeqAllocator`` per epoch is the only
+# source of ordinals, which is what makes the stream gap-free by construction rather than by
+# check. Two other parties originate frames -- the App server (``hello``, a refusal) and the
+# subscriber (input, resize, a resume request) -- and neither holds an attach or an allocator.
+#
+# They must not appear to hold a position in that space. A subscriber that read a server frame
+# or its own echoed input as a data ordinal would infer a gap that does not exist, and repaint
+# for it. 0 is safe to mean "no position" because ``seq.FIRST_SEQ`` is 1, so no allocator ever
+# issues it.
+UNORDERED_SEQ = 0
 
 FIELD_SESSION_ID = "session_id"
 FIELD_VIEWER_EMAIL = "viewer_email"
@@ -351,3 +381,96 @@ def resize_message(epoch: Epoch, cols: int, rows: int) -> ControlMessage:
     return ControlMessage(
         kind=CONTROL_RESIZE, epoch=epoch.value, fields={FIELD_COLS: cols, FIELD_ROWS: rows}
     )
+
+
+def input_message(data: bytes) -> ControlMessage:
+    """Keystrokes travelling from the subscriber to the pane, byte-exact.
+
+    Input is carried as a CONTROL message rather than as a fourth ``Stream`` value, and that is
+    a decision rather than a convenience. ``Stream``'s wire values are normative and its
+    members name what the *pane emitted*; a keystroke is not that. Adding ``STDIN`` would also
+    put input in the ring, which describes what this publisher SENT -- so a resume would
+    replay the viewer's typing back at them.
+
+    The payload is the raw bytes and nothing else: no encoding, no key names, no allowlist.
+    That is the point of the pty path -- ``keys.py``'s allowlist is closed by construction
+    ("anything not listed is ``invalid_key``"), so an application-mode keystroke it does not
+    name is unreachable through the tool surface.
+
+    WARNING: **Byte-exact here means byte-exact to the PTY, not to the pane process.** The
+    attach client is a tmux client, and tmux parses its terminal input into keys before sending
+    them on. Measured against tmux 3.6b through a live attach into a raw-mode pane: plain bytes
+    including ``;`` and TAB arrive verbatim, but a bracketed-paste wrapper
+    (``ESC[200~`` ... ``ESC[201~``) is CONSUMED by the client and only the text between the
+    markers reaches the pane. So a caller must not treat this path as a transparent pipe to the
+    pane's tty, and the plan's claim that a pty "carries bracketed-paste sequences" is true only
+    of the bytes inside them.
+
+    CRITICAL: **The publisher must apply a per-line ceiling before writing this to the pty.**
+    H4 is not a send-path property, it is the receiving pane's tty in canonical mode, and tmux
+    forwards an attach client's input to that same tty. Measured through a live attach (spike
+    F18): 8192 bytes plus a newline delivered **4096 bytes on Linux, silently truncated**, and
+    0 on macOS. A truncated command is a different, still-executable command. The ceiling is
+    the one the repo already ships -- ``max_send_line_bytes``, raising ``LineTooLong`` -- and
+    not a new number at 4096.
+
+    The epoch is ``None``: a subscriber holds no attach. See the module docstring.
+    """
+    return ControlMessage(kind=CONTROL_INPUT, epoch=None, fields={}, payload=data)
+
+
+def resume_message(from_seq: int, epoch: Epoch | None = None) -> ControlMessage:
+    """A subscriber asking to pick the stream back up at ``from_seq``. Answered by ADR-11.
+
+    This is the request side of ``FrameTransport.subscribe(session_id, from_seq, epoch=...)``,
+    and its two fields are exactly ``plan_resume``'s two inputs -- deliberately, so that the
+    wire form and the decision function cannot drift into disagreeing about what was asked.
+
+    It exists because the edge kills **every** open socket in the same second, so a reconnect
+    is not the publisher re-dialling into a subscriber that stayed put: both ends re-dial, and
+    the subscriber is the only party that knows how much of the stream it actually rendered.
+    Without this message a publisher would have to assume the worst on every reconnect and
+    repaint unconditionally -- which is correct but makes ADR-11's byte-exact branch dead code.
+
+    ``epoch`` is the subscriber's LAST SEEN epoch, and ``None`` means it holds nothing. Both
+    resolve safely: ``plan_resume`` checks the epoch **before** the ring floor, because ``seq``
+    restarts in each epoch and a stale ``seq`` can sit comfortably above the current floor
+    while naming a different position in the stream. Pass ``from_seq=0`` with no epoch for a
+    fresh subscriber; ``FIRST_SEQ`` is 1, so no ring floor can satisfy 0 and it takes the
+    honest branch, which is the right answer for a viewer opening a tab.
+    """
+    return ControlMessage(
+        kind=CONTROL_RESUME,
+        epoch=None if epoch is None else epoch.value,
+        fields={FIELD_ASKED_SEQ: from_seq},
+    )
+
+
+def closed_message(epoch: Epoch, reason: str) -> ControlMessage:
+    """The pane's stream ended, and **which** of the two ways it ended.
+
+    CRITICAL: ``terminal_gone`` and ``detached`` must never be collapsed, and the cost is
+    asymmetric. ``terminal_gone`` means the pane's process exited, so a viewer should stop
+    reconnecting -- there is nothing left to watch. ``detached`` means only this attach client
+    went away, and a viewer that read it as ``terminal_gone`` would tear down a session that is
+    still running (``omnigent/terminals/ws_bridge.py:71-80`` states the same rule for the same
+    reason).
+
+    ``has-session`` cannot tell them apart. shellbox sets ``remain-on-exit on`` GLOBALLY, so a
+    session deliberately outlives its pane's process -- that is what keeps the final output
+    readable. The signal is ``#{pane_dead}``, measured in both directions with a live client
+    attached (spike F19): on detach the pane reads ``0``, and when the process exits it reads
+    ``1`` while ``has-session`` still returns rc=0.
+
+    Sent as a frame rather than a WebSocket close code, unlike upstream's 4404/4405. Two
+    reasons, both measured: the edge kills healthy sockets **with no close frame at all**, so
+    "closed carrying no reason" is already the signature of a routine kill; and F19 found the
+    attach client OUTLIVES the pane's process, so the publisher's socket is still up and able
+    to carry a frame at the moment it has something to say.
+    """
+    if reason not in (CLOSED_TERMINAL_GONE, CLOSED_DETACHED):
+        raise CodecError(
+            f"closed reason {reason!r} is not one of "
+            f"{CLOSED_TERMINAL_GONE!r} or {CLOSED_DETACHED!r}"
+        )
+    return ControlMessage(kind=CONTROL_CLOSED, epoch=epoch.value, fields={FIELD_REASON: reason})

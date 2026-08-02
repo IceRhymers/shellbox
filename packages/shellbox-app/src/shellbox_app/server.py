@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from shellbox_transport.codec import (
+    UNORDERED_SEQ,
     ControlMessage,
     control_frame,
     encode_frame,
@@ -119,7 +120,11 @@ __all__ = [
 DEFAULT_PORT = 8000
 
 # `seq` on every frame this server originates. See `_control_bytes`.
-CONTROL_SEQ = 0
+#
+# Aliased from the codec rather than spelled again here: the subscriber originates frames under
+# the same rule, and two independent 0s would be two things to keep in step. The name is kept
+# because this module's tests and docstrings refer to it.
+CONTROL_SEQ = UNORDERED_SEQ
 
 # The close code for a refusal. 1008 is "policy violation", which is what a conflict is: the
 # socket was well-formed and the server declines to serve it. The reason a client branches on

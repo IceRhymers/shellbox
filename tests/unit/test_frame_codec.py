@@ -23,17 +23,26 @@ from dataclasses import replace
 import pytest
 from shellbox_transport import Frame, Stream
 from shellbox_transport.codec import (
+    CLOSED_DETACHED,
+    CLOSED_TERMINAL_GONE,
+    CONTROL_CLOSED,
     CONTROL_ERROR,
     CONTROL_HELLO,
+    CONTROL_INPUT,
+    CONTROL_RESUME,
     CONTROL_RESYNC,
+    FIELD_ASKED_SEQ,
     FIELD_BASE_SEQ,
     FIELD_CODE,
     FIELD_MESSAGE,
+    FIELD_REASON,
     FIELD_SESSION_ID,
     HEADER_SIZE,
     MAGIC,
+    UNORDERED_SEQ,
     CodecError,
     ControlMessage,
+    closed_message,
     control_frame,
     decode_control,
     decode_frame,
@@ -41,10 +50,12 @@ from shellbox_transport.codec import (
     encode_frame,
     error_message,
     hello_message,
+    input_message,
     resize_message,
+    resume_message,
     resync_message,
 )
-from shellbox_transport.seq import Discontinuity, Epoch
+from shellbox_transport.seq import FIRST_SEQ, Discontinuity, Epoch, SeqAllocator
 
 # 0xc3 0xa9 is "e with an acute accent" in UTF-8. Either byte alone is undecodable, which is
 # exactly the property under test.
@@ -309,3 +320,99 @@ def test_an_oversized_session_id_is_refused_by_the_encoder() -> None:
     declared length has silently wrapped."""
     with pytest.raises(CodecError, match="65535"):
         encode_frame(replace(_frame(b"x"), session_id="s" * 70_000))
+
+
+# --------------------------------------------------------------------------------------
+# The messages the data path added (W19): input, resume, and the end of the stream
+# --------------------------------------------------------------------------------------
+
+
+def test_input_carries_raw_bytes_and_no_ordinal_of_its_own() -> None:
+    """Input is a CONTROL message rather than a fourth ``Stream`` value, and that is a decision.
+
+    ``Stream``'s members name what the PANE EMITTED; a keystroke is not that. A ``STDIN`` member
+    would also put input in the publisher's ring, which records what the publisher SENT -- so a
+    resume would replay the viewer's own typing back at them.
+
+    The payload is opaque: no encoding, no key names, no allowlist. The bytes here are a
+    bracketed-paste wrapper around a bare ``;``, neither of which ``keys.py`` can express.
+    """
+    payload = b"\x1b[200~ls -la ; echo hi\x1b[201~\r"
+    got = decode_control(encode_control(input_message(payload)))
+
+    assert got.kind == CONTROL_INPUT
+    assert got.payload == payload
+    assert got.epoch is None, "a subscriber holds no attach"
+    assert got.fields == {}, "input needs no fields; the payload is the whole message"
+
+
+def test_input_survives_a_payload_that_looks_like_a_json_header() -> None:
+    """The split is on the FIRST newline, and a viewer can type newlines all day.
+
+    A paste is the obvious way to put a ``{`` and a newline into this payload, so the boundary
+    rule has to hold against input that mimics the header's own shape.
+    """
+    hostile = b'{"kind":"hello","epoch":null}\nand more\nlines'
+    assert decode_control(encode_control(input_message(hostile))).payload == hostile
+
+
+def test_a_resume_carries_exactly_plan_resumes_two_inputs() -> None:
+    """The wire form and the decision function must not drift into disagreeing.
+
+    ``resume_message``'s two fields are ``plan_resume``'s two arguments, and this asserts they
+    round-trip into the shapes that function takes -- an ``int`` and a ``str | None``.
+    """
+    epoch = Epoch.new()
+    got = decode_control(encode_control(resume_message(41, epoch)))
+
+    assert got.kind == CONTROL_RESUME
+    assert got.fields[FIELD_ASKED_SEQ] == 41
+    assert got.epoch == epoch.value
+
+
+def test_a_fresh_subscriber_resumes_from_zero_with_no_epoch() -> None:
+    """The shape a viewer opening a tab sends, and the reason it is safe.
+
+    ``FIRST_SEQ`` is 1, so no ring floor can satisfy 0 and the request takes the honest branch.
+    A null epoch cannot match the publisher's either, so the two agree rather than relying on
+    one of them.
+    """
+    got = decode_control(encode_control(resume_message(0)))
+
+    assert got.fields[FIELD_ASKED_SEQ] == 0
+    assert got.epoch is None
+
+
+def test_the_end_of_the_stream_names_which_of_the_two_ways_it_ended() -> None:
+    """``terminal_gone`` and ``detached`` are a closed set, enforced rather than documented.
+
+    Collapsing them is a session-destroying bug: ``terminal_gone`` tells a viewer to stop
+    reconnecting, and a detach misread as one tears down a session that is still running.
+    """
+    epoch = Epoch.new()
+    for reason in (CLOSED_TERMINAL_GONE, CLOSED_DETACHED):
+        got = decode_control(encode_control(closed_message(epoch, reason)))
+        assert got.kind == CONTROL_CLOSED
+        assert got.fields[FIELD_REASON] == reason
+        assert got.epoch == epoch.value, "the publisher holds the attach, so it has an epoch"
+
+
+def test_an_unrecognised_close_reason_cannot_be_constructed() -> None:
+    """A third reason would be a protocol change, so it fails at the constructor.
+
+    Left open, a typo would reach a renderer as a reason it has no branch for -- and the safe
+    default there is "keep reconnecting", which is exactly wrong for a dead pane.
+    """
+    with pytest.raises(CodecError, match="not one of"):
+        closed_message(Epoch.new(), "probably_fine")
+
+
+def test_the_unordered_seq_is_below_every_ordinal_an_allocator_issues() -> None:
+    """The one property that makes 0 safe to mean "this sender holds no position".
+
+    The App server and the subscriber both originate frames without an allocator. If 0 were a
+    value ``SeqAllocator`` could hand out, a subscriber would read one of those frames as a data
+    ordinal and infer a gap that does not exist.
+    """
+    assert UNORDERED_SEQ < FIRST_SEQ
+    assert SeqAllocator(Epoch.new()).next() == FIRST_SEQ

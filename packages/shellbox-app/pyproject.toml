@@ -1,0 +1,40 @@
+[project]
+name = "shellbox-app"
+version = "0.1.0"
+description = "Shellbox App half of the transport: accept a publisher, bind a session, serve one subscriber"
+requires-python = ">=3.12"
+dependencies = [
+    "shellbox-transport",
+    # `websockets` is NOT preinstalled on the Databricks Apps runtime, and uvicorn needs it
+    # to serve the WebSocket handshake at all. Measured by the Phase 1 probe and recorded in
+    # the comment at the top of `probe/requirements.txt`. Without it the upgrade fails inside
+    # the App, which a caller reads as an edge block -- the exact misdiagnosis the probe
+    # avoided by declaring it.
+    "websockets>=14,<16",
+    # fastapi and uvicorn ARE preinstalled on the Apps runtime, and they are declared anyway.
+    # Two reasons. The integration lane needs them in the workspace venv, and a declared
+    # version makes the local server the same server as the deployed one -- an undeclared
+    # dependency on whatever the runtime happens to ship is how a test lane and a deployment
+    # diverge silently.
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shellbox_app"]
+
+[tool.uv.sources]
+shellbox-transport = { workspace = true }
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+# T20 (flake8-print) is deliberately NOT extended here, unlike in `shellbox-mcp`. That rule
+# exists because the MCP server speaks JSON-RPC over stdout, so a `print` corrupts the wire
+# protocol. This process serves HTTP and logs to stdout like any other uvicorn app, where a
+# `print` is merely untidy. Copying the rule across would suggest the two processes share a
+# constraint they do not.

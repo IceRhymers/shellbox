@@ -7,6 +7,13 @@ dependencies = [
     "mcp>=1.2,<2",
     "databricks-sdk>=0.40,<1",
     "shellbox-registry",
+    "shellbox-transport",
+    # The client half of the transport. The range spans the sandbox image's preinstalled 14.2
+    # (probe findings) and the 15.0.1 this repo resolves, because `transport.py` runs in both:
+    # 14.2 in a sandbox, whatever CI resolves in the test lane. Every keepalive value and the
+    # redirect behavior are set EXPLICITLY there for that reason -- a default that differs
+    # across this range must not change how the transport behaves.
+    "websockets>=14.2,<16",
 ]
 
 [project.scripts]
@@ -21,6 +28,7 @@ packages = ["src/shellbox_mcp"]
 
 [tool.uv.sources]
 shellbox-registry = { workspace = true }
+shellbox-transport = { workspace = true }
 
 # T20 (flake8-print) is enforced here and ONLY here: this process speaks JSON-RPC over
 # stdout, so a stray print() corrupts the wire protocol. spike/ and probe/ are diagnostic

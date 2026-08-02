@@ -121,6 +121,27 @@ def raw_reader(path: str) -> list[str]:
     return ["sh", "-c", f"stty -icanon; cat > {path}"]
 
 
+def raw_reader_ready(path: str, marker: str) -> list[str]:
+    """``raw_reader``, plus a marker printed once the line discipline is ACTUALLY raw.
+
+    Kept in this block, and identical to ``raw_reader`` apart from the marker, so the split
+    oracle above stays readable as three variants of one thing rather than drifting apart.
+
+    The race it removes is real for both paths and only ever LOST by the attach path.
+    Canonical mode assembles lines as bytes enter the tty's input buffer, so anything written
+    before ``stty -icanon`` has run is held there awaiting a newline -- it does not become raw
+    retroactively. The tool path survives this by accident: ``send`` performs three tmux round
+    trips before any byte reaches the pane, which is ample time for the pane's shell to run
+    ``stty``. A write to an attach client's pty master follows ``create`` by microseconds and
+    loses.
+
+    So a test that writes to a pty must wait for this marker first. Polling ``capture-pane``
+    for it is not enough on its own -- the marker proves the SHELL got past ``stty``, which is
+    the actual precondition.
+    """
+    return ["sh", "-c", f"stty -icanon; printf {marker}; cat > {path}"]
+
+
 def canonical_reader(path: str) -> list[str]:
     """A CANONICAL-mode reader pane: plain ``cat``, the pty's default line discipline.
 

@@ -1,0 +1,4 @@
+command:
+  - "python"
+  - "-m"
+  - "shellbox_app"

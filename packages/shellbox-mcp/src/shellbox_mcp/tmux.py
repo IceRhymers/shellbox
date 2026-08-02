@@ -61,6 +61,7 @@ __all__ = [
     "SubprocessRunner",
     "TmuxAdapter",
     "TmuxConfig",
+    "client_env",
 ]
 
 # --------------------------------------------------------------------------------------
@@ -290,6 +291,33 @@ class SendResult:
     delivery: str = "unverified"
 
 
+def client_env(config: TmuxConfig) -> dict[str, str]:
+    """The environment every tmux CLIENT this package spawns runs under.
+
+    One construction, two callers: ``SubprocessRunner`` for the short-lived CLI invocations,
+    and ``TmuxAdapter.attach_env`` for the long-lived attach child. An attach is a tmux client
+    like any other, and two independent spellings of "the environment a tmux client needs"
+    would drift -- which here means drifting on ``LC_CTYPE``, whose absence silently collapses
+    every ``-F`` record into one field.
+
+    ``TERM`` is forced because a headless host has no tty, so bash substitutes ``TERM=dumb`` --
+    and ``tmux attach`` refuses a dumb terminal outright (spike F17). The inherited environment
+    is reduced to an allowlist because the MCP process's environment is where the harness
+    injects credentials, and a tmux server started by a client passes its environment on to
+    every pane it later spawns.
+    """
+    env = {"TERM": config.term, "LC_CTYPE": config.locale_ctype}
+    for key in config.passthrough_env:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    # LC_ALL would override LC_CTYPE, so a parent's `LC_ALL=C` would silently reinstate the
+    # TAB-mangling described on TmuxConfig.locale_ctype. It is not in the pass-through
+    # allowlist; this asserts that it never sneaks back in.
+    assert "LC_ALL" not in env, "LC_ALL must never be passed through: it overrides LC_CTYPE"
+    return env
+
+
 @dataclass
 class SubprocessRunner:
     """The real runner: ``subprocess.run`` with an argv LIST and ``shell=False``.
@@ -298,23 +326,17 @@ class SubprocessRunner:
     handful of variables: the MCP process's environment is where the harness injects
     credentials, and a tmux server started by this client passes its environment on to
     every pane it later spawns.
+
+    The environment itself is built by ``client_env`` so the attach client of ``attach_env``
+    gets the identical one. An attach IS a tmux client, and two constructions of "the
+    environment a tmux client runs under" would drift.
     """
 
     config: TmuxConfig
     env: dict[str, str] = field(init=False)
 
     def __post_init__(self) -> None:
-        self.env = {"TERM": self.config.term, "LC_CTYPE": self.config.locale_ctype}
-        for key in self.config.passthrough_env:
-            value = os.environ.get(key)
-            if value is not None:
-                self.env[key] = value
-        # LC_ALL would override LC_CTYPE, so a parent's `LC_ALL=C` would silently reinstate
-        # the TAB-mangling described on TmuxConfig.locale_ctype. It is not in the
-        # pass-through allowlist; this asserts that it never sneaks back in.
-        assert "LC_ALL" not in self.env, (
-            "LC_ALL must never be passed through: it overrides LC_CTYPE"
-        )
+        self.env = client_env(self.config)
 
     def __call__(self, argv: Sequence[str], stdin: bytes | None = None) -> CommandResult:
         # argv LIST, shell=False, never a string. Shell metacharacters are thus a non-issue
@@ -615,7 +637,7 @@ class TmuxAdapter:
         if not payload and not validated_keys:
             raise NoPayload("shell_send requires at least one of text or keys", session=name)
         if payload:
-            self._check_size(payload, name)
+            self.check_send_limits(payload, name)
 
         incarnation = self._resolve_owned(name)
         submitted = self._paste(name, payload) if payload else 0
@@ -630,7 +652,20 @@ class TmuxAdapter:
             incarnation=incarnation,
         )
 
-    def _check_size(self, payload: bytes, name: str) -> None:
+    def check_send_limits(self, payload: bytes, name: str) -> None:
+        """The two delivery ceilings, checked before anything is written anywhere.
+
+        PUBLIC, and shared with the pty path in ``bridge.py``, because H4 is a property of the
+        **receiving pane's tty in canonical mode** and not of how the bytes got there. tmux
+        forwards an attach client's keystrokes to that same tty, so the hazard is identical --
+        measured on the attach path directly (spike F18): 8192 bytes plus a newline delivered
+        4096 on Linux, silently truncated, and 0 on macOS.
+
+        One implementation rather than two, so the tool path and the pty path cannot drift into
+        enforcing different numbers or raising different errors. ``max_send_line_bytes`` and
+        ``LineTooLong`` are what ``errors.py`` calls "the real boundary"; F18's action was
+        explicit that the pty path reuses them rather than introducing a third number at 4096.
+        """
         if len(payload) > self.config.max_send_bytes:
             raise TooLarge(
                 f"payload is {len(payload)} bytes, over SHELLBOX_MAX_SEND_BYTES "
@@ -865,6 +900,124 @@ class TmuxAdapter:
         if result.rc != 0:
             raise tmux_failure(result.stderr, session=name, context="resize-window failed")
         return cols, rows
+
+    # -- attach support (W15) ------------------------------------------------------------
+    #
+    # Every tmux form the transport needs lives HERE, in the package that owns `target()` and
+    # `Settings.tmux_bin`, and not in `shellbox-transport`. That is decision B3 and it is
+    # mechanical rather than aesthetic: the two shipped AST guards
+    # (`tests/unit/test_target.py`, `tests/unit/test_no_global_window_size.py`) both reach this
+    # module, so an attach argv built here is covered by them, while the same argv built in the
+    # transport package would have to import `shellbox_mcp.target` -- the import cycle the
+    # separate package exists to prevent.
+    #
+    # omnigent's bridge is the counter-example and the reason the guard scope was widened:
+    # `ws_bridge.py:492` passes `-t tmux_target` UNANCHORED, and its `_tmux_session_alive`
+    # helper does it a second time while spawning a bare `"tmux"` rather than a resolved path.
+    # Both are exactly what `target.py` and `ADR-1` exist to forbid.
+
+    def attach_argv(self, name: str) -> list[str]:
+        """The argv for an attach client. A pure builder: no I/O, no ownership check.
+
+        Pure so that the shipped AST guard in ``tests/unit/test_target.py`` can prove the ``-t``
+        comes from ``target()`` on every branch, including the ones no test reaches.
+
+        WARNING: This does NOT resolve ownership and does NOT freeze the window size. Call
+        ``prepare_attach`` unless you have a reason not to -- attaching without the freeze
+        reflows the agent's window to the viewer's size, measured (spike F16, the control row).
+        """
+        naming.validate_session_name(name)
+        return [*self._base_argv(), "attach", "-t", target(name)]
+
+    def attach_env(self) -> dict[str, str]:
+        """The environment for an attach child. ``TERM`` describes the FAR end, not this process.
+
+        MEASURED (spike F17): ``tmux attach`` under ``TERM=dumb`` is refused outright with
+        ``open terminal failed: terminal does not support clear``, the child exits, and zero
+        clients attach -- in both lanes. A headless host has no tty, so bash substitutes
+        ``TERM=dumb``, which means *inheriting* the environment is exactly the failing case, and
+        the renderer would then display that error message instead of the pane.
+
+        So the forced value is load-bearing rather than hygiene, and it describes the terminal
+        at the far end of the socket -- a browser running xterm.js -- not the Python process
+        that forked the client.
+
+        It is ``client_env`` unmodified, which is the point: an attach is a tmux client, and it
+        needs the same reduced environment and the same forced ``LC_CTYPE`` as every other one.
+        """
+        return client_env(self.config)
+
+    def freeze_window_size(self, name: str) -> None:
+        """Pin this window's size so an attaching client cannot reflow the agent's pane.
+
+        CRITICAL: **The scope is the variable, and the global form kills the server.** With
+        ``set-option -g window-size manual`` the NEXT ``new-session`` dies with a SIGSEGV in
+        ``clients_calculate_size`` -- 15/15 in both lanes (spike F1/F9). It lands on the
+        *second* create, so by then other pooled agents hold sessions on that server and one
+        agent's ``shell_create`` destroys all of them. The per-window ``-w`` form is 0/15.
+        ``tests/unit/test_no_global_window_size.py`` enforces the distinction structurally.
+
+        Why this is needed at all: an attach is a tmux *client*, and a client's size drives the
+        window's. ``TmuxConfig.default_terminal`` is small on purpose because first attach GROWS
+        the window losslessly -- but a 120x40 viewer moving an 80x24 agent window is PM3, and it
+        was measured on 3.4 rather than feared (F16, the control row reflows).
+
+        Placement is at attach time, ``before_attach``, which F16 decided: its exposure window
+        measured EMPTY over 1714 samples, one call protects every later viewer including a
+        second client at a different size, and it leaves the shipped create chain -- the
+        composition four review rounds were spent on -- untouched. The create-time placement is
+        equally safe (0/15) but freezes a path that the 1-32 agents who never open a browser
+        would pay for.
+        """
+        naming.validate_session_name(name)
+        self._resolve_owned(name)
+        result = self._run("set-option", "-w", "-t", target(name), "window-size", "manual")
+        if result.rc != 0:
+            raise tmux_failure(result.stderr, session=name, context="set-option failed")
+
+    def prepare_attach(self, name: str) -> list[str]:
+        """Resolve ownership, freeze the window size, and return the argv to exec. In that order.
+
+        The order is the whole method. Freezing after the client is live costs one real reflow
+        of the agent's pane -- it reverts on its own (F16 consequence 3), but it is visible, and
+        it is avoidable by doing it first.
+
+        Raises ``NotFound`` for a session that does not exist or that carries no incarnation.
+        shellbox does not attach a pty to a session it cannot prove it owns, for the same reason
+        it will not kill one.
+        """
+        self.freeze_window_size(name)
+        return self.attach_argv(name)
+
+    def pane_dead(self, name: str) -> bool | None:
+        """Whether the pane's process has exited. ``None`` means the session did not resolve.
+
+        A thin accessor over ``_display_numeric``, and NOT a new tmux form: ``#{pane_dead}`` is
+        already in ``LIST_FIELDS`` and ``_READ_FIELDS``, and ``read()`` already returns it as
+        ``ReadResult.alive`` -- which this module calls the single source of truth for liveness.
+        Deliberately not ``list-panes``, which would be a new verb for a value already read.
+
+        It exists as its own accessor only because ``read()`` also performs a ``capture-pane``
+        and raises ``NotFound`` on a session carrying no incarnation. A liveness probe wants
+        neither: it runs on every close to answer one question, and it must be able to report
+        "gone" rather than raise.
+
+        WARNING: This is the signal that distinguishes a DETACH from a dead pane, and the two
+        must not be collapsed. ``has-session`` cannot do it -- shellbox sets ``remain-on-exit
+        on`` globally, so the session outlives its process by design. Measured both directions
+        with a live client attached (spike F19): on detach the pane reads ``0`` and stays ``0``;
+        when the process exits it reads ``1`` while ``has-session`` still returns rc=0.
+
+        The consequence for the close code: a dead pane is terminal-gone and stops the client's
+        reconnect loop; a detach must NOT be, because a detach misread as terminal-gone tears
+        down the whole session. F19 also found that the attach client OUTLIVES the pane's
+        process, which is what makes the distinction reportable on a socket that is still up.
+        """
+        naming.validate_session_name(name)
+        metrics = self._display_numeric(name, ("#{pane_dead}",))
+        if metrics is None:
+            return None
+        return metrics[0] == "1"
 
     def kill(self, name: str) -> bool:
         """Kill a session. Returns ``False`` (and succeeds) when there was nothing to kill.

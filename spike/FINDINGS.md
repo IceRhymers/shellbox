@@ -1,7 +1,10 @@
 # tmux adapter spike — findings
 
 Settles B1–B4 from the iteration-2 architect review of `.omc/plans/phase-2-session-plane.md`
-by executing the compositions §7 prescribes, rather than reasoning about them.
+by executing the compositions §7 prescribes, rather than reasoning about them. F16–F21 continue
+that for Phase 3's attach path (`W14` of
+[`phase-3-transport.md`](../.omc/plans/phase-3-transport.md)), under the same rule: a new tmux
+form goes into the spike first and into a module second.
 
 Run: `python3 spike/tmux_spike.py` (JSONL to stdout). Two lanes:
 
@@ -376,6 +379,257 @@ and any future code path that invokes tmux outside `TmuxAdapter` inherits this h
 
 ---
 
+# Phase 3 — W14. The attach path (`S-ATTACH`, `S-PANE-DEAD`, `S-PIPE`, `S-CLAIM`)
+
+Measurements for [`.omc/plans/phase-3-transport.md`](../.omc/plans/phase-3-transport.md) `W14`,
+run in the same two lanes. Every result below is **identical across both lanes** except F18's
+loss shape and F21's `/proc` availability — the two places §10 already predicts a platform split.
+
+The reason these are here and not in a module: `W14` is a gate. `R24` (High) recorded that
+per-window `window-size manual` holding a window's size under a *live* attached client was
+**inferred** from F1/F9 and had no upstream precedent — omnigent sets no `window-size` option at
+all and accepts the reflow (`omnigent/terminals/ws_bridge.py:485-487`, HEAD `fddb9b07`). A
+negative result would have flipped Decision A from an attached PTY to a `pipe-pane` sink and
+rewritten `W15`, `W19`, `ADR-9` and `ADR-10`.
+
+## F16 — `R24` is CLOSED, positive: per-window `window-size manual` holds under a live attached client
+
+An 80x24 session, a live 120x40 attach client, the size sampled continuously for 1.5 s while the
+client was attached. `#{session_attached}` was asserted non-zero before every size result, because
+"the size held" and "nothing ever attached" are otherwise the same observation.
+
+| placement | sizes seen while attached | held? | samples (3.4 / 3.6b) |
+|---|---|---|---|
+| **no option** — the control | `120x40` | **no — it reflows** | 1744 / 191 |
+| **`at_create`** — inside the create chain | `80x24` only | **yes** | 1767 / 173 |
+| **`before_attach`** — set on the existing window just before the client spawns | `80x24` only | **yes** | 1714 / 204 |
+| **`after_attach`** — set once the client is live and the window already reflowed | `80x24` only | **yes**, and see below | 1749 / 198 |
+
+Four consequences, and the third was not predicted by the plan:
+
+1. **Decision A stands.** `ADR-9`'s attached PTY is viable on tmux 3.4 and `A2` stays a
+   fallback nobody has to take. `ADR-10`'s per-window scope is confirmed under the condition
+   F9 could not test.
+2. **The control reflows, so PM3 is real on 3.4** — a viewer at 120x40 does move an 80x24
+   agent window. The mitigation is not defensive programming against a hypothetical.
+3. **The `after_attach` exposure window is transient and self-healing.** The window *does*
+   reflow to `120x40` first (recorded as `reflowed_before_option_was_set`), and then setting
+   per-window `window-size manual` **restores `80x24` on its own** — no `resize-window`
+   required. `ADR-10` priced the attach-time placement as costing "one reflow that can still
+   fire"; measured, it costs one reflow that then reverts. That materially strengthens the
+   attach-time placement, which is the one that **freezes the agent create path** — the chain
+   the plan itself calls transcribed-from-the-spike and paid for over three review rounds.
+4. **`resize-window` still works while `manual` is in force**, rc=0 and the window follows to
+   90x28 in every variant. This had to be checked: `shell_resize` is a shipped tool built on
+   `resize-window`, and an option that silently froze it would be a regression introduced by a
+   mitigation. Note the size does **not** revert when the last client detaches (it stays at
+   90x28), which is what `manual` means.
+
+5. **One `set-option` protects every later viewer.** Set once before the first attach, the
+   window held `80x24` through a 120x40 client, that client's detach, and a **second client at
+   100x50** — 825 samples on the second attach, both lanes. `ADR-10`'s attach-time placement
+   rests on this and does not state it: if the option were client-scoped, or cleared when the
+   last client left, setting it at attach time would protect only the first viewer and the
+   second would reflow the window — which is what "do not set it and size the PTY to the
+   session" was already rejected for.
+
+And the composition, separately, because F1's whole lesson is that these defects live in
+compositions rather than in commands: the per-window `set-option` **inside the shipped create
+chain** produced **0/15 second-create failures in both lanes**. F9 measured the same option as a
+standalone call; this measures the form `W15` would ship at the create-time placement.
+
+### Which placement `W15` should use — the decision `ADR-10` delegates to this measurement
+
+`ADR-10` states the rule: the create chain is the default, and "the attach-time placement
+[is] preferred if its exposure window measures empty." The measurement separates two orderings
+the ADR's prose runs together, and the distinction decides it:
+
+- **Set the option, then spawn the attach client** (`before_attach`) — the ordering a publisher
+  would actually use, because the window already exists the moment the session does. **Exposure
+  window: empty.** No reflow observed in 1714 samples, and per (5) it holds for later viewers too.
+- **Spawn the attach client, then set the option** (`after_attach`) — not an ordering any
+  publisher needs. One reflow fires and then reverts.
+
+So by `ADR-10`'s own criterion the **attach-time placement wins**, and it wins on the ADR's own
+stated benefit: it **freezes the agent create path** — the chain the plan calls
+transcribed-from-the-spike and paid for over three review rounds — so the 1-32 agents who never
+open a browser pay nothing, and the blast radius of a wrong measurement is one attach rather than
+every `shell_create`. The create-chain form is measured safe as well (0/15), so this is a choice
+between two working options rather than a fallback.
+
+## F17 — the attach client must be spawned with `forkpty`. `Popen` attaches fine and then silently ignores every resize
+
+`ADR-16` lists `os.openpty()` + `subprocess.Popen(start_new_session=True)` as an alternative to
+`os.forkpty()`, and routes one question here: does `tmux attach` tolerate a slave that is not the
+child's controlling terminal, since `subprocess` performs no `TIOCSCTTY`?
+
+**That is the wrong question. The answer is yes, and the mechanism still loses.**
+
+| | `forkpty` | `openpty` + `Popen(start_new_session=True)` |
+|---|---|---|
+| controlling terminal | yes | **no** |
+| client attaches (`#{session_attached}`) | 1 | **1 — it works** |
+| initial repaint arrives on the master fd | yes | yes |
+| `DeprecationWarning` in a threaded process | **yes** | none |
+| **`TIOCSWINSZ` on the master reaches tmux** | **yes — window follows to 100x30** | **NO — window stays 120x40** |
+
+The kernel delivers `SIGWINCH` to the pty's **foreground process group**, and a child with no
+controlling terminal is not in one. So the `Popen` route produces a client that comes up, streams
+correctly, and then discards every viewer resize — which is a **worse** outcome than an attach
+that fails, because nothing reports it. `W19` applies `TIOCSWINSZ` on the master for a resize
+control frame, so this is not a corner: it is one of the four things `W19` owes.
+
+**Action.** `W19` uses `os.forkpty()` and **silences the `DeprecationWarning` deliberately**
+(`ADR-15`'s decision 1 — `os.execve`, not `execvpe`, so the child allocates nothing before
+`exec` — is the mitigation, and it is upstream's). `preexec_fn` is not an escape route: it
+reinstates running Python in the child after a fork, which is the hazard that made `Popen`
+attractive in the first place. Both directions of the table are asserted, so a kernel or tmux
+change that rehabilitates `Popen` will say so rather than pass quietly.
+
+Two of `ADR-15`'s transcribed decisions were measured here rather than left as citations:
+
+- **`TERM` describes the far end.** `tmux attach` with `TERM=dumb` is refused outright —
+  `open terminal failed: terminal does not support clear`, child exits, zero clients attached, in
+  both lanes. So `attach_argv`'s forced `TERM` is load-bearing, not hygiene.
+- **The initial repaint is free, in-band, and ordered by tmux.** Decision A's strongest argument
+  was argued from the *absence* of a `capture-pane` call in omnigent's bridge, and absence of a
+  call is not presence of a repaint. Measured directly: a sentinel printed into the pane **before
+  any client existed** arrived in the attach master's first ~730 bytes with **no `capture-pane`
+  issued at all**.
+
+## F18 — H4 applies to the attach input path too, and Linux truncates at 4096 there as well
+
+The correction this validates is load-bearing and inverts a claimed advantage. An earlier plan
+revision held that an attached PTY *escapes* H4. It does not: H4 is the **receiving pane's tty in
+canonical mode** (F5's table reads `raw (both) ok` at every length), and tmux forwards an attach
+client's keystrokes to that same pty.
+
+Measured through a live attach client into a canonical-mode `cat > file`:
+
+| written to the attach master | delivered, 3.4 / Linux | delivered, 3.6b / macOS |
+|---|---|---|
+| 26 bytes + LF | **26 — byte-exact** | 26 |
+| 8192 bytes + LF | **4096 — silently truncated** | **0 — discarded** |
+
+Exactly F5's platform split, on the new path. Linux's truncation is the worse half, per F5's own
+verdict: *a truncated command is a different, still-executable command.*
+
+**Action.** `W19`'s `send_input` owes a per-line ceiling, and it must be the one the repo already
+ships — `max_send_line_bytes` (default 1000, `SHELLBOX_MAX_SEND_LINE_BYTES`) raising
+`LineTooLong`, which `errors.py` calls "the real boundary" — not a new number at 4096. The
+ceiling is now a **measured** requirement rather than an inferred one, and `T-INPUT-LINE-CEILING`
+asserts rejection, which is the only implementable branch: canonical-mode truncation is the
+kernel's `MAX_CANON` buffer, so chunking does not help, and no tmux format exposes the pane pty's
+termios, so the publisher cannot know which mode the pane is in.
+
+## F19 — `S-PANE-DEAD`: both directions hold, and the attach client OUTLIVES the pane's process
+
+Read through the shipped `display-message` path (`#{session_name}\t#{pane_dead}`), not
+`list-panes`, and with a live attach client present in both directions. Identical in both lanes.
+
+| direction | `pane_dead` | `has-session` | clients attached |
+|---|---|---|---|
+| the attach client is killed (**detach**) | `0` while attached, **`0` after** | rc=0 | 1 → 0 |
+| the pane's **process exits** under `remain-on-exit on` | **`1`** | **rc=0 — the session survives** | **1 — still attached** |
+
+This validates an assumption already load-bearing in shipped code rather than gating new code:
+`tmux.py` derives `alive` from `#{pane_dead}` and calls it the single source of truth for
+liveness, so it runs whether or not `W19` proceeds.
+
+The third column is the finding the earlier plan revision did not have. **The attach client stays
+attached after the pane it is showing dies**, so a publisher can read `#{pane_dead}` and emit
+`4404 terminal-gone` *on a socket that is still up*, rather than inferring it from its own client
+going away. That is what makes the 4404/4405 split implementable as `ws_bridge.py:71-80`
+describes it — and a detach misread as terminal-gone would stop the client's reconnect loop and
+tear the session down.
+
+## F20 — `pipe-pane` is worse than the plan feared, and `-o` is the dangerous spelling
+
+`OQ-J` asked whether tmux stores one pipe per pane. It does, and the two spellings fail
+differently. Identical in both lanes: open a pipe to sink 1, send output, open a second pipe to
+sink 2, send more.
+
+| form | sink 1 after | sink 2 | verdict |
+|---|---|---|---|
+| `pipe-pane -t <t> 'cat >> f'` | frozen at 7 B | 7 B | **the second pipe REPLACED the first** |
+| `pipe-pane -o -t <t> 'cat >> f'` | frozen at 7 B | **0 B** | **the second call TOGGLED piping OFF — neither sink receives it** |
+
+Both are stream-stealing failures under D6's multi-viewer expectation, and **the `-o` form —
+the one §2's `A2` sketch is written with — is the worse of the two**: a second viewer does not
+take over the stream, it silently stops the first viewer's *and* gets nothing itself. `-o` means
+"only open a pipe if none exists", so a second call toggles rather than replaces.
+
+This is priced now rather than when the fallback is reached for, per `ADR-10`'s rollback
+paragraph. F16 means nobody has to take it; if `R24` ever reopens, `A2` needs publisher-side
+arbitration of its own before it can serve two viewers, which is cost the plan's A2 analysis did
+not carry.
+
+## F21 — `S-CLAIM`: the claim round-trips, and the read path that distinguishes "no claim" from "error" is the shipped one
+
+Four measurements behind `ADR-16`'s claim protocol, none of which had been run.
+
+**(a) Round trip, including from another process.** A claim of the shape
+`<pid>:<tid>:<starttime>` — digits and colons only, so it cannot corrupt a TAB group the way
+`@shellbox_cwd` can (`check_cwd_injection` in [`tmux_spike.py`](tmux_spike.py) measures that
+hazard) — written with `set-option -t '=<name>:'` and read back:
+
+| read path | present | **absent** |
+|---|---|---|
+| `display-message -p -F '#{session_name}\t#{@shellbox_publisher}'` | rc=0, exact value | **rc=0, empty field** |
+| `show-options -t '=<name>:' -v @shellbox_publisher` | rc=0, exact value | **rc=1, `invalid option: @…`** |
+| the same `display-message`, run by a **separate Python process** | rc=0, exact value | — |
+| `set-option -u` then re-read | — | rc=0, empty field |
+
+**`W19b` must read the claim through `display-message`, not `show-options -v`.** An absent claim
+is the *ordinary* case — it is what a first publisher sees — and `show-options -v` reports it as
+an error indistinguishable from a real failure, while the shipped path reports it as an empty
+field at rc=0. This is F11's rule paying off a second time: lead the format with
+`#{session_name}` and an empty first field means unresolved, so "no claim" and "no session" stay
+distinct too.
+
+**(b) Racing writers.** Twelve trials per lane, two separate processes released by a shared
+trigger file, each doing `set-option` then read-back:
+
+| outcome | 3.4 | 3.6b |
+|---|---|---|
+| one racer reads its own claim, the other reads a foreign one (**the protocol works**) | **12/12** | **12/12** |
+| both read their own (`R33`'s interleaving — both would attach) | 0/12 | 0/12 |
+| a stored value belonging to neither writer (**torn**) | 0/12 | 0/12 |
+
+Stated honestly: **`own+own` was not observed, which bounds `R33` rather than excluding it.** The
+protocol is detection, not mutual exclusion — tmux has no compare-and-swap, the same limit
+`_resolve_owned` documents for the send path (R12) — and 24 trials of a millisecond-scale
+interleaving is weak evidence about a microsecond-scale window. What *is* established is that
+last-writer-wins converges and never leaves a torn value, which is what makes the loser's
+read-back meaningful.
+
+**(c) `/proc` per-thread identity, on Linux.** Field 22 of `/proc/<pid>/task/<tid>/stat` is
+**per-thread**, measured rather than taken from the documentation:
+
+| thread | native tid | field 22 (ticks, `SC_CLK_TCK` = 100) |
+|---|---|---|
+| main | 2577 | 115514216 |
+| first (started at T) | 13257 | 115518130 |
+| second (started at T+0.4 s) | 13258 | **115518170 — 40 ticks later** |
+
+40 ticks at 100 Hz is the 0.4 s the threads were staggered by, so the field tracks *thread* start
+and not process start. And the property the whole design rests on: **the `/proc/<pid>/task/<tid>`
+entry disappears when the thread dies while the process keeps running** — verified with the
+process's own main-thread entry still present in the same instant. That is what makes the claim
+self-clearing, which is what lets a design with no shutdown path be correct anyway, and it is why
+a `tid` works where a publisher-uuid cannot: any of the 1-32 processes can evaluate it.
+
+**(d) The degraded predicate, for the lane with no `/proc`.** On macOS the only liveness probe
+available is `os.kill(pid, 0)`, and the spike emits it with the limitation attached rather than
+behaving differently in silence: pid-liveness **reinstates the exact hazard the `tid` was
+introduced for** — a publisher thread that died inside a still-running process leaves a claim
+naming a live pid, so no publisher serves that session again for the rest of that process's life.
+That is acceptable only because macOS is a developer lane and the sandbox is Ubuntu 24.04. It
+would not be acceptable in production, and `T-ATTACH-CLAIM`'s case 3 is the test that would
+otherwise pass there while the production predicate deadlocked.
+
+---
+
 ## The suite now gates
 
 `spike/tmux_spike.py` was upgraded after the iteration-3 architect review, which correctly
@@ -395,6 +649,21 @@ anything. It now:
 
 Verified: **exit 0 in both lanes** with all assertions passing, and **exit 1** with a listed
 failure when an assertion is genuinely violated.
+
+`W14` extended it along the same lines, and two of the additions are worth naming because they
+are the kind of assertion that is easy to write vacuously:
+
+- **Every size result asserts `#{session_attached}` first.** "The size held" and "nothing ever
+  attached" are otherwise the same observation, and the second one passes.
+- **F17's mechanism table is asserted in BOTH directions** — `forkpty` propagates a resize and
+  `Popen` does not. Asserting only the half that ships would let a platform change quietly
+  rehabilitate the rejected alternative; asserting only the other half would let the shipped
+  mechanism regress unnoticed. F16's `no_option` control and F18's over-long line are asserted
+  the same way: the **hazard** is asserted, so its mitigation can never come to look unnecessary.
+
+`check_self`'s normative list grew to cover the W14 checks, including `Attach.__init__` — the
+attach argv itself. That is the single place the `=<name>:` rule is most likely to be broken by
+copying, because omnigent's own attach passes an **unanchored** `-t` (`ws_bridge.py:492`).
 
 ---
 

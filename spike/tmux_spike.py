@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Executable spike for shellbox Phase 2 (issue #2), section 7 — the tmux adapter.
+"""Executable spike for the shellbox tmux adapter -- Phase 2 section 7, and Phase 3's W14.
 
 Purpose: settle B1-B4 from the iteration-2 architect review by RUNNING the command
 compositions the plan prescribes, rather than reasoning about them. The plan's
 measurement appendix tests fragments; every defect found so far lived in the
 composition. This runs compositions.
+
+The Phase 3 additions (`S-ATTACH`, `S-PANE-DEAD`, `S-PIPE`, `S-CLAIM`, from
+`.omc/plans/phase-3-transport.md` W14) are here for the same reason and under the same
+rule: a new tmux form goes into this file FIRST and into a module SECOND. They also
+carry a gate -- see the block comment above `check_s_attach`.
 
 Emits one JSON object per check to stdout (JSONL). Run under two tmux versions:
 
@@ -18,16 +23,22 @@ Section 7 of the plan should then be transcribed FROM this output.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
+import threading
 import time
 import uuid
+import warnings
 
 TMUX = os.environ.get("SHELLBOX_TMUX_BIN") or shutil.which("tmux") or "tmux"
 
@@ -1161,6 +1172,1298 @@ def check_locale_tab_dependence() -> None:
         )
 
 
+# ===========================================================================
+# Phase 3 (issue #3), W14. Every check below measures a form W15/W19/W19b will
+# ship, which is the only reason they may be written at all (Principle 5).
+#
+# S-ATTACH's first variant is a GATE, not a confirmation. R24 (High) records that
+# per-window `window-size manual` holding a window's size under a LIVE attached
+# client is INFERRED from F1/F9 and has no upstream precedent: omnigent sets no
+# `window-size` option at all and accepts the reflow instead
+# (`omnigent/terminals/ws_bridge.py:485-487`, HEAD fddb9b07). A negative result
+# flips Decision A from an attached PTY to a `pipe-pane` sink -- which is why
+# S-PIPE is measured here, now, rather than when the fallback is reached for.
+# ===========================================================================
+
+# The claim option W19b writes. A user option, like `@shellbox_incarnation`, and read
+# back through the same `display-message` format path -- see check_s_claim for why the
+# value's shape (digits and colons only) is what makes that safe.
+PUBLISHER_OPTION = "@shellbox_publisher"
+
+# The environment a `tmux attach` client is handed.
+#
+# `TERM` describes the FAR end -- the terminal the bytes are ultimately rendered on --
+# not the process doing the bridging. A headless host has no tty, bash substitutes
+# `TERM=dumb`, and `tmux attach` refuses a dumb terminal, so the viewer would render
+# that refusal instead of the pane (transcribed decision 5, ADR-15,
+# `ws_bridge.py:138-148`). S-ATTACH[TERM=dumb] measures the refusal rather than
+# trusting the citation.
+#
+# `LC_CTYPE` is forced for the same reason `tmux.py` forces it (F15): a container has
+# no locale to inherit.
+ATTACH_ENV = {
+    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    "HOME": os.environ.get("HOME", "/tmp"),
+    "TERM": "xterm-256color",
+    "LC_CTYPE": "C.UTF-8",
+}
+
+
+def set_winsize(fd: int, cols: int, rows: int) -> None:
+    """The `TIOCSWINSZ` W19 applies on a resize control frame, on a pty fd."""
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+class Attach:
+    """One live `tmux attach` client on its own pty, torn down on exit.
+
+    Two spawn mechanisms, because `ADR-16` lists the second as an alternative to the
+    first and routes the deciding question here:
+
+    * ``forkpty`` -- `os.forkpty()` then `os.execve`, omnigent's shape
+      (`ws_bridge.py:151`). `execve` rather than `execvpe` so the child allocates
+      nothing before `exec`; the binary is therefore resolved in the PARENT, which is
+      also what `ADR-1`'s single-resolution-point rule wants. The child gets the slave
+      as its CONTROLLING terminal, because that is what `forkpty` does.
+    * ``popen`` -- `os.openpty()` plus `subprocess.Popen(start_new_session=True)`.
+      Emits no `DeprecationWarning` (the fork and exec happen in C, with no Python
+      executed in the child), but performs no `TIOCSCTTY`, so the slave is NOT the
+      child's controlling terminal. **Whether `tmux attach` tolerates that is the open
+      question `ADR-16` routes to S-ATTACH**, and it is measured, not assumed.
+
+    Never a context manager that swallows failures: `close()` reaps the child AND
+    closes the master fd, because `os.forkpty` hands back a raw int with no object
+    whose collection would close it. An unclosed master plus an unreaped child is a
+    live tmux client holding the window at the last viewer's size forever -- PM3's
+    reflow made permanent, which is exactly the residual `W19b` exists to close.
+    """
+
+    def __init__(
+        self,
+        sock: str,
+        name: str,
+        *,
+        cols: int = 120,
+        rows: int = 40,
+        mechanism: str = "forkpty",
+        read_only: bool = False,
+        term: str = "xterm-256color",
+    ) -> None:
+        argv = [TMUX, "-S", sock, "-f", "/dev/null", "attach"]
+        if read_only:
+            argv.append("-r")
+        argv += ["-t", T(name)]
+        self.argv = argv
+        self.mechanism = mechanism
+        self.env = {**ATTACH_ENV, "TERM": term}
+        self.pid = -1
+        self.master = -1
+        self._slave = -1
+        self._proc: subprocess.Popen[bytes] | None = None
+        self.fork_warnings: list[str] = []
+
+        binary = shutil.which(argv[0]) or argv[0]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            if mechanism == "forkpty":
+                pid, master = os.forkpty()
+                if pid == 0:  # pragma: no cover -- the child never returns
+                    try:
+                        os.execve(binary, argv, self.env)
+                    finally:
+                        os._exit(127)
+                self.pid, self.master = pid, master
+            else:
+                master, slave = os.openpty()
+                self.master, self._slave = master, slave
+                set_winsize(slave, cols, rows)
+                self._proc = subprocess.Popen(
+                    argv,
+                    executable=binary,
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    env=self.env,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+                self.pid = self._proc.pid
+            self.fork_warnings = [str(w.message) for w in caught]
+        # After the spawn either way: tmux may already have read the size, in which case
+        # the ioctl delivers SIGWINCH and it re-reads. Polling is what makes that safe --
+        # never a fixed sleep (§11.1).
+        set_winsize(self.master, cols, rows)
+
+    def drain(self, duration: float = 1.0) -> bytes:
+        """Everything the pty master offers within `duration`. Never blocks past it."""
+        buf = b""
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            readable, _, _ = select.select([self.master], [], [], 0.05)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def write(self, payload: bytes) -> int:
+        return os.write(self.master, payload)
+
+    def exit_status(self) -> int | None:
+        """The child's status if it has already exited, else None."""
+        if self._proc is not None:
+            return self._proc.poll()
+        try:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            return -1
+        return status if pid else None
+
+    def close(self) -> None:
+        """SIGTERM, escalate to SIGKILL, reap, then close both fds. In that order."""
+        for sig in (15, 9):
+            try:
+                os.kill(self.pid, sig)
+            except OSError:
+                break
+            deadline = time.time() + 2.0
+            reaped = False
+            while time.time() < deadline:
+                if self.exit_status() is not None:
+                    reaped = True
+                    break
+                time.sleep(0.02)
+            if reaped:
+                break
+        for fd in (self.master, self._slave):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.master = self._slave = -1
+
+    def __enter__(self) -> Attach:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.close()
+        return False
+
+
+def create_session(
+    s: Server,
+    name: str,
+    *,
+    cols: int = 80,
+    rows: int = 24,
+    window_size_manual: bool = False,
+    command: tuple[str, ...] = ("sh",),
+) -> dict:
+    """`tmux.py`'s shipped create chain, optionally with `ADR-10`'s per-window option.
+
+    Transcribed from `check_chain_verbatim` rather than invented, so a measurement here
+    describes the chain that actually ships. The `-w` `set-option` goes AFTER
+    `new-session` because the window it targets does not exist before it -- that is the
+    create-time placement `ADR-10` calls its default.
+    """
+    inc = str(uuid.uuid4())
+    # fmt: off
+    chain = [
+        "start-server",
+        ";",
+        "set-option", "-g", "history-limit", "20000",
+        ";",
+        "set-option", "-g", "status", "off",
+        ";",
+        "set-option", "-g", "default-terminal", "screen-256color",
+        ";",
+        "set-option", "-g", "remain-on-exit", "on",
+        ";",
+        "new-session", "-d", "-s", name,
+        "-x", str(cols), "-y", str(rows), "-c", "/tmp",
+        *command,
+    ]
+    if window_size_manual:
+        chain += [";", "set-option", "-w", "-t", T(name), "window-size", "manual"]
+    chain += [
+        ";",
+        "set-option", "-t", T(name), "@shellbox_incarnation", inc,
+    ]
+    # fmt: on
+    return s.run(*chain)
+
+
+def read_size(s: Server, name: str) -> tuple[int, int] | None:
+    """`#{window_width}`/`#{window_height}` through the shipped `_display_numeric` shape.
+
+    Leads with `#{session_name}` and treats an empty first field as unresolved, because
+    F11 measured that a multi-field format against a missing target prints its literal
+    separators at rc=0 -- so `if not stdout` is not a resolution check.
+    """
+    fmt = "#{session_name}\t#{window_width}\t#{window_height}"
+    parts = s.run("display-message", "-p", "-t", T(name), fmt)["stdout_raw"]
+    fields = parts.split("\n")[0].split("\t")
+    if len(fields) != 3 or not fields[0]:
+        return None
+    try:
+        return int(fields[1]), int(fields[2])
+    except ValueError:
+        return None
+
+
+def read_attached(s: Server, name: str) -> int:
+    """How many clients tmux currently counts as attached to this session.
+
+    `#{session_attached}` rather than `list-clients`, deliberately: it is a format field
+    the shipped `display-message` path already reads, so measuring it introduces no new
+    command form -- and W15/W19 need none.
+    """
+    fmt = "#{session_name}\t#{session_attached}"
+    fields = s.run("display-message", "-p", "-t", T(name), fmt)["stdout_raw"]
+    parts = fields.split("\n")[0].split("\t")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return 0
+    try:
+        return int(parts[1])
+    except ValueError:
+        return 0
+
+
+def wait_attached(s: Server, name: str, *, want: int = 1, timeout: float = 8.0) -> int:
+    """Poll until at least `want` clients are attached. Returns the count seen.
+
+    Zero means the attach never took, and EVERY size measurement below asserts a
+    non-zero count first. Without that guard a "the size held" result is indistinguishable
+    from "nothing ever attached", which is the vacuous pass this whole gate turns on.
+    """
+    deadline = time.time() + timeout
+    seen = 0
+    while time.time() < deadline:
+        seen = read_attached(s, name)
+        if seen >= want:
+            return seen
+        time.sleep(0.05)
+    return seen
+
+
+def observe_sizes(s: Server, name: str, duration: float = 1.5) -> tuple[list[str], int]:
+    """Every DISTINCT size seen over `duration`, in the order first seen, plus the sample count.
+
+    Sustained observation rather than one sample, for two reasons. A reflow is not
+    instantaneous, so a single read right after the attach can miss it and report a hold
+    that is not there. And `ADR-10`'s attach-time placement is priced on an EXPOSURE
+    WINDOW -- a transient reflow between the attach and the option taking effect -- which
+    only a series can see at all.
+
+    Honest limitation, stated because the finding must not overclaim: each sample is a
+    subprocess round trip, so the sampling interval is milliseconds, not microseconds.
+    A window shorter than that is bounded by this measurement, not excluded by it.
+    """
+    seen: list[str] = []
+    samples = 0
+    deadline = time.time() + duration
+    while time.time() < deadline:
+        size = read_size(s, name)
+        samples += 1
+        label = "unresolved" if size is None else f"{size[0]}x{size[1]}"
+        if label not in seen:
+            seen.append(label)
+    return seen, samples
+
+
+def check_s_attach(trials: int = 15) -> None:
+    """S-ATTACH -- the R24 gate. Does per-window `window-size manual` hold under a live client?
+
+    Four placements, because `ADR-10` names two and the two failure directions are
+    different:
+
+    * `no_option` -- the control, and it must show the reflow. If a viewer at 120x40
+      attaching to an 80x24 session does NOT reflow it on this tmux, then PM3 does not
+      exist and neither does the mitigation, so this variant asserts the HAZARD.
+    * `at_create` -- the option inside the create chain. `ADR-10`'s default, and the one
+      with no window of exposure.
+    * `before_attach` -- set on an existing window immediately before the client spawns.
+      The publisher's natural placement; it freezes the agent create path, so if it holds
+      it is the better choice.
+    * `after_attach` -- set once the client is already live and the window already
+      reflowed. This prices the exposure window: does the option RESTORE the original
+      size, or does it freeze the window at the reflowed size until something resizes it?
+    """
+    for variant in ("no_option", "at_create", "before_attach", "after_attach"):
+        with Server() as s:
+            create_session(s, "build", window_size_manual=(variant == "at_create"))
+            before = read_size(s, "build")
+            if variant == "before_attach":
+                s.run("set-option", "-w", "-t", T("build"), "window-size", "manual")
+
+            attached = 0
+            reflowed_before_option = None
+            with Attach(s.sock, "build", cols=120, rows=40) as client:
+                attached = wait_attached(s, "build")
+                if variant == "after_attach":
+                    # Let the reflow land first -- the point of this variant is to set the
+                    # option AFTER the damage, not to race it.
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline and read_size(s, "build") == before:
+                        time.sleep(0.02)
+                    reflowed_before_option = read_size(s, "build")
+                    s.run("set-option", "-w", "-t", T("build"), "window-size", "manual")
+                sizes, samples = observe_sizes(s, "build")
+                during = read_size(s, "build")
+                # Can the publisher still set a size while manual is in force? `shell_resize`
+                # is a shipped tool and it issues exactly this, so an option that broke it
+                # would be a regression the gate has to catch.
+                resize = s.run("resize-window", "-t", T("build"), "-x", "90", "-y", "28")
+                deadline = time.time() + 2.0
+                while time.time() < deadline and read_size(s, "build") != (90, 28):
+                    time.sleep(0.02)
+                after_resize = read_size(s, "build")
+                client_alive = client.exit_status() is None
+
+            detached = wait_attached(s, "build", want=0, timeout=3.0)
+            after_detach = read_size(s, "build")
+
+            held = sizes == [f"{before[0]}x{before[1]}"] if before else False
+            oks = [
+                expect(
+                    f"S-ATTACH[{variant}: a client really attached]",
+                    attached >= 1,
+                    "session_attached never reached 1 -- every size result below is vacuous",
+                ),
+                expect(
+                    f"S-ATTACH[{variant}: the client was still live at measurement time]",
+                    client_alive,
+                    "the attach child exited before the size was read",
+                ),
+                expect(
+                    f"S-ATTACH[{variant}: resize-window still works]",
+                    resize["rc"] == 0 and after_resize == (90, 28),
+                    f"rc={resize['rc']} {resize['stderr']!r} size={after_resize}",
+                ),
+            ]
+            if variant == "no_option":
+                # Assert the HAZARD, so the mitigation can never look unnecessary.
+                oks.append(
+                    expect(
+                        "S-ATTACH[no_option: the attach DOES reflow the window (PM3 is real)]",
+                        not held,
+                        f"a 120x40 client left an {before} window unchanged; PM3 may not apply",
+                    )
+                )
+            elif variant in ("at_create", "before_attach"):
+                oks.append(
+                    expect(
+                        f"S-ATTACH[{variant}: the size holds under a live client]",
+                        held,
+                        f"sizes seen {sizes} over {samples} samples, wanted only {before}",
+                    )
+                )
+            emit(
+                "S-ATTACH",
+                "does per-window `window-size manual` hold a window's size under a LIVE "
+                "attached client?",
+                variant=variant,
+                clients_attached=attached,
+                size_before_attach=before,
+                sizes_seen_during_attach=sizes,
+                samples=samples,
+                size_during_attach=during,
+                reflowed_before_option_was_set=reflowed_before_option,
+                held=held,
+                resize_window_rc=resize["rc"],
+                size_after_resize_window=after_resize,
+                clients_after_detach=detached,
+                size_after_detach=after_detach,
+                ok=all(oks),
+            )
+
+    # `attach -r`. A read-only client cannot send input -- so if it also does not resize
+    # the window it would be a second, independent mitigation, and W19's argv would owe a
+    # policy decision. Measured rather than reasoned about.
+    with Server() as s:
+        create_session(s, "build")
+        before = read_size(s, "build")
+        with Attach(s.sock, "build", cols=120, rows=40, read_only=True) as client:
+            attached = wait_attached(s, "build")
+            sizes, samples = observe_sizes(s, "build")
+            payload = client.drain(1.0)
+            alive = client.exit_status() is None
+        emit(
+            "S-ATTACH",
+            "does `attach -r` succeed on this tmux, and does a read-only client still "
+            "resize the window?",
+            variant="read_only_attach_-r",
+            clients_attached=attached,
+            size_before_attach=before,
+            sizes_seen_during_attach=sizes,
+            samples=samples,
+            bytes_received=len(payload),
+            child_still_live=alive,
+            ok=expect(
+                "S-ATTACH[attach -r is accepted and delivers output]",
+                attached >= 1 and len(payload) > 0,
+                f"attached={attached} bytes={len(payload)}",
+            ),
+        )
+
+    # Does the option PERSIST across a detach and a second attach at a different size?
+    #
+    # `ADR-10`'s attach-time placement rests on this and does not say so: if the option were
+    # scoped to a client, or cleared when the last client left, then setting it once before
+    # the first attach would protect only that attach and the SECOND viewer would reflow the
+    # window -- which is the case "do not set it and size the PTY to the session" was already
+    # rejected for. It is a window option, so it should persist; measured rather than assumed.
+    with Server() as s:
+        create_session(s, "build")
+        before = read_size(s, "build")
+        s.run("set-option", "-w", "-t", T("build"), "window-size", "manual")
+        first = Attach(s.sock, "build", cols=120, rows=40)
+        attached_first = wait_attached(s, "build")
+        sizes_first, _ = observe_sizes(s, "build", duration=0.75)
+        first.close()
+        wait_attached(s, "build", want=0, timeout=3.0)
+        # A DIFFERENT size, so a second viewer that could reflow would move it somewhere the
+        # first viewer's size does not explain.
+        second = Attach(s.sock, "build", cols=100, rows=50)
+        attached_second = wait_attached(s, "build")
+        sizes_second, samples_second = observe_sizes(s, "build", duration=0.75)
+        second.close()
+        want = [f"{before[0]}x{before[1]}"] if before else []
+        emit(
+            "S-ATTACH",
+            "does a per-window `window-size manual` set once survive a detach and a SECOND "
+            "attach at a different size?",
+            variant="second_attach_after_detach",
+            size_at_create=before,
+            first_client="120x40",
+            clients_attached_first=attached_first,
+            sizes_during_first_attach=sizes_first,
+            second_client="100x50",
+            clients_attached_second=attached_second,
+            sizes_during_second_attach=sizes_second,
+            samples_second=samples_second,
+            ok=expect(
+                "S-ATTACH[the option set once holds for a SECOND viewer too]",
+                attached_first >= 1 and attached_second >= 1
+                and sizes_first == want and sizes_second == want,
+                f"first={sizes_first} second={sizes_second} wanted {want} "
+                f"(attached {attached_first}/{attached_second})",
+            ),
+        )
+
+    # The option's OTHER half, re-measured with the option where W15 would put it. F9
+    # measured the per-window form safe as a standalone call; this measures it inside the
+    # create chain, which is the composition that ships. F1's whole lesson is that the
+    # composition is where these defects live.
+    crashes = 0
+    first_err = ""
+    for _ in range(trials):
+        with Server() as s:
+            create_session(s, "a", window_size_manual=True)
+            second = create_session(s, "b", window_size_manual=True)
+            if second["rc"] != 0:
+                crashes += 1
+                first_err = first_err or second["stderr"]
+    emit(
+        "S-ATTACH",
+        "does the per-window `window-size manual` INSIDE the create chain survive a "
+        "second create?",
+        variant="per_window_in_create_chain",
+        trials=trials,
+        second_create_failures=crashes,
+        first_error=first_err,
+        ok=expect(
+            "S-ATTACH[per-window option in the create chain: 0 second-create failures]",
+            crashes == 0,
+            f"{crashes}/{trials} second creates failed -- this is F1 with the safe scope",
+        ),
+    )
+
+
+def check_s_attach_mechanism() -> None:
+    """S-ATTACH -- the spawn mechanism, the `TIOCSCTTY` question, and the in-band repaint.
+
+    Four things a citation currently stands in for, all of which `ADR-15`/`ADR-16` rest on.
+    The fourth is the one that decides the mechanism, and it is not the one the ADR names:
+
+    1. **`os.forkpty()` warns in a threaded process, and `Popen` does not.** `W19` must
+       either silence that warning deliberately or adopt the `Popen` mechanism, and the
+       choice needs the measurement rather than the changelog. A thread is started here on
+       purpose -- `enroll.py` already runs two daemon threads, so shellbox's fork is
+       unavoidably multithreaded in production.
+    2. **Does `tmux attach` tolerate a slave that is not the child's controlling
+       terminal?** `subprocess` performs no `TIOCSCTTY`. This is the open question
+       `ADR-16` routes here -- and it is the WRONG question, because the answer is yes
+       and the mechanism still loses. See 4.
+    3. **Is the initial repaint really free, in-band, and ordered by tmux?** This is
+       Decision A's strongest argument for an attached PTY over `pipe-pane` and it was
+       argued from the ABSENCE of a `capture-pane` call in omnigent's bridge. Absence of a
+       call is not presence of a repaint, so: write a sentinel into the pane, attach, and
+       look for the sentinel in the master fd with no `capture-pane` issued at all.
+    4. **Does a `TIOCSWINSZ` on the master actually reach tmux?** W19 applies exactly that
+       for a resize control frame. Not on the ADR's list, and it is what settles the
+       mechanism: a controlling terminal is not needed to ATTACH, but it is needed to be
+       SIGWINCH'd, so the `Popen` route comes up fine and then silently ignores every
+       resize. An attach that works and a resize that vanishes is a worse outcome than an
+       attach that fails, which is why this had to be measured rather than inferred from
+       whether the client came up.
+    """
+    idle = threading.Event()
+    spectator = threading.Thread(target=idle.wait, name="spike-spectator", daemon=True)
+    spectator.start()
+    try:
+        for mechanism in ("forkpty", "popen"):
+            with Server() as s:
+                # `conftest.Sentinel`'s invariant, borrowed rather than reinvented: the
+                # needle must not be a substring of the command that produces it, or the
+                # echoed command line alone satisfies the check.
+                needle = f"sbx{uuid.uuid4().hex[:10]}"
+                create_session(s, "build", command=("sh", "-c", f"printf %s\\\\n {needle}; sleep 300"))
+                # The pane has printed the needle before any client exists, so anything the
+                # master fd yields is tmux repainting the EXISTING screen to a new client.
+                deadline = time.time() + 3.0
+                painted = ""
+                while time.time() < deadline:
+                    painted = s.run("capture-pane", "-p", "-t", T("build"))["stdout"]
+                    if needle in painted:
+                        break
+                    time.sleep(0.05)
+
+                client = Attach(s.sock, "build", mechanism=mechanism)
+                try:
+                    attached = wait_attached(s, "build", timeout=5.0)
+                    received = client.drain(1.5)
+                    status = client.exit_status()
+                    fork_warnings = client.fork_warnings
+                    # Does a viewer resize actually PROPAGATE on this mechanism? W19 applies
+                    # `TIOCSWINSZ` to the master for a resize control frame, and the kernel
+                    # delivers the resulting SIGWINCH to the pty's FOREGROUND PROCESS GROUP --
+                    # which a child with no controlling terminal is not a member of. So this is
+                    # not a formality: it is the failure a missing `TIOCSCTTY` would actually
+                    # produce, and it would present as a viewer whose resizes are silently
+                    # ignored rather than as an attach that fails. No `window-size manual` is
+                    # set here, so the window is free to follow the client.
+                    set_winsize(client.master, 100, 30)
+                    deadline = time.time() + 3.0
+                    while time.time() < deadline and read_size(s, "build") != (100, 30):
+                        time.sleep(0.02)
+                    resized = read_size(s, "build")
+                finally:
+                    client.close()
+
+                repainted = needle.encode() in received
+                oks = [
+                    expect(
+                        f"S-ATTACH[{mechanism}: the attach client came up]",
+                        attached >= 1,
+                        f"session_attached={attached} child_status={status} "
+                        f"first_bytes={received[:200]!r}",
+                    ),
+                    expect(
+                        f"S-ATTACH[{mechanism}: tmux repaints the pane in-band, no capture-pane]",
+                        repainted,
+                        f"the sentinel was on screen but not in {len(received)} bytes of "
+                        "attach output",
+                    ),
+                ]
+                # The measured asymmetry, asserted in BOTH directions so neither half can
+                # rot silently. `forkpty` propagates a resize; `popen` does NOT, because the
+                # kernel delivers SIGWINCH to the pty's foreground process group and a child
+                # with no controlling terminal is not in one. Asserting only the positive
+                # half would let a future kernel or tmux quietly rehabilitate the `popen`
+                # route without anyone noticing it had; asserting only the negative half
+                # would let the mechanism W19 actually ships regress unnoticed.
+                if mechanism == "forkpty":
+                    oks.append(
+                        expect(
+                            "S-ATTACH[forkpty: TIOCSWINSZ on the master reaches tmux]",
+                            resized == (100, 30),
+                            f"the window read {resized} after the master was set to 100x30 -- "
+                            "W19's whole resize path runs through this",
+                        )
+                    )
+                else:
+                    oks.append(
+                        expect(
+                            "S-ATTACH[popen: TIOCSWINSZ does NOT reach tmux -- no controlling tty]",
+                            resized != (100, 30),
+                            f"the popen route propagated a resize ({resized}); if that is now "
+                            "reliable, ADR-16's Popen alternative is back on the table and the "
+                            "forkpty DeprecationWarning no longer has to be lived with",
+                        )
+                    )
+                if mechanism == "forkpty":
+                    oks.append(
+                        expect(
+                            "S-ATTACH[forkpty in a threaded process warns]",
+                            any("multi-threaded" in w for w in fork_warnings),
+                            f"expected a DeprecationWarning, got {fork_warnings!r} -- if this "
+                            "stops firing, W19's obligation to silence it is obsolete",
+                        )
+                    )
+                else:
+                    oks.append(
+                        expect(
+                            "S-ATTACH[popen route emits no fork warning]",
+                            not fork_warnings,
+                            str(fork_warnings),
+                        )
+                    )
+                emit(
+                    "S-ATTACH",
+                    "which spawn mechanism can host the attach client, and does the initial "
+                    "repaint arrive in-band?",
+                    variant=f"mechanism_{mechanism}",
+                    controlling_terminal="yes (forkpty)" if mechanism == "forkpty" else "NO (no TIOCSCTTY)",
+                    clients_attached=attached,
+                    child_status=status,
+                    bytes_received=len(received),
+                    sentinel_on_screen_before_attach=needle in painted,
+                    sentinel_in_attach_stream=repainted,
+                    size_after_TIOCSWINSZ_100x30=resized,
+                    fork_warnings=fork_warnings,
+                    ok=all(oks),
+                )
+    finally:
+        idle.set()
+        spectator.join(timeout=2.0)
+
+    # TERM=dumb. ADR-15's decision 5, measured.
+    with Server() as s:
+        create_session(s, "build")
+        client = Attach(s.sock, "build", term="dumb")
+        try:
+            output = client.drain(1.5)
+            attached = read_attached(s, "build")
+            deadline = time.time() + 2.0
+            while time.time() < deadline and client.exit_status() is None:
+                time.sleep(0.02)
+            status = client.exit_status()
+        finally:
+            client.close()
+        emit(
+            "S-ATTACH",
+            "does `tmux attach` refuse a dumb terminal, as ADR-15's decision 5 says?",
+            variant="TERM=dumb",
+            clients_attached=attached,
+            child_status=status,
+            output=repr(output[:300]),
+            ok=expect(
+                "S-ATTACH[TERM=dumb is refused]",
+                attached == 0,
+                f"a dumb terminal attached anyway (attached={attached}); the forced TERM in "
+                "attach_argv would then be unjustified",
+            ),
+        )
+
+
+def check_s_attach_input() -> None:
+    """S-ATTACH -- input through the attach master, and H4 on that path.
+
+    The load-bearing half is the second measurement. An earlier plan revision claimed an
+    attached PTY ESCAPES H4; it does not, and the correction inverts into a hazard. H4 is
+    the RECEIVING pane's tty in canonical mode (F5's table reads `raw (both) ok` at every
+    length, so the loss belongs to the pane's line discipline), and tmux forwards an attach
+    client's keystrokes to that same pty. `max_send_line_bytes` is a LOUD `LineTooLong`
+    rejection at the tool boundary; a PTY input path has no ceiling at all, and F5's verdict
+    is that truncation is the worse failure because "a truncated command is a different,
+    still-executable command".
+
+    So this measures the hazard on the attach path specifically. If it reproduces here,
+    `W19`'s per-line ceiling is a measured requirement rather than an inferred one.
+    """
+    with Server() as s:
+        out = os.path.join(tempfile.mkdtemp(prefix="sbx"), "out")
+        create_session(s, "build", command=("sh", "-c", f"cat > {out}"))
+        with Attach(s.sock, "build") as client:
+            attached = wait_attached(s, "build")
+            client.drain(0.5)  # discard the initial repaint
+
+            short = b"hello-from-the-attach-pty\n"
+            client.write(short)
+            delivered_short = wait_for(out, len(short), timeout=3.0)
+
+            long_line = (b"x" * 8192) + b"\n"
+            client.write(long_line)
+            # A ceiling-free path would deliver everything; Linux truncates at 4096 and
+            # macOS discards. Wait for the full amount so a PASS cannot come from reading
+            # too early, then report what actually arrived.
+            total = wait_for(out, delivered_short + len(long_line), timeout=4.0)
+            delivered_long = total - delivered_short
+            alive = client.exit_status() is None
+
+        lossless = delivered_long == len(long_line)
+        oks = [
+            expect(
+                "S-ATTACH[input: a client attached and stayed live]",
+                attached >= 1 and alive,
+                f"attached={attached} alive={alive}",
+            ),
+            expect(
+                "S-ATTACH[input: a short line reaches the pane byte-exact]",
+                delivered_short == len(short),
+                f"{delivered_short}/{len(short)} bytes",
+            ),
+            # Only the LOSS is asserted, not its shape: F5 measured macOS discarding and
+            # Linux truncating, and the point here is that the attach path does not escape
+            # either.
+            expect(
+                "S-ATTACH[input: an 8 KiB line through the attach pty is NOT delivered whole]",
+                not lossless,
+                "the attach path delivered 8193 bytes intact, which would mean H4 does not "
+                "apply to it and W19's ceiling rests on nothing",
+            ),
+        ]
+        emit(
+            "S-ATTACH",
+            "does input written to the attach master reach the pane, and does H4 apply to "
+            "that path?",
+            variant="input_and_h4",
+            clients_attached=attached,
+            short_line_bytes_sent=len(short),
+            short_line_bytes_delivered=delivered_short,
+            long_line_bytes_sent=len(long_line),
+            long_line_bytes_delivered=delivered_long,
+            long_line_lossless=lossless,
+            platform=sys.platform,
+            ok=all(oks),
+        )
+
+
+def check_s_pane_dead() -> None:
+    """S-PANE-DEAD -- `#{pane_dead}` in BOTH directions, with a live client present.
+
+    This validates an assumption already load-bearing in shipped code rather than gating
+    new code: `tmux.py` derives `alive` from `#{pane_dead}` and calls it "the single source
+    of truth for liveness". So it runs whether or not W19 proceeds.
+
+    Read through the shipped `display-message` path, NOT `list-panes`. omnigent prefers
+    `list-panes` because `display-message` can fall back to another pane -- but that cannot
+    happen here: the format leads with `#{session_name}` and an empty first field reads as
+    unresolved, and no shellbox code path ever issues `split-window` or `new-window`, so
+    every session has one window and one pane.
+
+    The dead direction is the one that matters and the one an earlier plan revision did not
+    measure: it is what the 4404-terminal-gone / 4405-detached close-code split turns on,
+    and a detach misread as terminal-gone would tear down the whole session.
+    """
+    fmt = "#{session_name}\t#{pane_dead}"
+
+    # Direction 1: DETACH. The client goes away; the pane must still read alive.
+    with Server() as s:
+        create_session(s, "build", command=("sh", "-c", "sleep 300"))
+        client = Attach(s.sock, "build")
+        attached = wait_attached(s, "build")
+        during = s.run("display-message", "-p", "-t", T("build"), fmt)["stdout_raw"]
+        client.close()
+        after_clients = wait_attached(s, "build", want=0, timeout=3.0)
+        after = s.run("display-message", "-p", "-t", T("build"), fmt)["stdout_raw"]
+        has_session = s.run("has-session", "-t", T("build"))
+        during_dead = during.split("\n")[0].split("\t")
+        after_dead = after.split("\n")[0].split("\t")
+        oks = [
+            expect("S-PANE-DEAD[detach: a client was attached first]", attached >= 1, str(attached)),
+            expect(
+                "S-PANE-DEAD[detach: pane_dead is 0 while attached]",
+                during_dead[:2] == ["build", "0"],
+                repr(during),
+            ),
+            expect(
+                "S-PANE-DEAD[detach: pane_dead is STILL 0 after the client is killed]",
+                after_dead[:2] == ["build", "0"],
+                repr(after),
+            ),
+            expect(
+                "S-PANE-DEAD[detach: the session survives the detach]",
+                has_session["rc"] == 0,
+                has_session["stderr"],
+            ),
+        ]
+        emit(
+            "S-PANE-DEAD",
+            "does killing the attach client leave the pane alive?",
+            direction="detach",
+            clients_attached=attached,
+            clients_after=after_clients,
+            display_while_attached=repr(during),
+            display_after_detach=repr(after),
+            has_session_rc=has_session["rc"],
+            ok=all(oks),
+        )
+
+    # Direction 2: the pane's PROCESS exits while a client is still attached. Under the
+    # global `remain-on-exit on` the session must survive and the pane must read dead.
+    with Server() as s:
+        marker = os.path.join(tempfile.mkdtemp(prefix="sbx"), "done")
+        create_session(
+            s, "build", command=("sh", "-c", f"sleep 0.75; : > {marker}; exit 0")
+        )
+        client = Attach(s.sock, "build")
+        try:
+            attached = wait_attached(s, "build")
+            wait_for(marker, 0, timeout=5.0)
+            deadline = time.time() + 5.0
+            observed = ""
+            while time.time() < deadline:
+                observed = s.run("display-message", "-p", "-t", T("build"), fmt)["stdout_raw"]
+                if observed.split("\n")[0].split("\t")[1:2] == ["1"]:
+                    break
+                time.sleep(0.05)
+            has_session = s.run("has-session", "-t", T("build"))
+            still_attached = read_attached(s, "build")
+            child_status = client.exit_status()
+            fields = observed.split("\n")[0].split("\t")
+        finally:
+            client.close()
+        oks = [
+            expect(
+                "S-PANE-DEAD[dead: a client was attached when the process exited]",
+                attached >= 1,
+                str(attached),
+            ),
+            expect(
+                "S-PANE-DEAD[dead: pane_dead reads 1 after the pane's process exits]",
+                fields[:2] == ["build", "1"],
+                repr(observed),
+            ),
+            expect(
+                "S-PANE-DEAD[dead: the session SURVIVES it (remain-on-exit on)]",
+                has_session["rc"] == 0,
+                has_session["stderr"],
+            ),
+        ]
+        emit(
+            "S-PANE-DEAD",
+            "with a live attach client present, does a pane whose process exited read dead "
+            "while the session survives?",
+            direction="pane_process_exited",
+            clients_attached=attached,
+            clients_still_attached_after_death=still_attached,
+            attach_child_status_after_pane_death=child_status,
+            display_after_exit=repr(observed),
+            has_session_rc=has_session["rc"],
+            ok=all(oks),
+        )
+
+
+def check_s_pipe() -> None:
+    """S-PIPE -- what does a SECOND `pipe-pane` on one pane do to the first?
+
+    Prices Decision A's designated fallback, which is why it is measured now rather than
+    when the fallback is reached for. Both spellings, because they are not the same
+    question and the plan's A2 sketch uses the second:
+
+    * without `-o`: does the new pipe REPLACE the first, silently stealing a viewer's
+      stream? Multi-viewer is a D6 expectation.
+    * with `-o`: tmux documents `-o` as "only open a new pipe if no previous pipe exists",
+      which makes a second call a TOGGLE. If so, a second viewer would not steal the
+      stream -- it would turn the first viewer's pipe OFF, which is a different and worse
+      failure than replacement, and it is the form A2 was written with.
+    """
+    for flag in ("none", "-o"):
+        with Server() as s:
+            base = tempfile.mkdtemp(prefix="sbxpipe")
+            first = os.path.join(base, "first")
+            second = os.path.join(base, "second")
+            create_session(s, "build", command=("sh", "-c", "sleep 300"))
+
+            args = ["pipe-pane"] + (["-o"] if flag == "-o" else [])
+            open_first = s.run(*args, "-t", T("build"), f"cat >> {first}")
+            s.run("send-keys", "-t", T("build"), "-l", "alpha")
+            s.run("send-keys", "-t", T("build"), "--", "Enter")
+            first_before = wait_for(first, 1, timeout=3.0)
+
+            open_second = s.run(*args, "-t", T("build"), f"cat >> {second}")
+            s.run("send-keys", "-t", T("build"), "-l", "bravo")
+            s.run("send-keys", "-t", T("build"), "--", "Enter")
+            second_size = wait_for(second, 1, timeout=3.0)
+            first_after = os.path.getsize(first) if os.path.exists(first) else 0
+
+            if second_size > 0 and first_after == first_before:
+                verdict = "the second pipe REPLACED the first"
+            elif second_size > 0 and first_after > first_before:
+                verdict = "both pipes received output"
+            elif second_size == 0 and first_after == first_before:
+                verdict = "the second call TOGGLED piping OFF -- neither sink received it"
+            else:
+                verdict = "the second call did not open a pipe; the first kept receiving"
+            emit(
+                "S-PIPE",
+                "does a second `pipe-pane` on one pane replace, coexist with, or toggle off "
+                "the first?",
+                variant=f"pipe_pane_{flag}",
+                first_open_rc=open_first["rc"],
+                second_open_rc=open_second["rc"],
+                first_sink_bytes_before_second_open=first_before,
+                first_sink_bytes_after=first_after,
+                second_sink_bytes=second_size,
+                verdict=verdict,
+                # No assertion: this measures a form shellbox does not ship, and the finding
+                # IS the result. Asserting a guessed answer here would only encode the guess.
+                ok=expect(
+                    f"S-PIPE[{flag}: the first pipe-pane call itself works]",
+                    open_first["rc"] == 0 and first_before > 0,
+                    f"rc={open_first['rc']} bytes={first_before} {open_first['stderr']!r}",
+                ),
+            )
+            shutil.rmtree(base, ignore_errors=True)
+
+
+# Run by check_s_claim in TWO concurrent processes. It writes a claim and reads it back,
+# which is the whole protocol -- so a race between two of these is a race between two
+# publishers. The anchored target is passed IN rather than built here, so the child cannot
+# introduce a target form this file's own SELF check does not cover.
+_CLAIM_RACER = r"""
+import os, subprocess, sys, time
+
+tmux, sock, target, option, value, trigger = sys.argv[1:7]
+env = {
+    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    "HOME": os.environ.get("HOME", "/tmp"),
+    "TERM": "xterm-256color",
+    "LC_CTYPE": "C.UTF-8",
+}
+base = [tmux, "-S", sock, "-f", "/dev/null"]
+# Both racers spin on one trigger file so the write-then-read-back sequences overlap.
+# Without it the two processes start milliseconds apart and the race never happens.
+while not os.path.exists(trigger):
+    time.sleep(0.0005)
+subprocess.run(base + ["set-option", "-t", target, option, value], env=env, capture_output=True)
+read = subprocess.run(
+    base + ["display-message", "-p", "-t", target, "#{session_name}\t#{" + option + "}"],
+    env=env,
+    capture_output=True,
+)
+fields = read.stdout.decode(errors="replace").split("\n")[0].split("\t")
+saw = fields[1] if len(fields) > 1 else ""
+print("own" if saw == value else "foreign", saw, sep="\t")
+"""
+
+
+def tid_starttime(pid: int, tid: int) -> int | None:
+    """Field 22 of `/proc/<pid>/task/<tid>/stat`, or None where `/proc` is not there.
+
+    Field 2 (`comm`) is parenthesised and may itself contain spaces and a `)`, so the split
+    is after the LAST `)`. Everything after it begins at field 3, which puts field 22 at
+    index 19. Getting this wrong reads a neighbouring counter and the claim then compares
+    two numbers that are not start times -- silently, since they are both plausible ints.
+    """
+    path = f"/proc/{pid}/task/{tid}/stat"
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read().decode(errors="replace")
+    except OSError:
+        return None
+    try:
+        tail = raw[raw.rindex(")") + 1 :].split()
+        return int(tail[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def check_s_claim(race_trials: int = 12) -> None:
+    """S-CLAIM -- the four things `ADR-16`'s claim protocol rests on and has not measured.
+
+    (a) The `set-option`/read-back round trip for a claim, including a read of a claim
+        written by ANOTHER PROCESS, since the design's premise is 1-32 of them. Both read
+        paths are measured -- the shipped `display-message` format and `show-options -v` --
+        because "no claim" must be distinguishable from "the read failed", and the two
+        paths do not report an absent option the same way.
+    (b) The ORDERING of claim-then-read-back under two racing writers. This is what bounds
+        `R33` to one interleaving, and the honest result is a RATE rather than an assertion:
+        with writes at W1,R1,W2,R2 both racers read their own claim and both would proceed.
+        That interleaving is the residual; measuring how often it occurs is the point.
+    (c) That field 22 of `/proc/<pid>/task/<tid>/stat` is a PER-THREAD start time, and that
+        the `/proc` entry DISAPPEARS when the thread dies while the process lives. The
+        second property is what makes the claim self-clearing, which is what lets a design
+        with no shutdown path be correct anyway. Both are documented Linux behaviour that
+        this plan had not run.
+    (d) A documented DEGRADED predicate for the non-`/proc` lane. This spike also runs on
+        macOS, and silently behaving differently there is the failure mode; saying what is
+        lost is the alternative.
+    """
+    claim = f"{os.getpid()}:{threading.get_native_id()}:1234567"
+
+    # (a) round trip, cross-process read, and both read paths.
+    with Server() as s:
+        create_session(s, "build")
+        wrote = s.run("set-option", "-t", T("build"), PUBLISHER_OPTION, claim)
+        fmt = "#{session_name}\t#{" + PUBLISHER_OPTION + "}"
+        via_display = s.run("display-message", "-p", "-t", T("build"), fmt)["stdout_raw"]
+        via_show = s.run("show-options", "-t", T("build"), "-v", PUBLISHER_OPTION)
+        # A DIFFERENT PROCESS reads it. `Server.run` already forks a tmux client, but the
+        # reader that matters is a separate Python process -- that is the case the design
+        # turns on, so it is the case that gets measured.
+        reader = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess,sys;"
+                "print(subprocess.run(sys.argv[1:],capture_output=True).stdout.decode(),end='')",
+                TMUX,
+                "-S",
+                s.sock,
+                "-f",
+                "/dev/null",
+                "display-message",
+                "-p",
+                "-t",
+                T("build"),
+                fmt,
+            ],
+            capture_output=True,
+            env=ATTACH_ENV,
+        )
+        cross = reader.stdout.decode(errors="replace")
+
+        # Absent, through both paths. `display-message` expands an unset user option to the
+        # empty string at rc=0 (F11's shape); `show-options -v` is measured, not assumed.
+        absent_display = s.run(
+            "display-message", "-p", "-t", T("build"), "#{session_name}\t#{@shellbox_nosuch}"
+        )
+        absent_show = s.run("show-options", "-t", T("build"), "-v", "@shellbox_nosuch")
+
+        # Release, which W19b implements only as an optimisation.
+        unset = s.run("set-option", "-u", "-t", T("build"), PUBLISHER_OPTION)
+        after_unset = s.run("display-message", "-p", "-t", T("build"), fmt)["stdout_raw"]
+
+        display_fields = via_display.split("\n")[0].split("\t")
+        cross_fields = cross.split("\n")[0].split("\t")
+        oks = [
+            expect("S-CLAIM[set-option writes the claim]", wrote["rc"] == 0, wrote["stderr"]),
+            expect(
+                "S-CLAIM[the claim round-trips through the shipped display-message path]",
+                display_fields[:2] == ["build", claim],
+                repr(via_display),
+            ),
+            expect(
+                "S-CLAIM[another PROCESS reads the same claim]",
+                cross_fields[:2] == ["build", claim],
+                repr(cross),
+            ),
+            expect(
+                "S-CLAIM[show-options -v returns the claim too]",
+                via_show["rc"] == 0 and via_show["stdout"] == claim,
+                f"rc={via_show['rc']} {via_show['stdout']!r} {via_show['stderr']!r}",
+            ),
+            expect(
+                "S-CLAIM[an ABSENT option is an empty field, not an error, via display-message]",
+                absent_display["rc"] == 0
+                and absent_display["stdout_raw"].split("\n")[0].split("\t")[:2] == ["build", ""],
+                f"rc={absent_display['rc']} {absent_display['stdout_raw']!r}",
+            ),
+            expect(
+                "S-CLAIM[set-option -u clears the claim]",
+                unset["rc"] == 0 and after_unset.split("\n")[0].split("\t")[1:2] == [""],
+                f"rc={unset['rc']} {unset['stderr']!r} after={after_unset!r}",
+            ),
+        ]
+        emit(
+            "S-CLAIM",
+            "does a publisher claim round-trip through a tmux session option, including "
+            "across processes?",
+            variant="round_trip",
+            claim=claim,
+            set_option_rc=wrote["rc"],
+            via_display_message=repr(via_display),
+            via_show_options_rc=via_show["rc"],
+            via_show_options=repr(via_show["stdout"]),
+            read_by_another_process=repr(cross),
+            absent_via_display_message=repr(absent_display["stdout_raw"]),
+            absent_via_show_options_rc=absent_show["rc"],
+            absent_via_show_options_stderr=repr(absent_show["stderr"]),
+            unset_rc=unset["rc"],
+            after_unset=repr(after_unset),
+            ok=all(oks),
+        )
+
+    # (b) two racing writers, claim-then-read-back, N trials.
+    outcomes = {"own+own": 0, "one_own_one_foreign": 0, "other": 0}
+    torn = 0
+    details: list[str] = []
+    with Server() as s:
+        create_session(s, "build")
+        for trial in range(race_trials):
+            s.run("set-option", "-u", "-t", T("build"), PUBLISHER_OPTION)
+            base = tempfile.mkdtemp(prefix="sbxclaim")
+            trigger = os.path.join(base, "go")
+            values = [f"9{trial}0:11{trial}:5550{trial}", f"9{trial}1:22{trial}:6660{trial}"]
+            procs = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        _CLAIM_RACER,
+                        TMUX,
+                        s.sock,
+                        T("build"),
+                        PUBLISHER_OPTION,
+                        value,
+                        trigger,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=ATTACH_ENV,
+                )
+                for value in values
+            ]
+            with open(trigger, "w") as handle:
+                handle.write("go")
+            said = []
+            for proc in procs:
+                out, _ = proc.communicate(timeout=30)
+                said.append(out.decode(errors="replace").split("\n")[0].split("\t")[0])
+            final = s.run("show-options", "-t", T("build"), "-v", PUBLISHER_OPTION)["stdout"]
+            if final not in values:
+                torn += 1
+            if said == ["own", "own"]:
+                outcomes["own+own"] += 1
+            elif sorted(said) == ["foreign", "own"]:
+                outcomes["one_own_one_foreign"] += 1
+            else:
+                outcomes["other"] += 1
+            details.append(f"{said}->{'winner' if final in values else repr(final)}")
+            shutil.rmtree(base, ignore_errors=True)
+    emit(
+        "S-CLAIM",
+        "under two racing writers, what does claim-then-read-back actually report?",
+        variant="racing_writers",
+        trials=race_trials,
+        outcomes=outcomes,
+        torn_or_foreign_final_values=torn,
+        per_trial=details,
+        interpretation=(
+            "`own+own` is R33 exactly: both publishers read their own claim and both would "
+            "attach. The count is the residual's observed rate, not a bound on it -- the "
+            "protocol is detection, not mutual exclusion, and tmux offers no compare-and-swap."
+        ),
+        ok=expect(
+            "S-CLAIM[the stored claim is always ONE writer's value, never a torn one]",
+            torn == 0,
+            f"{torn}/{race_trials} trials left a value belonging to neither writer",
+        ),
+    )
+
+    # (c)/(d) per-thread identity.
+    pid = os.getpid()
+    main_tid = threading.get_native_id()
+    if sys.platform == "linux":
+        stop = threading.Event()
+        tids: dict[str, int] = {}
+
+        def worker(label: str) -> None:
+            tids[label] = threading.get_native_id()
+            stop.wait()
+
+        first = threading.Thread(target=worker, args=("first",), daemon=True)
+        first.start()
+        # More than one clock tick apart. `starttime` is in ticks (100 Hz on every Linux
+        # shellbox targets), so two threads started inside one tick share a value and the
+        # measurement would prove nothing.
+        time.sleep(0.4)
+        second = threading.Thread(target=worker, args=("second",), daemon=True)
+        second.start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and len(tids) < 2:
+            time.sleep(0.01)
+
+        starts = {
+            "main": tid_starttime(pid, main_tid),
+            "first": tid_starttime(pid, tids.get("first", -1)),
+            "second": tid_starttime(pid, tids.get("second", -1)),
+        }
+        distinct_tids = len({main_tid, *tids.values()}) == 3
+        stop.set()
+        first.join(timeout=5.0)
+        second.join(timeout=5.0)
+        # The self-clearing property: the entry goes away when the THREAD dies, while the
+        # process -- and this very interpreter -- keeps running.
+        gone_deadline = time.time() + 5.0
+        first_path = f"/proc/{pid}/task/{tids.get('first', -1)}"
+        while time.time() < gone_deadline and os.path.exists(first_path):
+            time.sleep(0.02)
+        entry_gone = not os.path.exists(first_path)
+        process_still_live = os.path.exists(f"/proc/{pid}/task/{main_tid}")
+
+        oks = [
+            expect("S-CLAIM[three distinct native tids]", distinct_tids, str([main_tid, *tids])),
+            expect(
+                "S-CLAIM[field 22 is readable for every thread]",
+                all(v is not None for v in starts.values()),
+                str(starts),
+            ),
+            expect(
+                "S-CLAIM[field 22 is PER-THREAD, not per-process]",
+                starts["first"] is not None
+                and starts["second"] is not None
+                and starts["second"] > starts["first"],
+                f"{starts} -- a thread started 0.4 s later must carry a later starttime",
+            ),
+            expect(
+                "S-CLAIM[a dead thread's /proc entry disappears while the process lives]",
+                entry_gone and process_still_live,
+                f"entry_gone={entry_gone} process_live={process_still_live}",
+            ),
+        ]
+        emit(
+            "S-CLAIM",
+            "is field 22 of /proc/<pid>/task/<tid>/stat a per-thread start time, and does "
+            "the entry vanish when the thread dies?",
+            variant="proc_per_thread_starttime",
+            platform=sys.platform,
+            pid=pid,
+            tids={"main": main_tid, **tids},
+            starttimes=starts,
+            clock_ticks_per_second=os.sysconf("SC_CLK_TCK"),
+            dead_thread_entry_gone=entry_gone,
+            process_entry_still_present=process_still_live,
+            predicate=(
+                "a claim (pid, tid, tid_starttime) is STALE when /proc/<pid>/task/<tid> is "
+                "absent or its field 22 differs; otherwise it is held"
+            ),
+            ok=all(oks),
+        )
+    else:
+        # The degraded lane, documented rather than silently different.
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            alive = False
+        emit(
+            "S-CLAIM",
+            "what claim predicate is available where /proc does not exist?",
+            variant="degraded_predicate_no_proc",
+            platform=sys.platform,
+            proc_task_dir_present=os.path.exists(f"/proc/{pid}/task"),
+            pid_liveness_probe="os.kill(pid, 0)",
+            pid_liveness_result=alive,
+            predicate=(
+                "PID LIVENESS ONLY: a claim is stale when os.kill(pid, 0) raises. The "
+                "tid and tid_starttime are recorded but CANNOT be evaluated."
+            ),
+            limitation=(
+                "This is strictly weaker and reinstates the hazard the tid was introduced "
+                "for: a publisher thread that died inside a still-running process leaves a "
+                "claim naming a LIVE pid, so no publisher serves that session again for the "
+                "rest of that process's life. macOS is a developer lane only -- the sandbox "
+                "is Ubuntu 24.04 -- so the degradation is acceptable there and would not be "
+                "in production."
+            ),
+            ok=expect(
+                "S-CLAIM[the non-/proc lane really has no /proc to fall back on]",
+                not os.path.exists(f"/proc/{pid}/task"),
+                "a /proc task directory exists on a platform this branch assumes lacks one",
+            ),
+        )
+
+
 def check_self() -> None:
     """Enforce the plan's own rule on this file: no bare `=name` target anywhere.
 
@@ -1185,6 +2488,22 @@ def check_self() -> None:
         check_stderr_signatures,
         check_adapter_forms,
         check_locale_tab_dependence,
+        # W14's additions. Normative for the same reason: W15's `attach_argv`, W15's
+        # per-window `window-size manual`, W19's resync, and W19b's claim are all
+        # transcribed FROM these, so a bare `=name` here would be copied into a module.
+        check_s_attach,
+        check_s_attach_mechanism,
+        check_s_attach_input,
+        check_s_pane_dead,
+        check_s_pipe,
+        check_s_claim,
+        create_session,
+        read_size,
+        read_attached,
+        # The attach argv itself, which W15 builds in `tmux.py`. omnigent's attach passes an
+        # UNANCHORED `-t` (`ws_bridge.py:492`) -- precisely the form `target.py` forbids --
+        # so this is the one place the rule is most likely to be broken by copying.
+        Attach.__init__,
     ]
     offenders = {}
     for fn in normative:
@@ -1224,6 +2543,15 @@ def main() -> int:
     check_socket_path_limit()
     check_adapter_forms()
     check_locale_tab_dependence()
+    # W14 (Phase 3). S-ATTACH runs first because its first variant is the gate: a negative
+    # result there flips Decision A to a `pipe-pane` sink and changes W15, W19, ADR-9 and
+    # ADR-10, so it should be the first thing a reader of this output sees fail.
+    check_s_attach()
+    check_s_attach_mechanism()
+    check_s_attach_input()
+    check_s_pane_dead()
+    check_s_pipe()
+    check_s_claim()
 
     emit(
         "SUMMARY",

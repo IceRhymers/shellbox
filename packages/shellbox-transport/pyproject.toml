@@ -1,0 +1,24 @@
+[project]
+name = "shellbox-transport"
+version = "0.1.0"
+description = "Shellbox transport protocol: Frame, codec, and epoch-scoped sequencing. Pure."
+requires-python = ">=3.12"
+# EMPTY, and it must stay empty. This package is the part the sandbox half and the App half
+# genuinely share, so anything installed here is installed in both. `websockets` belongs to
+# whichever half opens a socket (`shellbox-mcp` for the client, the App for the server); the
+# MCP SDK, the Databricks SDK, and the tmux adapter belong to `shellbox-mcp` alone.
+#
+# `shellbox-registry` is the precedent: its three dependencies are deliberately SDK-free, and
+# that is what lets local-Postgres CI, `NullRegistry`, and the whole test suite run with no
+# Databricks install. The true analogue of that here is `codec.py` plus `seq.py`.
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shellbox_transport"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"

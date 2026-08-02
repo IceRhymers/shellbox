@@ -204,6 +204,75 @@ had `databricks sandbox` run inside it. Until then:
 
 ---
 
+## 6. The App is DEPLOYED, and it relays a frame through the real edge
+
+Date: **2026-08-02**. App `shellbox` on `fevm-west` →
+`https://shellbox-7474657232613476.aws.databricksapps.com`. Reproduce with
+`scripts/deploy-app.sh --profile fevm-west --verify`.
+
+This closes the step `packages/shellbox-app/src/requirements.txt` had carried as **unverified**
+since `#15`, and it is `W24`'s first half. It needs **no credential-chain work**: the Apps edge
+authenticates a workspace user directly, so this half was always doable from the laptop, and doing
+it first means `W24`'s live run is a pure credential problem rather than a mixed one.
+
+### What the packaging fix actually is
+
+`shellbox_transport` is a uv **workspace** package: `shellbox-app/pyproject.toml` resolves it via
+`[tool.uv.sources] { workspace = true }`, which pip on the Apps runtime knows nothing about. It
+reads `requirements.txt`, finds no `shellbox-transport` on any index, and the App boots into
+`ModuleNotFoundError`. The fix is to flatten both packages into one root:
+
+```
+<root>/app.yaml  requirements.txt  shellbox_app/  shellbox_transport/
+```
+
+`python -m shellbox_app` puts that root on `sys.path`, so the sibling resolves as an ordinary
+import — no wheel, no editable install, no `sys.path` manipulation inside the app.
+
+**Proved against a venv holding only `fastapi`, `uvicorn` and `websockets`**, where
+`import shellbox_app` raises `ModuleNotFoundError` before the copy and serves after it. That
+negative control is the assertion that matters: a check run inside the repo passes on the local
+editable install no matter what was staged, which is why `deploy-app.sh` runs it under
+`uv run --no-project`.
+
+### Measured at the edge
+
+| | |
+|---|---|
+| `GET /` unauthenticated | **302** to `/oidc/oauth2/v2.0/authorize` |
+| `GET /` with a workspace OAuth token | **200**, `{"service":"shellbox-app","sessions":0,...}` |
+| `wss://…/subscribe/<id>` | **101**, `gap-auth: tanner.wendland@databricks.com`, in **778–967 ms** |
+| `wss://…/publish/<id>` | **101**, `hello` carrying `viewer_email` |
+| publisher → App → subscriber | **89–167 ms** for a real frame, byte-exact, identity preserved |
+
+The `viewer_email` on the publisher's `hello` is `X-Forwarded-Email` surviving the upgrade — D5
+identity **display**, never authorization, and this is the first time it has been observed
+end to end rather than simulated.
+
+`W18` is therefore verified in production: accept, bind, `hello`, and relay all work at the edge.
+
+### Two things worth knowing before `W24`
+
+**The global session id survives the edge's path routing.** The check deliberately uses
+`livecheck-host:build` — the colon-bearing `<host_id>:<tmux_name>` shape `W23` made the wire
+identity. A `:` in a URL path segment is legal but not universally handled, and discovering
+otherwise during the live run would have been discovering it too late.
+
+**The first upgrade costs ~800 ms, and it is the UPGRADE and not the relay.** Once open, a frame
+crosses in under 170 ms. That gap matters for `R25`'s reconnect storm: after an edge kill every
+publisher pays the ~800 ms handshake simultaneously, so the storm's cost is dominated by
+handshakes rather than by throughput. `W24` should measure it with more than one publisher.
+
+### Not proven here
+
+**No pty, no sandbox, no tmux.** Both sockets were dialled from the laptop by a workspace user. A
+sandbox publisher needs the OAuth grant, which is the credential chain, which still needs a
+browser. **And nothing here waited out an edge kill** — the sockets were open for seconds, where
+`probe/FINDINGS.md` measured the kill arriving every 10–18 minutes. Reconnect-with-resume against
+the real edge remains `W24`'s and is untouched by this run.
+
+---
+
 ## Not yet run
 
 | | What | Blocked on |

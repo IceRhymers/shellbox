@@ -13,9 +13,13 @@ fmt:
 	uv run ruff format packages tests
 	uv run ruff check --fix packages tests
 
+# `shellbox-app` is on this list because it is a DELIVERABLE, not a diagnostic script. The
+# exclusion above is written for spike/ and probe/, and it does not extend to a package the
+# integration lane exercises and a live run deploys.
 lint:
 	uv run ruff check packages tests
-	uv run mypy packages/shellbox-mcp/src packages/shellbox-registry/src
+	uv run mypy packages/shellbox-mcp/src packages/shellbox-registry/src \
+		packages/shellbox-transport/src packages/shellbox-app/src
 
 test:
 	uv run pytest

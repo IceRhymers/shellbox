@@ -1,0 +1,13 @@
+# The Databricks Apps requirement set. Mirrors `probe/requirements.txt`, whose comment records
+# the measurement this file depends on.
+#
+# fastapi and uvicorn are preinstalled on the Apps runtime. `websockets` is NOT, and uvicorn
+# needs it to serve the WebSocket handshake at all -- without it the upgrade fails inside the
+# App, and a caller reads that as the edge blocking WebSockets. The Phase 1 probe avoided that
+# misdiagnosis by declaring it, and so does this.
+websockets
+
+# CRITICAL: `shellbox_transport` is a workspace package and pip cannot resolve it from here.
+# The deploy step must place it at the deploy root beside `shellbox_app/`. Nothing in this repo
+# has deployed this App yet, so treat that step as unverified until a live run commits its
+# findings, in the pattern `probe/FINDINGS.md` and `spike/FINDINGS.md` set.

@@ -403,6 +403,15 @@ class Publisher:
             await self._bridge.run()
         except asyncio.CancelledError:
             logger.info("publisher for session %s cancelled by shutdown", self._tmux_name)
+        finally:
+            # CRITICAL: **This runs AFTER the cancellation above has been caught**, which is
+            # the whole reason it is here and not inside ``run``'s own ``finally``. A
+            # cancellation is delivered once; having absorbed it, this coroutine's awaits
+            # behave normally, so the socket close actually completes. Cleanup that awaits
+            # while a cancellation is still propagating does not, and the App measured the
+            # difference: a stale publisher binding that outlived its publisher by 30 seconds
+            # and made the session unpublishable by its own successor.
+            await self._bridge.aclose()
 
     def _release(self, claim: Claim) -> None:
         """Release the claim, best effort. Never raises, and never required for correctness.

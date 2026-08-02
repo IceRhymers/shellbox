@@ -288,15 +288,25 @@ def test_re_acquiring_a_session_this_publisher_already_holds_succeeds() -> None:
 
 
 class FakeBridge:
-    """A bridge whose ``run`` blocks until cancelled, recording its closes.
+    """A bridge whose ``run`` blocks until cancelled, recording both of its teardown calls.
 
     ``close`` counts rather than flags because the ordering claim is about it being called at
     all under each failure -- and because it is documented idempotent, so being called twice is
     correct rather than a defect worth failing on.
+
+    CRITICAL: **``aclose`` must exist here, and its absence was not a failing test.** An earlier
+    revision of this fake omitted it, so ``_serve``'s teardown raised ``AttributeError`` on every
+    test in this file -- and every test still PASSED, because ``close`` is also called from
+    ``_run``'s ``finally`` and that is all they asserted on. The error went into ``publisher
+    .error``, which nothing read. So the whole suite was exercising the failure path of the one
+    method that fixes the 30-second stale publisher binding. ``test_a_publisher_that_wins...``
+    below now asserts ``error is None`` for exactly that reason: a fake that has drifted from
+    the real bridge's surface must fail rather than quietly pass.
     """
 
     def __init__(self, *, hangs: bool = False, returns: bool = False) -> None:
         self.closes = 0
+        self.acloses = 0
         self.started = threading.Event()
         self._hangs = hangs
         self._returns = returns
@@ -314,6 +324,9 @@ class FakeBridge:
 
     def close(self) -> None:
         self.closes += 1
+
+    async def aclose(self) -> None:
+        self.acloses += 1
 
 
 def test_the_publisher_claims_before_it_builds_a_bridge() -> None:
@@ -340,8 +353,13 @@ def test_the_publisher_claims_before_it_builds_a_bridge() -> None:
         publisher.stop(timeout=2.0)
 
 
-def test_a_publisher_that_wins_runs_the_bridge_and_stop_closes_the_pty() -> None:
-    """The ordinary shutdown.
+def test_a_publisher_that_wins_runs_the_bridge_and_stop_closes_both_ends() -> None:
+    """The ordinary shutdown, and BOTH halves of it.
+
+    ``close`` reaps the attach child. ``aclose`` closes the socket, and it is what the App can
+    see: without it a stopped publisher stayed bound server-side for 30 seconds, and the App
+    refuses a second publisher while a live one is registered -- so the session was
+    unpublishable by its own successor until TCP eventually noticed.
 
     ``error is None`` is the anti-drift assertion. ``_run`` records anything ``_serve`` raises
     rather than propagating it, so a teardown that raises leaves every other assertion here
@@ -356,6 +374,7 @@ def test_a_publisher_that_wins_runs_the_bridge_and_stop_closes_the_pty() -> None
 
     publisher.stop(timeout=5.0)
     assert bridge.closes >= 1, "the attach child was never reaped"
+    assert bridge.acloses >= 1, "the publisher's socket was never closed, so the App stays bound"
     assert publisher.error is None, f"the publisher's teardown raised: {publisher.error!r}"
 
 

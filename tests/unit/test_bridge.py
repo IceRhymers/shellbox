@@ -58,7 +58,12 @@ from shellbox_transport.codec import (
 )
 from shellbox_transport.seq import REASON_BELOW_FLOOR, REASON_EPOCH_CHANGED, Epoch, RingBuffer
 
-SESSION = "build"
+TMUX_NAME = "build"
+# The GLOBAL wire id, deliberately different from the tmux name and deliberately
+# containing the `:` that `naming.validate_session_name` rejects. Every frame assertion
+# below therefore also proves the local name never reaches the wire, and every adapter
+# response proves the wire id never reaches tmux.
+SESSION = "itest-host:build"
 INCARNATION = "11111111-2222-4333-8444-555555555555"
 REPAINT = "\x1b[2J\x1b[31mred\x1b[39m pane"
 
@@ -74,11 +79,11 @@ def tmux(*, pane_dead: str = "0") -> TmuxAdapter:
         if "capture-pane" in argv:
             return result(stdout=REPAINT)
         if "display-message" in argv and argv[-1] == _PANE_DEAD_FORMAT:
-            return result(stdout=f"{SESSION}\t{pane_dead}\n")
+            return result(stdout=f"{TMUX_NAME}\t{pane_dead}\n")
         if "display-message" in argv:
             # `_READ_FIELDS`: width, height, pane_dead, history_size, history_limit, incarnation.
-            return result(stdout=f"{SESSION}\t120\t40\t{pane_dead}\t10\t20000\t{INCARNATION}\n")
-        return result(stdout=f"{SESSION}\t{INCARNATION}\n")
+            return result(stdout=f"{TMUX_NAME}\t120\t40\t{pane_dead}\t10\t20000\t{INCARNATION}\n")
+        return result(stdout=f"{TMUX_NAME}\t{INCARNATION}\n")
 
     return TmuxAdapter(
         TmuxConfig(socket_path="/tmp/sbx-bridge.sock"), runner=RecordingRunner(respond=respond)
@@ -206,6 +211,7 @@ def build(
         tmux(pane_dead=pane_dead),
         transport,  # type: ignore[arg-type]
         SESSION,
+        tmux_name=TMUX_NAME,
         epoch=epoch,
         attach=lambda: pty,
         ring=ring,
@@ -228,6 +234,50 @@ async def run_until_done(bridge: PtyBridge, *, timeout: float = 5.0) -> None:
 # --------------------------------------------------------------------------------------
 # Output: pane bytes become frames, and the ring records them either way
 # --------------------------------------------------------------------------------------
+
+
+def test_the_wire_id_never_reaches_tmux_and_the_tmux_name_never_reaches_the_wire() -> None:
+    """The `W23` correction, pinned. **These are two different strings and must stay so.**
+
+    They were one parameter until a bridge was wired to a real App. ``session_id`` is the
+    global ``<host_id>:<tmux_name>``, which contains a ``:`` that
+    ``naming.validate_session_name`` rejects -- so passing it to an adapter raises
+    ``InvalidName``, and the only way the old signature could work was to put a bare tmux name
+    on the wire. Two sandboxes each holding a session called ``build`` would then collide on
+    one App: the second either refused as a conflict, or REBOUND to the first's attachment and
+    served a viewer somebody else's terminal. ``hello`` cannot catch it, because both sides
+    agree on the string.
+
+    Asserted in both directions because each is a separate mistake with a separate symptom: a
+    wire id reaching tmux fails loudly at the adapter, while a tmux name reaching the wire
+    fails silently and crosses two agents' terminals.
+    """
+    pty = FakePty()
+    transport = FakeTransport()
+    adapter = tmux()
+    bridge = PtyBridge(
+        adapter,
+        transport,  # type: ignore[arg-type]
+        SESSION,
+        tmux_name=TMUX_NAME,
+        attach=lambda: pty,
+        clock=_ticking(),  # type: ignore[arg-type]
+    )
+
+    anyio.run(_drive, bridge, transport, pty, [b"pane output"])
+
+    assert transport.published, "nothing was published, so neither direction is proven"
+    for frame in transport.published:
+        assert frame.session_id == SESSION, "a frame carried something other than the wire id"
+
+    runner = adapter._run_command  # noqa: SLF001 -- structural assertion over the argv built
+    assert isinstance(runner, RecordingRunner)
+    argv_seen = [argv for argv, _ in runner.calls]
+    assert argv_seen, "no tmux command ran, so the tmux direction is unproven"
+    for argv in argv_seen:
+        joined = " ".join(argv)
+        assert SESSION not in joined, f"the WIRE id reached tmux: {joined!r}"
+        assert TMUX_NAME in joined, f"a tmux command named neither: {joined!r}"
 
 
 def test_each_pty_read_becomes_one_ordered_stdout_frame() -> None:
@@ -378,7 +428,7 @@ def test_the_ceiling_is_the_one_the_tool_path_uses() -> None:
     """
     pty = FakePty()
     adapter = tmux()
-    bridge = PtyBridge(adapter, FakeTransport(), SESSION, attach=lambda: pty)  # type: ignore[arg-type]
+    bridge = PtyBridge(adapter, FakeTransport(), SESSION, tmux_name=TMUX_NAME, attach=lambda: pty)  # type: ignore[arg-type]
     bridge.attach()
     limit = adapter.config.max_send_line_bytes
 
@@ -580,7 +630,7 @@ def test_a_session_that_no_longer_resolves_reads_as_terminal_gone() -> None:
         TmuxConfig(socket_path="/tmp/sbx-bridge.sock"),
         runner=RecordingRunner(default=result(stdout="")),
     )
-    bridge = PtyBridge(adapter, transport, SESSION, attach=lambda: pty)  # type: ignore[arg-type]
+    bridge = PtyBridge(adapter, transport, SESSION, tmux_name=TMUX_NAME, attach=lambda: pty)  # type: ignore[arg-type]
 
     anyio.run(_drive, bridge, transport, pty, [])
 

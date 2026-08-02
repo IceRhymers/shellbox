@@ -89,14 +89,36 @@ class PtyBridge:
         transport: WSTransport,
         session_id: str,
         *,
+        tmux_name: str,
         epoch: Epoch | None = None,
         attach: Callable[[], PtySource] | None = None,
         ring: RingBuffer | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        """Bind a wire identity to a local tmux session. **The two are not the same string.**
+
+        CRITICAL: ``session_id`` is the GLOBAL ``<host_id>:<tmux_name>`` from
+        ``naming.session_id`` -- what goes on every ``Frame``, what the App binds an attachment
+        to, and what ``hello`` echoes back for the client to compare. ``tmux_name`` is the LOCAL
+        session name this host's tmux server knows, and it is the only one an adapter call may
+        receive.
+
+        They were one parameter until `W23` wired a bridge to a real App and found they cannot
+        be: ``naming.validate_session_name`` rejects ``:``, so a global id passed to
+        ``prepare_attach`` raises ``InvalidName`` -- which meant the wire could only ever carry
+        a bare tmux name. Two sandboxes each holding a session called ``build`` would then dial
+        the same ``/publish/build``, and the second would either be refused as a conflict or
+        REBIND to the first's attachment and serve a viewer somebody else's terminal. The
+        ``hello`` check cannot catch that, because both sides agree on the string.
+
+        ``tmux_name`` is keyword-only and required. Two adjacent string parameters are a swap
+        waiting to happen, and a swap here is silent: both are plausible names, and the failure
+        surfaces as a session that cannot be found on a host that does have it.
+        """
         self._adapter = adapter
         self._transport = transport
         self._session_id = session_id
+        self._tmux_name = tmux_name
         # One epoch per attach, minted here because an attach is what an epoch identifies. A
         # subscriber that sees an unfamiliar one knows `seq` restarted, which is the whole of
         # what ADR-12 buys -- post-hoc misdelivery DETECTION, exactly as `@shellbox_incarnation`
@@ -181,6 +203,28 @@ class PtyBridge:
         """
         if self._pty is None:
             self._pty = self._attach()
+
+    async def aclose(self) -> None:
+        """Close the SOCKET and then the pty. The shutdown path's deterministic teardown.
+
+        ``close()`` below reaps the attach child and is synchronous, which is what makes it
+        callable from the main thread after a loop has stopped. It cannot close the socket,
+        because closing a WebSocket is an ``await``. So the two are separate, and a shutdown
+        that still has a live loop calls this one -- which does both, in the order that matters.
+
+        Socket first: the App refuses a second publisher while a live one is registered, so
+        until this returns the session is unpublishable by anyone else. The pty can wait a
+        few milliseconds; the binding cannot.
+
+        See ``WSTransport.aclose`` for the measurement that made this necessary -- the App held
+        a stale publisher binding for 30 seconds after a stop, because the generator cleanup it
+        used to rely on was reached through a cancellation.
+        """
+        try:
+            if self._transport is not None:
+                await self._transport.aclose()
+        finally:
+            self.close()
 
     def close(self) -> None:
         """Close the pty and reap the attach child. Idempotent, and safe to call from anywhere.
@@ -298,7 +342,7 @@ class PtyBridge:
         direction of the two: a session that is gone certainly has nothing left to watch, while
         reporting it as a detach would leave a viewer reconnecting to nothing forever.
         """
-        dead = await asyncio.to_thread(self._adapter.pane_dead, self._session_id)
+        dead = await asyncio.to_thread(self._adapter.pane_dead, self._tmux_name)
         reason = CLOSED_DETACHED if dead is False else CLOSED_TERMINAL_GONE
         logger.info("session %s stream ended: %s", self._session_id, reason)
         async with self._lock:
@@ -472,7 +516,7 @@ class PtyBridge:
         repaint, which is a picture of a rendered screen -- and specifically NOT acceptable on
         the live path, which is why that one never goes near ``str``.
         """
-        read = await asyncio.to_thread(self._adapter.read, self._session_id, lines=0)
+        read = await asyncio.to_thread(self._adapter.read, self._tmux_name, lines=0)
         return read.content.encode("utf-8")
 
     # -- the real attach -----------------------------------------------------------------
@@ -491,9 +535,9 @@ class PtyBridge:
         alternative was a new tmux read path, and Principle 5 puts a new form in the spike
         first.
         """
-        argv = self._adapter.prepare_attach(self._session_id)
+        argv = self._adapter.prepare_attach(self._tmux_name)
         pty = AttachedPty.spawn(argv, self._adapter.attach_env())
-        size = self._adapter.read(self._session_id, lines=0)
+        size = self._adapter.read(self._tmux_name, lines=0)
         if size.cols > 0 and size.rows > 0:
             pty.set_window_size(size.cols, size.rows)
         return pty

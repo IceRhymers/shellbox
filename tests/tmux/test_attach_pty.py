@@ -276,7 +276,13 @@ def test_an_over_ceiling_line_is_refused_before_it_reaches_the_pane(
     # The transport is `None` on purpose: `send_input` is synchronous and touches no socket, so
     # a bridge that never runs is the whole of what this needs. Passing a double would suggest
     # the socket were involved in the decision, and it is not.
-    bridge = PtyBridge(adapter, None, "build", attach=lambda: pty)  # type: ignore[arg-type]
+    bridge = PtyBridge(
+        adapter,
+        None,  # type: ignore[arg-type]
+        "itest-host:build",
+        tmux_name="build",
+        attach=lambda: pty,
+    )
     bridge.attach()
     over = b"z" * adapter.config.max_send_line_bytes + b"\n"
 

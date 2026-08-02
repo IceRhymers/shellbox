@@ -186,6 +186,19 @@ class WSTransportConfig:
     ping_interval: float = _DEFAULT_PING_INTERVAL
     ping_timeout: float = _DEFAULT_PING_TIMEOUT
     open_timeout: float = 10.0
+    close_timeout: float = 2.0
+    """How long a graceful close may wait for the peer's half of the handshake.
+
+    Passed EXPLICITLY, like every other keepalive value here, and deliberately shorter than
+    the library's measured default of 10 s. `W23` found why it matters: the shutdown path
+    closes this socket so the App releases the publisher binding, and at the default the
+    publisher's thread then sat in the close handshake long enough to miss its own join --
+    so ``Publisher.stop`` reported a thread that would not stop, on a shutdown that had in
+    fact already done the one thing that mattered.
+
+    Short rather than zero because a graceful close is still worth attempting: it is what
+    makes the App release the binding in the same millisecond instead of waiting on TCP."""
+
     hello_deadline: float = 5.0
     """How long a 101 has to become a ``hello``. Bounded rather than absent: a server that
     completes the upgrade and then sends nothing must leave the client NOT connected, and a
@@ -317,6 +330,20 @@ class WSTransport:
         # for two instances constructed a millisecond apart.
         self._rng = rng if rng is not None else random.Random()
         self._connection: ClientConnection | None = None
+        """The socket ``publish`` may send on. Cleared between dials, so a frame is never
+        written into a socket the loop has already left behind."""
+
+        self._open_socket: ClientConnection | None = None
+        """The socket ``aclose`` must close. A SECOND reference, deliberately, and the two
+        differ in exactly one way: this one is cleared when the socket is actually closed
+        rather than when it stops being publishable.
+
+        They were one field until `W23` measured what that costs. ``connect_forever``'s
+        ``finally`` clears ``_connection`` as it leaves the yield -- which happens on the
+        cancellation path too, BEFORE the generator's own ``aclose`` has closed the socket, and
+        that ``aclose`` is then cut short. So the shutdown path found ``None``, closed nothing,
+        and the App went on holding the publisher binding for 30 seconds with the session
+        unpublishable by its own successor."""
 
     @property
     def detector(self) -> str:
@@ -406,6 +433,7 @@ class WSTransport:
             auth_remints = 0
             attempt = 0
             self._connection = connected.connection
+            self._open_socket = connected.connection
             try:
                 yield connected
             finally:
@@ -428,6 +456,7 @@ class WSTransport:
             # application-level ping, and `tests/unit/test_no_keepalive.py` asserts that.
             ping_interval=self._config.ping_interval,
             ping_timeout=self._config.ping_timeout,
+            close_timeout=self._config.close_timeout,
         )
         try:
             hello = await self._await_hello(connection)
@@ -505,6 +534,37 @@ class WSTransport:
         if connection is None:
             raise TransportTerminal(Failure.PROTOCOL, "publish called with no live connection")
         await connection.send(encode_frame(frame))
+
+    async def aclose(self) -> None:
+        """Close the live socket, if there is one. Idempotent, and safe to call twice.
+
+        CRITICAL: **This exists because generator cleanup during cancellation is not
+        dependable, and the App can tell.** ``connect_forever`` closes its socket in a
+        ``finally``, which is correct when the loop ends on its own -- but a publisher stopped
+        by ``W19b``'s shutdown path is CANCELLED, and awaits reached that way can be cut short
+        before ``aclose`` completes. Measured in the loopback lane (`W23`): the App still held
+        the publisher bound **30 seconds** after ``Publisher.stop()`` returned.
+
+        That is not untidiness. The App refuses a second publisher while a live one is
+        registered, so a publisher that restarts -- an MCP process rotating, an agent
+        restarting -- is answered ``publisher_conflict`` for as long as the stale binding
+        survives, and nothing on the server side expires it. The session simply stops being
+        publishable.
+
+        So the shutdown path closes the socket EXPLICITLY rather than hoping the generator got
+        there, and it does so from a context that has already caught its cancellation.
+        """
+        self._connection = None
+        connection, self._open_socket = self._open_socket, None
+        if connection is None:
+            return
+        try:
+            # Bounded here as well as at the dial, because this runs on the shutdown path and a
+            # shutdown that can hang is one an operator kills -- which orphans the attach child
+            # this whole sequence exists to reap.
+            await asyncio.wait_for(connection.close(), timeout=self._config.close_timeout)
+        except (Exception, TimeoutError) as exc:  # noqa: BLE001 - already gone is the goal
+            logger.debug("closing the transport socket for %s: %s", self._config.session_id, exc)
 
     async def receive(self, connection: ClientConnection) -> AsyncIterator[Frame]:
         """Yield inbound frames -- the server's input and resize control frames.

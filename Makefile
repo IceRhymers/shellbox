@@ -37,11 +37,23 @@ test:
 test-tmux:
 	python3 spike/tmux_spike.py
 	uv run pytest tests/tmux -v
-	@# A skip here means no tmux binary, which in this target is a failure, not a pass:
-	@# a silently skipped gate is indistinguishable from a green one.
-	@uv run pytest tests/tmux -q 2>&1 | tee /tmp/shellbox-tmux.txt | tail -1
-	@if grep -qE '[0-9]+ skipped' /tmp/shellbox-tmux.txt; then \
+	@# A skip for a MISSING TMUX is a failure in this target, not a pass: a silently skipped
+	@# gate is indistinguishable from a green one.
+	@#
+	@# It greps the skip REASON rather than counting skips. The count was a proxy for "no
+	@# binary", and it stopped being one the first time a test skipped for a different
+	@# reason -- W19b's claim cases, which need `/proc` and so cannot run on the macOS
+	@# developer lane. Counting would have failed this target on a machine where the gate
+	@# had in fact run, which trains people to ignore it. `-rs` prints the reasons.
+	@uv run pytest tests/tmux -q -rs 2>&1 | tee /tmp/shellbox-tmux.txt | tail -1
+	@if grep -q 'tmux binary not available' /tmp/shellbox-tmux.txt; then \
 		echo "ERROR: tests/tmux SKIPPED -- no tmux binary on PATH (or SHELLBOX_TMUX_BIN unset)."; \
+		exit 1; \
+	fi
+	@# And the anti-vacuous half, which the count did give for free: a lane that collected
+	@# nothing must not report success.
+	@if ! grep -qE '[0-9]+ passed' /tmp/shellbox-tmux.txt; then \
+		echo "ERROR: tests/tmux ran no tests at all."; \
 		exit 1; \
 	fi
 

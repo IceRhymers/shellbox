@@ -22,8 +22,11 @@ import anyio
 from conftest import TmuxServer, requires_tmux
 from harness import Outcome, call, make_harness, run_calls
 from mcp.shared.memory import create_connected_server_and_client_session
+from shellbox_mcp.bridge import PtyBridge
 from shellbox_mcp.config import Settings
 from shellbox_mcp.server import build_server
+from shellbox_mcp.transport import WSTransport
+from shellbox_transport.seq import RingBuffer
 
 pytestmark = requires_tmux
 
@@ -131,6 +134,54 @@ def test_nothing_the_server_holds_remembers_a_session(
         held += [(f"{tool.name} closure", cell) for cell in _closure_values(tool.fn)]
     for where, value in held:
         assert name not in repr(value), f"{where} remembers the session name: {value!r}"
+
+
+def test_no_transport_object_is_reachable_from_the_server(
+    tmux_server: TmuxServer, tmp_path: Path
+) -> None:
+    """T-NO-TRANSPORT-STATE. Phase 3 adds a ring and a socket, and neither may live here.
+
+    The test above catches a session NAME. This catches the objects the transport introduced,
+    which are a different hazard: a ``RingBuffer`` holds frames, a ``WSTransport`` holds a
+    socket, and a ``PtyBridge`` holds both plus a pty. Any of them reachable from the server
+    would be per-session state in a process that is one of 1-32 -- so a second process would
+    answer from a ring that describes a stream it never carried.
+
+    CRITICAL: **The subject is the RING, not the epoch** (Decision C). An epoch is an
+    identifier a subscriber uses pessimistically -- "unfamiliar, so distrust everything and
+    repaint" -- and identifiers are exactly what this design does keep, in tmux, where the
+    authority is. The ring is an answer to "what did I send down this socket", which only the
+    publisher that sent it can answer, and which is worthless to any other process.
+
+    Structural rather than behavioral, for the reason the previous test gives: this catches
+    state that is merely POPULATED, before it has caused a bug.
+    """
+    harness = make_harness(tmux_server, tmp_path)
+    server = build_server(Settings.from_env(harness.env))
+
+    async def main() -> Outcome:
+        async with create_connected_server_and_client_session(server) as client:
+            return await call(client, "shell_create", {"name": "transport", "cwd": str(tmp_path)})
+
+    assert anyio.run(main).data["created"] is True
+
+    held: list[tuple[str, object]] = [
+        (f"attribute {attribute}", value) for attribute, value in vars(server).items()
+    ]
+    for tool in server._tool_manager.list_tools():  # noqa: SLF001 -- structural test
+        held += [(f"{tool.name} closure", cell) for cell in _closure_values(tool.fn)]
+
+    forbidden = (RingBuffer, PtyBridge, WSTransport)
+    for where, value in held:
+        assert not isinstance(value, forbidden), (
+            f"{where} holds a {type(value).__name__}. Transport state in an MCP process is "
+            f"wrong the moment another of the 1-32 processes acts."
+        )
+        # And by name, so a wrapper or a container holding one is caught too -- `repr` is what
+        # the sibling test uses for the same reason.
+        rendered = repr(value)
+        for banned in ("RingBuffer", "PtyBridge", "WSTransport", "AttachedPty"):
+            assert banned not in rendered, f"{where} reaches a {banned}: {rendered!r}"
 
 
 def _closure_values(fn: object, depth: int = 2) -> list[object]:

@@ -8,6 +8,16 @@
 websockets
 
 # CRITICAL: `shellbox_transport` is a workspace package and pip cannot resolve it from here.
-# The deploy step must place it at the deploy root beside `shellbox_app/`. Nothing in this repo
-# has deployed this App yet, so treat that step as unverified until a live run commits its
-# findings, in the pattern `probe/FINDINGS.md` and `spike/FINDINGS.md` set.
+# The deploy step must place it at the deploy root beside `shellbox_app/`.
+#
+# VERIFIED 2026-08-02 against `fevm-west`, and the mechanism is in `scripts/deploy-app.sh` so
+# it is a script rather than tribal knowledge. `transport/FINDINGS.md` §6 records the run. The
+# flattened root is the whole of the fix -- no editable install, no wheel, no `pip install -e`:
+#
+#     <root>/app.yaml  requirements.txt  shellbox_app/  shellbox_transport/
+#
+# It works because `python -m shellbox_app` puts the deploy root on `sys.path`, so a sibling
+# top-level package resolves as an ordinary import. Proved against a venv holding ONLY
+# fastapi/uvicorn/websockets, where `import shellbox_app` fails before the copy and serves
+# after it -- which is the assertion that would catch a root silently relying on a local
+# install.

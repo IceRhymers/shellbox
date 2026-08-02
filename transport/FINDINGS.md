@@ -46,7 +46,60 @@ also lacks it, so this is not a "not yet backported" situation.
 Also relevant to (b), from the same help text: *"If a profile with the given name already exists,
 **it is updated**. Otherwise a new profile is created."* So `auth login` mutates an existing
 profile. The help does **not** say whether it preserves or clears an existing `token =`, which is
-exactly what the `W20` ordering question turns on. **Not yet measured.**
+exactly what the `W20` ordering question turns on. See (b) below.
+
+---
+
+## S-LOGIN (b) — Does the login preserve an existing `token =`? **No. It replaces the stanza.**
+
+WARNING: **Operator knowledge, not measured by this run.** Answered by @IceRhymers from prior
+experience with the CLI, and recorded here so `W20` can be designed against it. It carries the same
+status as the PID 1 environment claim in §3 below — *documented, not verified* — and wants an
+in-sandbox confirmation on **v1.7.0** before `W20` is called done. It is written down now because
+the answer resolves `W20`'s ordering, and a design blocked on a browser step should not also be
+blocked on re-deriving something already known.
+
+The answer: running `databricks auth login` against a profile that carries a `token =` **overwrites
+that profile**, rewriting it as an OAuth profile with `auth_type = databricks-cli`. The PAT does not
+survive. Combined with (a)'s help-text quote, the behavior is *update the matching profile in place*,
+and the update is a replacement rather than a merge.
+
+**Consequences — this is the good branch, and `W20` shrinks.**
+
+* **The PAT removal is a side effect of the login, not a separate `reset_pat` call.** The `W20` row
+  left both open and said the answer follows from (b). It is the former.
+* **There is no credential-less window at all.** Removal and acquisition are the same write, so the
+  ordering the plan kept trying to get right stops being a sequencing problem. This is the upside
+  the `S-LOGIN` row named as possible; it landed.
+* **`ADR-14`'s hazard dissolves rather than being mitigated.** Its trap was that `credential_less_cfg`
+  writes a whole-file `[DEFAULT]`, so writing it *is* the removal. The resolution is to **never write
+  it pre-login** for that stanza — the CLI produces the credential-less form itself, on success.
+* **§0.6's chosen shape is confirmed by the tool rather than guessed.** `credential_less_cfg` is
+  specified to write `auth_type = databricks-cli`, which is exactly what the CLI writes. That matters
+  for `--restore-grant` and for `doctor`, which both have to recognise the state the CLI leaves.
+
+**The residual question, and it is the one that decides whether `ADR-14`'s invariant survives.**
+
+Does the rewrite happen **on success only**, or on **attempt**?
+
+* *Success only* — a failed or abandoned login leaves the PAT intact. `ADR-14`'s invariant holds:
+  "nothing is removed until a grant verifies, so a half-finished login leaves a working sandbox."
+* *On attempt* — the credential-less window returns on the **worst** path. Walking away from the
+  browser prompt would leave the sandbox with no PAT and no grant, and `ADR-14`'s invariant would
+  have to be re-established by `W20` itself (back up the stanza, restore it if the login does not
+  verify).
+
+This is cheap and needs no sandbox: point `DATABRICKS_CONFIG_FILE` at a scratch file containing a
+`[DEFAULT]` with a `token =`, start a login, **abandon it at the browser**, and read the file back.
+Do it against a scratch path rather than the real `~/.databrickscfg` — the login rewrites whatever
+config it resolves, and the laptop's copy holds the working profiles this file's header names.
+
+**Also still unconfirmed, and both are about *where* rather than *what*.** The sandbox's
+`~/.databrickscfg` is a **symlink into `/run/lakebox/`** (§1), so the login's write lands on a path
+that is wiped between boots — the grant does not survive a reboot on the cfg side either, which is
+`W21`'s problem and not solved by this answer. And §3 measured that an sshd-spawned shell inherits
+neither config override, so which file the CLI resolves depends on how the shell was started;
+`W20b`'s verification should assert the resolved path rather than assume `~/.databrickscfg`.
 
 ---
 
@@ -151,11 +204,81 @@ had `databricks sandbox` run inside it. Until then:
 
 ---
 
+## 6. The App is DEPLOYED, and it relays a frame through the real edge
+
+Date: **2026-08-02**. App `shellbox` on `fevm-west` →
+`https://shellbox-7474657232613476.aws.databricksapps.com`. Reproduce with
+`scripts/deploy-app.sh --profile fevm-west --verify`.
+
+This closes the step `packages/shellbox-app/src/requirements.txt` had carried as **unverified**
+since `#15`, and it is `W24`'s first half. It needs **no credential-chain work**: the Apps edge
+authenticates a workspace user directly, so this half was always doable from the laptop, and doing
+it first means `W24`'s live run is a pure credential problem rather than a mixed one.
+
+### What the packaging fix actually is
+
+`shellbox_transport` is a uv **workspace** package: `shellbox-app/pyproject.toml` resolves it via
+`[tool.uv.sources] { workspace = true }`, which pip on the Apps runtime knows nothing about. It
+reads `requirements.txt`, finds no `shellbox-transport` on any index, and the App boots into
+`ModuleNotFoundError`. The fix is to flatten both packages into one root:
+
+```
+<root>/app.yaml  requirements.txt  shellbox_app/  shellbox_transport/
+```
+
+`python -m shellbox_app` puts that root on `sys.path`, so the sibling resolves as an ordinary
+import — no wheel, no editable install, no `sys.path` manipulation inside the app.
+
+**Proved against a venv holding only `fastapi`, `uvicorn` and `websockets`**, where
+`import shellbox_app` raises `ModuleNotFoundError` before the copy and serves after it. That
+negative control is the assertion that matters: a check run inside the repo passes on the local
+editable install no matter what was staged, which is why `deploy-app.sh` runs it under
+`uv run --no-project`.
+
+### Measured at the edge
+
+| | |
+|---|---|
+| `GET /` unauthenticated | **302** to `/oidc/oauth2/v2.0/authorize` |
+| `GET /` with a workspace OAuth token | **200**, `{"service":"shellbox-app","sessions":0,...}` |
+| `wss://…/subscribe/<id>` | **101**, `gap-auth: tanner.wendland@databricks.com`, in **778–967 ms** |
+| `wss://…/publish/<id>` | **101**, `hello` carrying `viewer_email` |
+| publisher → App → subscriber | **89–167 ms** for a real frame, byte-exact, identity preserved |
+
+The `viewer_email` on the publisher's `hello` is `X-Forwarded-Email` surviving the upgrade — D5
+identity **display**, never authorization, and this is the first time it has been observed
+end to end rather than simulated.
+
+`W18` is therefore verified in production: accept, bind, `hello`, and relay all work at the edge.
+
+### Two things worth knowing before `W24`
+
+**The global session id survives the edge's path routing.** The check deliberately uses
+`livecheck-host:build` — the colon-bearing `<host_id>:<tmux_name>` shape `W23` made the wire
+identity. A `:` in a URL path segment is legal but not universally handled, and discovering
+otherwise during the live run would have been discovering it too late.
+
+**The first upgrade costs ~800 ms, and it is the UPGRADE and not the relay.** Once open, a frame
+crosses in under 170 ms. That gap matters for `R25`'s reconnect storm: after an edge kill every
+publisher pays the ~800 ms handshake simultaneously, so the storm's cost is dominated by
+handshakes rather than by throughput. `W24` should measure it with more than one publisher.
+
+### Not proven here
+
+**No pty, no sandbox, no tmux.** Both sockets were dialled from the laptop by a workspace user. A
+sandbox publisher needs the OAuth grant, which is the credential chain, which still needs a
+browser. **And nothing here waited out an edge kill** — the sockets were open for seconds, where
+`probe/FINDINGS.md` measured the kill arriving every 10–18 minutes. Reconnect-with-resume against
+the real edge remains `W24`'s and is untouched by this run.
+
+---
+
 ## Not yet run
 
 | | What | Blocked on |
 |---|---|---|
-| `S-LOGIN` (b) | What does `databricks auth login` write to `~/.databrickscfg` — which profile, and does it preserve an existing `token =`? Decides `W20`'s ordering | A browser step (no headless flow exists) |
+| `S-LOGIN` (b) **confirm** | The answer above is operator knowledge, not measured. Confirm on **v1.7.0 in-sandbox**, and record the **resolved config path** rather than assuming `~/.databrickscfg` (§1: it is a symlink into `/run/lakebox/`; §3: an ssh shell inherits no override) | A browser step (no headless flow exists) |
+| `S-LOGIN` (b) **success-vs-attempt** | Does the stanza get rewritten **on success only**, or on **attempt**? Decides whether `ADR-14`'s "a half-finished login leaves a working sandbox" still holds, or whether `W20` must back up and restore the stanza itself | Nothing — laptop only, scratch `DATABRICKS_CONFIG_FILE`, ~2 min |
 | `S-REFRESH` (a) | Mint a grant, copy the cache, force a refresh, try the copy — does a copied cache survive rotation? | `S-LOGIN` (b) |
 | `S-REFRESH` (b) | **Restore a stale copy over a live grant — does the live grant survive?** This is the direction that can brick a sandbox, and `R23` is the plan's top risk | `S-REFRESH` (a); wants a throwaway sandbox |
 | `OQ-A` re-check | `~/.databricks/sandbox.json` on a never-developed-in sandbox | A fresh sandbox |

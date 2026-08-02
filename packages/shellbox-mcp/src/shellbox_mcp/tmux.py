@@ -166,6 +166,23 @@ CWD_OPTION = "@shellbox_cwd"
 # extra subprocesses", paid only on the rare cold path where the identity cache is missing.
 HOST_ID_OPTION = "@shellbox_host_id"
 
+# The publisher claim (`ADR-16`, W19b). `<pid>:<tid>:<tid_starttime>` -- digits and colons
+# only, which is what makes it safe to read through the TAB-separated `_display_tail` path
+# that `@shellbox_cwd` is deliberately kept out of.
+#
+# Read through `display-message` and NOT `show-options -v`, and that is a measured choice
+# rather than consistency with `read_host_stamp`. Spike F21 ran both: on a session carrying no
+# claim, `display-message` reports rc=0 with an empty field while `show-options -v` reports
+# **rc=1 with `invalid option:`** -- indistinguishable from a real failure. An absent claim is
+# the ORDINARY case here (it is what every first publisher sees), where an absent host stamp is
+# the rare one, so the two options want opposite read paths.
+PUBLISHER_OPTION = "@shellbox_publisher"
+
+# The shape a claim must have to be evaluated. A value that does not match is treated as
+# ABSENT rather than as a live owner -- the same direction `_own_incarnation` takes, and for
+# the same reason: a claim naming no evaluable owner cannot keep a session locked forever.
+_CLAIM_RE = re.compile(r"\d+:\d+:\d+\Z")
+
 
 class CommandResult(NamedTuple):
     """One tmux invocation's outcome.
@@ -1110,6 +1127,102 @@ class TmuxAdapter:
             logger.warning(
                 "could not stamp %s on session %r: %s",
                 HOST_ID_OPTION,
+                name,
+                result.stderr.strip(),
+            )
+            return False
+        return True
+
+    # -- the publisher claim (W19b) --------------------------------------------------------
+    #
+    # Three thin verbs, and the PROTOCOL that composes them is deliberately not here: it lives
+    # in `publisher.py`, because deciding whether a claim's owner is still alive means reading
+    # `/proc`, and this module's job is tmux forms. What this module owes is that the write is
+    # anchored (R11) and that the read distinguishes "no claim" from "the read failed".
+    #
+    # Like the host stamp, all three are NON-RAISING: a publisher that cannot evaluate a claim
+    # must decline to attach, which is the safe direction, and it must not turn a dead tmux
+    # server into an exception on a background thread nobody is catching for.
+
+    def read_publisher_claim(self, name: str) -> str | None:
+        """The session's ``@shellbox_publisher``, or ``None`` if there is no usable claim.
+
+        ``None`` means "no owner this publisher must yield to" and collapses four cases: no
+        server, no session, no claim, and a claim whose shape cannot have come from shellbox.
+        They collapse because every caller does the same thing with all four -- proceeds to
+        claim the session itself.
+
+        CRITICAL: **A malformed claim reads as absent, and that is the deliberate direction.**
+        The alternative -- treating an unparseable value as a live owner -- would let one junk
+        `set-option` lock a session out of ever being published again, with no way to clear it
+        short of killing the session. The claim's whole safety argument is that it is
+        self-clearing (spike F21c), and a value nobody can evaluate is not self-clearing.
+        """
+        naming.validate_session_name(name)
+        try:
+            raw = self._display_tail(name, f"#{{{PUBLISHER_OPTION}}}")
+        except TmuxError as exc:
+            logger.warning("could not read %s on session %r: %s", PUBLISHER_OPTION, name, exc)
+            return None
+        if raw is None or not raw:
+            return None
+        if not _CLAIM_RE.match(raw):
+            logger.warning(
+                "ignoring %s=%r on session %r: it is not the <pid>:<tid>:<starttime> shape, so "
+                "no publisher can evaluate whether its owner is still running",
+                PUBLISHER_OPTION,
+                raw,
+                name,
+            )
+            return None
+        return raw
+
+    def claim_publisher(self, name: str, claim: str) -> bool:
+        """Write ``claim`` into ``@shellbox_publisher``. False if it could not be written.
+
+        Last-writer-wins, which is all tmux offers -- there is no compare-and-swap, the same
+        limit `_resolve_owned` documents for the send path (R12). Measured over 24 racing
+        trials across both tmux versions (spike F21b): the stored value is always exactly one
+        writer's and never a torn mixture, which is what makes a read-back meaningful. The
+        read-back itself is the caller's, in `publisher.py`.
+        """
+        naming.validate_session_name(name)
+        if not _CLAIM_RE.match(claim):
+            raise ValueError(f"{claim!r} is not the <pid>:<tid>:<starttime> shape")
+        result = self._run("set-option", "-t", target(name), PUBLISHER_OPTION, claim)
+        if result.rc != 0:
+            logger.warning(
+                "could not claim session %r for publisher %s: %s",
+                name,
+                claim,
+                result.stderr.strip(),
+            )
+            return False
+        return True
+
+    def release_publisher_claim(self, name: str, claim: str) -> bool:
+        """Unset ``@shellbox_publisher``, but ONLY if it still holds ``claim``.
+
+        CRITICAL: **The read-back is not an optimization of the release; it is the whole of
+        it.** A departing publisher that unset unconditionally would clobber a SUCCESSOR's
+        fresh claim -- and the successor has already read its own value back, so it is
+        attached and running, and the next publisher to come along would see an empty option
+        and attach as a second one. That is exactly the double-attach the claim exists to
+        prevent, caused by the code meant to prevent it.
+
+        Release is itself only an optimization (`ADR-16`). A dead thread's `/proc` entry
+        vanishes on its own, so the claim is self-clearing and nothing NEEDS to unset it; this
+        exists so an orderly shutdown does not leave a successor waiting on a liveness probe.
+        Returns whether the option was unset.
+        """
+        naming.validate_session_name(name)
+        if self.read_publisher_claim(name) != claim:
+            return False
+        result = self._run("set-option", "-t", target(name), "-u", PUBLISHER_OPTION)
+        if result.rc != 0:
+            logger.debug(
+                "could not release %s on session %r: %s",
+                PUBLISHER_OPTION,
                 name,
                 result.stderr.strip(),
             )

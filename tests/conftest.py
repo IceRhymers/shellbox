@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 import pytest
+from shellbox_mcp.publisher import Claim, claim_is_live
 from shellbox_mcp.tmux import CommandResult, Runner, SubprocessRunner, TmuxAdapter, TmuxConfig
 
 TMUX_BIN = os.environ.get("SHELLBOX_TMUX_BIN") or shutil.which("tmux")
@@ -60,6 +61,38 @@ def await_condition(
             return
         time.sleep(_POLL_INTERVAL)
     raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+
+
+def departed_claim(timeout: float = DEFAULT_TIMEOUT) -> Claim:
+    """A claim written by a thread that has exited, in THIS still-running process.
+
+    W19b's case-3 fixture, and it needs the synchronization model as much as any tmux
+    assertion does. **``Thread.join()`` is not a synchronization point for ``/proc``.** It
+    returns when the thread's Python target has finished; the kernel task is torn down
+    slightly later, and until it is, ``/proc/<pid>/task/<tid>`` still exists and the claim
+    still reads LIVE. Measured on Ubuntu 24.04 / CPython 3.12.3: 3 of 200 joined threads read
+    live immediately after ``join()``, all of them within a millisecond of it.
+
+    So this polls for the property the test is actually about -- the claim has become dead --
+    rather than asserting it once and flaking 1.5% of the time in CI. That is the same rule
+    this file's docstring states for tmux: poll for a condition with a deadline, never sleep
+    for a duration and then assert.
+
+    The production consequence of that window is one sentence long and is in
+    ``claim_is_live``: a successor arriving inside it declines to attach, which is the safe
+    direction, and it is gone by the next attempt.
+    """
+    captured: list[Claim] = []
+    thread = threading.Thread(target=lambda: captured.append(Claim.current()))
+    thread.start()
+    thread.join()
+    claim = captured[0]
+    await_condition(
+        lambda: not claim_is_live(claim),
+        timeout=timeout,
+        what="the departed thread's /proc entry to disappear",
+    )
+    return claim
 
 
 def await_file(

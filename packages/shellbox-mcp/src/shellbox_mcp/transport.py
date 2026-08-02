@@ -51,7 +51,7 @@ import asyncio
 import logging
 import random
 import urllib.parse
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -340,8 +340,13 @@ class WSTransport:
         separator = "&" if urllib.parse.urlparse(self._config.url).query else "?"
         return f"{self._config.url}{separator}{query}"
 
-    async def connect_forever(self) -> AsyncIterator[Connected]:
+    async def connect_forever(self) -> AsyncGenerator[Connected, None]:
         """Yield each live, ``hello``-confirmed connection until a terminal failure.
+
+        Typed as a generator rather than an iterator because a caller that stops early MUST
+        ``aclose`` it. This loop holds a live socket at its suspension point, so abandoning it
+        without closing leaves that socket open until the garbage collector runs a finalizer --
+        and the App would go on counting a publisher that left.
 
         The caller streams on the yielded connection and returns to this loop when it closes,
         which is the normal course of events roughly every 10-18 minutes rather than an error.

@@ -637,7 +637,7 @@ class TmuxAdapter:
         if not payload and not validated_keys:
             raise NoPayload("shell_send requires at least one of text or keys", session=name)
         if payload:
-            self._check_size(payload, name)
+            self.check_send_limits(payload, name)
 
         incarnation = self._resolve_owned(name)
         submitted = self._paste(name, payload) if payload else 0
@@ -652,7 +652,20 @@ class TmuxAdapter:
             incarnation=incarnation,
         )
 
-    def _check_size(self, payload: bytes, name: str) -> None:
+    def check_send_limits(self, payload: bytes, name: str) -> None:
+        """The two delivery ceilings, checked before anything is written anywhere.
+
+        PUBLIC, and shared with the pty path in ``bridge.py``, because H4 is a property of the
+        **receiving pane's tty in canonical mode** and not of how the bytes got there. tmux
+        forwards an attach client's keystrokes to that same tty, so the hazard is identical --
+        measured on the attach path directly (spike F18): 8192 bytes plus a newline delivered
+        4096 on Linux, silently truncated, and 0 on macOS.
+
+        One implementation rather than two, so the tool path and the pty path cannot drift into
+        enforcing different numbers or raising different errors. ``max_send_line_bytes`` and
+        ``LineTooLong`` are what ``errors.py`` calls "the real boundary"; F18's action was
+        explicit that the pty path reuses them rather than introducing a third number at 4096.
+        """
         if len(payload) > self.config.max_send_bytes:
             raise TooLarge(
                 f"payload is {len(payload)} bytes, over SHELLBOX_MAX_SEND_BYTES "

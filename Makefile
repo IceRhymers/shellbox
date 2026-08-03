@@ -1,5 +1,5 @@
 .PHONY: install sync fmt lint test test-tmux test-registry test-integration migrate migration \
-	migrate-roundtrip deploy require-pg-host
+	migrate-roundtrip deploy grant require-pg-host require-deploy-principal
 
 # The workspace, and the target inside the bundle. Both overridable on the command line:
 #
@@ -178,8 +178,35 @@ deploy: require-pg-host
 		scripts/deploy-app.sh --profile $(PROFILE) --app "$$SHELLBOX_APP_NAME" \
 			--source-code-path "$$SHELLBOX_APP_SOURCE_PATH"
 
-migrate: require-pg-host
+# The second guard on this path, and it guards the IDENTITY rather than the destination.
+#
+# `alembic upgrade head` and the App SP's grant are both deploy-time actions, and both must run as
+# the DEPLOYING PRINCIPAL. The App's service principal holds SELECT on hosts and sessions and
+# nothing else, so a migration with its credential fails on a permission error -- and the tempting
+# fix for that error is a wider grant, after which the serving principal holds DDL on a registry it
+# is only supposed to read. That is a real path to a real outcome, and it arrives disguised as a fix
+# for something else.
+#
+# `python3` and not `uv run`: the check imports nothing outside the standard library, so it works on
+# a checkout with nothing synced, and it authenticates nowhere.
+require-deploy-principal:
+	@python3 scripts/check_deploy_principal.py "this command"
+
+migrate: require-pg-host require-deploy-principal
 	uv run alembic -c alembic.ini upgrade head
+
+# The App's service principal gets SELECT on hosts and sessions, and nothing else.
+#
+# NOT part of `make deploy`, and the sequencing is the reason: this needs the migration to have run
+# (a grant needs its table) and the App to be ACTIVE (the SP's Postgres role appears after
+# activation). It is a step in the documented bootstrap sequence -- docs/deploy.md section 4 -- and
+# a deploy that skips it fails on `/ready` rather than silently serving 500s from every inventory
+# call.
+#
+# See scripts/grant-app-sp.sh for why this exists at all: everything verified before it
+# authenticated as a workspace user, and the App authenticates as its service principal.
+grant: require-pg-host require-deploy-principal
+	scripts/grant-app-sp.sh --target $(TARGET) --profile $(PROFILE)
 
 migration:
 	uv run alembic -c alembic.ini revision --autogenerate -m "$(name)"

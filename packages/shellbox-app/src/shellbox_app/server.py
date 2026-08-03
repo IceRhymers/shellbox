@@ -77,6 +77,28 @@ this repo has evidence for, and a reason carried in a close frame does not.
 
 ``GET /`` returns how many sessions are bound, not which. Any workspace user the edge lets
 through reaches this route, and a session name is not theirs to enumerate.
+
+``GET /`` also touches NO database, and that is a rule rather than an accident of what it
+happens to report. It is the target of the deploy's own smoke step and of the App's periodic
+prober, so a database call here would put a Lakebase wake on the path of the one check that
+must answer when Lakebase is the thing that is broken. The inventory routes are separate, and
+a reader adding a row count to this payload should add a route instead.
+
+## The database, and the two rules that keep it away from the relay
+
+The registry lives on ``app.state.database``, opened once per app by
+``shellbox_app.database.open_registry``. Two rules govern every route built on it, and both
+exist because the event loop of this process is what relays every attached terminal:
+
+1. **Every database-touching route is a sync ``def``, never ``async def``.**
+   ``PostgresRegistry`` is synchronous SQLAlchemy. FastAPI runs a sync ``def`` in a threadpool
+   and an ``async def`` on the event loop, so one blocking query in a coroutine route stalls
+   every attached terminal at once. The WebSocket routes below are correctly ``async def``,
+   which is a different case: they suspend on socket I/O and never touch the database.
+2. **Opening the registry is never fatal.** See the module docstring of
+   `packages/shellbox-app/src/shellbox_app/database.py`. A Lakebase outage means the inventory
+   goes stale. It never means a browser cannot attach, and
+   `tests/unit/test_app_database.py` asserts that with a registry that raises on every call.
 """
 
 from __future__ import annotations
@@ -84,7 +106,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -97,6 +120,8 @@ from shellbox_transport.codec import (
     hello_message,
 )
 from starlette.websockets import WebSocketState
+
+from shellbox_app.database import AppDatabase, open_registry
 
 logger = logging.getLogger(__name__)
 
@@ -307,8 +332,8 @@ async def serve_subscriber(relay: Relay, websocket: WebSocket, session_id: str) 
         logger.info("released subscriber for session %s", session_id)
 
 
-def build_app(relay: Relay | None = None) -> FastAPI:
-    """A FastAPI app over its own ``Relay``.
+def build_app(relay: Relay | None = None, database: AppDatabase | None = None) -> FastAPI:
+    """A FastAPI app over its own ``Relay`` and its own registry.
 
     A factory rather than a module-level app over module-level state, mirroring
     ``shellbox_mcp.server.build_server``. Two apps in one interpreter then share nothing, so the
@@ -318,13 +343,36 @@ def build_app(relay: Relay | None = None) -> FastAPI:
     split is what lets the unit lane drive the accept path with a fake socket instead of reaching
     into ``FastAPI``'s route table for a closure -- the behavior under test is the binding rule,
     and it should not need a running server to assert.
+
+    ``database`` defaults to whatever the environment resolves to, which is a `NullRegistry`
+    when nothing is configured. Passing one is how a test supplies a fake minter, or a registry
+    that raises on every call. Building the app opens the registry and starts NO thread: the
+    refresher belongs to the lifespan handler below, because this function runs at import.
     """
-    api = FastAPI()
     sessions = Relay() if relay is None else relay
+    store = open_registry() if database is None else database
+
+    @asynccontextmanager
+    async def lifespan(api: FastAPI) -> AsyncIterator[None]:
+        """Start the credential refresher, serve, then stop it.
+
+        The App is long-lived and is the case the background refresher exists for -- see the
+        module docstring of `packages/shellbox-app/src/shellbox_app/database.py`. ``stop()`` is
+        in the unwind path so a reload or a failed startup elsewhere still joins the thread.
+        """
+        store.start()
+        try:
+            yield
+        finally:
+            store.stop()
+
+    api = FastAPI(lifespan=lifespan)
     api.state.relay = sessions
+    api.state.database = store
 
     @api.get("/")
     def health() -> dict[str, object]:
+        """CRITICAL: zero database. See this module's docstring -- the rule, not the payload."""
         return health_payload(sessions)
 
     @api.websocket("/publish/{session_id}")

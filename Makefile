@@ -11,10 +11,40 @@
 PROFILE ?= fevm-west
 TARGET  ?= dev
 
+# No `make` target may silently re-lock. UV_LOCKED is the environment form of `--locked`: uv
+# checks `uv.lock` against the pyproject files and FAILS if it is stale, instead of quietly
+# resolving a different dependency set in the middle of `make test`.
+#
+# UV_LOCKED, and NOT UV_FROZEN. `--frozen` skips the staleness check altogether, so a dependency
+# that was added to a pyproject.toml and not re-locked installs the OLD set. That failure surfaces
+# much later as an ImportError for a package the project declares, which is a confusing way to
+# learn that a lockfile is stale.
+#
+# This is orthogonal to whether `uv.lock` is committed. It is not committed -- see the comment
+# above `uv.lock` in `.gitignore` -- because this governs whether a target may REWRITE the
+# lockfile, not where the lockfile comes from.
+#
+# Measured 2026-08-03 on uv 0.10.9, because two of the three behaviours are surprising:
+#
+#   UV_LOCKED=1, stale lockfile   -> "The lockfile at `uv.lock` needs to be updated, but
+#                                    `UV_LOCKED=1` was provided." The guard this exists for.
+#   UV_LOCKED=1, NO lockfile      -> "Unable to find lockfile at `uv.lock`". `uv.lock` is ignored,
+#                                    so EVERY fresh clone starts in this state. That is why `sync`
+#                                    is exempted below, and why it has to be.
+#   UV_LOCKED= (empty)            -> hard error: "expected a boolish value". An exemption must
+#                                    therefore set 0, never blank.
+export UV_LOCKED := 1
 
 
 install: sync
 
+# The one target allowed to write the lockfile, and it must be. `uv.lock` is gitignored, so a
+# fresh clone has none, and `uv sync` under UV_LOCKED=1 fails outright with "Unable to find
+# lockfile". `make sync` is where a developer expects the lockfile to be created, and where
+# adding a dependency is expected to update it.
+#
+# 0 rather than blank, because uv rejects an empty UV_LOCKED. See the measurement above.
+sync: UV_LOCKED := 0
 sync:
 	uv sync
 

@@ -26,3 +26,9 @@ class NullRegistry(Registry):
 
     def list_sessions_for_host(self, host_id: str) -> list[SessionRecord]:
         return []
+
+    def list_hosts(self, owner_email: str | None = None) -> list[HostRecord]:
+        return []
+
+    def list_sessions(self, owner_email: str | None = None) -> list[SessionRecord]:
+        return []

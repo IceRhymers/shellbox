@@ -20,10 +20,12 @@ from shellbox_registry.lakebase import (
     API_MIN_TTL_SECONDS,
     POOL_RECYCLE_SECONDS,
     REFRESH_MARGIN,
+    SQLALCHEMY_DEFAULT_POOL_TIMEOUT_SECONDS,
     Credential,
     LakebaseCredentials,
     LakebaseEndpoint,
     create_lakebase_engine,
+    lakebase_registry,
 )
 
 T0 = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
@@ -387,6 +389,65 @@ def test_the_engine_bounds_its_connect() -> None:
     credentials, _, _ = _credentials()
     engine = create_lakebase_engine(_endpoint(), credentials)
     assert _merged_connect_params(engine)["connect_timeout"] > 0
+
+
+def test_pool_timeout_defaults_to_sqlalchemys_own_so_no_caller_changed() -> None:
+    """Adding the parameter must not move any existing caller off SQLAlchemy's behaviour.
+
+    `shellbox-mcp` builds an engine through here and has no threadpool in front of the
+    pool, so it wants the wide default. Asserting against SQLAlchemy's live value rather
+    than a literal 30 is the point: if the library ever changes its default, this fails and
+    says so, instead of silently pinning a number nobody chose.
+    """
+    credentials, _, _ = _credentials()
+    engine = create_lakebase_engine(_endpoint(), credentials)
+
+    import inspect
+
+    from sqlalchemy.pool import QueuePool
+
+    # SQLAlchemy states it as the float 30.0; the constant is the int 30, which compares
+    # equal. Read from the signature rather than hardcoded, so a library change fails here.
+    library_default = inspect.signature(QueuePool.__init__).parameters["timeout"].default
+    assert SQLALCHEMY_DEFAULT_POOL_TIMEOUT_SECONDS == library_default, (
+        f"SQLAlchemy's pool timeout default is now {library_default}, so the constant no "
+        f"longer restates it and this function silently changed every caller's behaviour"
+    )
+    assert engine.pool._timeout == SQLALCHEMY_DEFAULT_POOL_TIMEOUT_SECONDS
+
+
+def test_pool_timeout_is_passable_and_reaches_the_pool() -> None:
+    """The App's 5 s per ADR-19's corollary, which had no plumbing before `W28`.
+
+    Not a tautology: this parameter did not exist, and `create_lakebase_engine` declares no
+    `**kwargs`, so the value has to be threaded to `create_engine` explicitly. A wired-up
+    parameter that never reached the pool would look identical from the signature.
+    """
+    credentials, _, _ = _credentials()
+    engine = create_lakebase_engine(_endpoint(), credentials, pool_timeout=5)
+    assert engine.pool._timeout == 5
+
+
+def test_lakebase_registry_forwards_pool_timeout_rather_than_raising() -> None:
+    """CRITICAL: The exact call that raised `TypeError` on the pre-`W28` tree.
+
+    `lakebase_registry` forwards `**engine_kwargs` into `create_lakebase_engine`, which
+    declared no `**kwargs` -- so `lakebase_registry(..., pool_timeout=5)` failed with
+    `TypeError: create_lakebase_engine() got an unexpected keyword argument 'pool_timeout'`
+    (measured on the tree before this change) rather than being ignored. `W29` makes this
+    call for real, so the regression this guards is a broken App startup, not a wrong
+    number.
+    """
+    credentials, _, _ = _credentials()
+    registry, returned = lakebase_registry(
+        _endpoint(), credentials=credentials, pool_timeout=5, max_overflow=10
+    )
+    try:
+        assert returned is credentials, "the caller needs these back to start_refresher()"
+        assert registry._engine.pool._timeout == 5
+        assert registry._engine.pool._max_overflow == 10, "the App raises this from the default 5"
+    finally:
+        registry.dispose()
 
 
 # ----------------------------------------------------- the shape the live API returns

@@ -101,6 +101,17 @@ POOL_RECYCLE_SECONDS = 1800
 # relationship between recycling and token lifetime is checkable rather than folklore.
 API_MIN_TTL_SECONDS = 300
 
+# SQLAlchemy's OWN default for `pool_timeout`, restated so the default below is visibly
+# inherited rather than chosen. Named because the two readings differ: a value this module
+# picked would be a claim about Lakebase, and this one is not. It is here so adding the
+# parameter changes no existing caller's behaviour.
+#
+# SQLAlchemy declares it as `30.0` on `QueuePool.__init__`; the int compares equal, and
+# `tests/unit/test_lakebase.py` reads the library's signature so a change there fails
+# loudly instead of quietly moving every caller. See `create_lakebase_engine` for why the
+# App overrides it, and for the arithmetic that makes 30s the wrong value there.
+SQLALCHEMY_DEFAULT_POOL_TIMEOUT_SECONDS = 30
+
 # Backoff after a failed mint, so a control-plane outage does not become a hot loop against
 # it. Bounded rather than unbounded: the point is to stop hammering, not to give up.
 _BACKOFF_SECONDS = (1.0, 2.0, 5.0, 15.0, 30.0)
@@ -385,17 +396,34 @@ def create_lakebase_engine(
     max_overflow: int = 5,
     pool_recycle: int = POOL_RECYCLE_SECONDS,
     connect_timeout: int = PostgresRegistry.CONNECT_TIMEOUT_SECONDS,
+    pool_timeout: int = SQLALCHEMY_DEFAULT_POOL_TIMEOUT_SECONDS,
 ) -> Engine:
     """An engine that injects a fresh token as the password on every new connection.
 
-    Three settings, each for a measured reason rather than by convention:
+    Four settings, each for a measured reason rather than by convention:
 
     * ``pool_pre_ping`` — Lakebase **scales to zero**, which kills pooled connections. A
       checkout of a dead connection would otherwise surface as an error on whatever query
-      happened to be next.
+      happened to be next. **Hardcoded ``True``, deliberately not a parameter.** A caller
+      cannot weaken it by passing a value; only an edit to that line can. Do not make one.
     * ``pool_recycle`` — see fact 3 in the module docstring; refresh does not cover this.
     * ``connect_timeout`` — inherited from `PostgresRegistry`, where an unbounded connect
       was measured to hang a tool call for 63 seconds.
+    * ``pool_timeout`` — how long a checkout waits for a **free connection from the pool**.
+      Not `connect_timeout`, which bounds the TCP connect instead; the comment on
+      `PostgresRegistry.__init__` draws that line. The default here is SQLAlchemy's own
+      30 s, so adding this parameter changed no caller.
+
+      **The App passes 5**, and raises ``max_overflow`` to 10 from the 5 defaulted here.
+      Those 15 connections sit behind Starlette's 40-thread threadpool. A synchronized edge
+      kill reconnects every browser at once, which parks up to 25 requests. At 30 s each
+      that includes ``/ready`` — the only automatic detector of a database problem, queuing
+      behind the storm it exists to diagnose. 5 s clears the **measured** 1.4 s first
+      connect to an ``IDLE`` endpoint (`docs/lakebase-handoff.md` section 2) and stays far
+      under 30 s.
+
+      The App is the only caller with a threadpool in front of this pool. `shellbox-mcp` is
+      not, which is why the wider default stays wide.
 
     ``do_connect`` rather than a DSN password: the token changes and the URL does not, so
     baking it in would pin the first token for the engine's life and leak it into every
@@ -407,6 +435,7 @@ def create_lakebase_engine(
         max_overflow=max_overflow,
         pool_pre_ping=True,
         pool_recycle=pool_recycle,
+        pool_timeout=pool_timeout,
         connect_args={"connect_timeout": connect_timeout},
     )
 

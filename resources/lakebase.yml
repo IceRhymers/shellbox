@@ -1,0 +1,70 @@
+# The Lakebase Autoscaling Postgres that backs the registry.
+#
+# The verification project this replaces was created by hand and was explicitly not
+# infrastructure-as-code. See section 5 of docs/lakebase-handoff.md, debt 1. This file is that
+# debt paid.
+#
+# CRITICAL: an endpoint's parent is a BRANCH, not a project. The CLI's own description is
+# "Parent is the branch containing this endpoint". So the project reference belongs on the
+# BRANCH's `parent`, and the endpoint's `parent` references the branch. Getting this wrong
+# produces a bundle that validates and then fails at deploy, because `bundle validate` does not
+# check resource references at all -- see the note in databricks.yml.
+
+resources:
+  postgres_projects:
+    pg_project:
+      # `project_id` and `display_name` are different things, and the CLI says so: "Note that
+      # name refers to this resource path, not the user-visible display_name". The id becomes
+      # projects/<id> and is what every `databricks postgres` call addresses.
+      project_id: ${var.pg_project_id}
+      display_name: ${var.pg_project_display_name}
+      pg_version: 17
+      default_endpoint_settings:
+        autoscaling_limit_min_cu: 0.5
+        autoscaling_limit_max_cu: 4
+        suspend_timeout_duration: "300s"
+
+  postgres_branches:
+    production:
+      parent: ${resources.postgres_projects.pg_project.id}
+      branch_id: ${var.pg_branch_id}
+      no_expiry: true
+      # `replace_existing` is load-bearing, not defensive. Creating a project server-side
+      # AUTO-PROVISIONS a `production` branch and a `primary` read-write endpoint. Declaring
+      # either of them without this flag therefore fails with ALREADY_EXISTS on the very first
+      # deploy, against resources the same deploy just caused to exist. The schema documents
+      # the flag as "take over an existing ... instead of failing", which is exactly the
+      # intent: adopt what the project creation made, then reconcile it to this spec.
+      replace_existing: true
+
+  postgres_endpoints:
+    primary:
+      parent: ${resources.postgres_branches.production.id}
+      endpoint_id: ${var.pg_endpoint_id}
+      endpoint_type: ENDPOINT_TYPE_READ_WRITE
+      replace_existing: true
+      autoscaling_limit_min_cu: 0.5
+      autoscaling_limit_max_cu: 4
+      # CRITICAL: 300s, and the number is a cost decision rather than a default.
+      #
+      # Lakebase at 0.5 to 1 CU costs roughly $0.06 per CU-hour while awake and nothing while
+      # suspended (measured 2026-07-31, docs/lakebase-handoff.md section 6). The App probes the
+      # database every 30 minutes, and each probe wakes the endpoint for one
+      # `suspend_timeout_duration`, so the duty cycle is that timeout divided by 30 minutes:
+      #
+      #     300s  ->  16.7 percent  ->  $3.65 to $7.30 per month
+      #     600s  ->  33.3 percent  ->  $7.30 to $14.60 per month
+      #
+      # 600s is what the Databricks sample bundle ships. Raising this value to it doubles the
+      # standing cost of the whole design, silently, so change it only with that arithmetic in
+      # front of you.
+      suspend_timeout_duration: "300s"
+
+  postgres_databases:
+    # The database the registry migrates into. Creating a project provisions a DEFAULT database
+    # that is not this one, so without this resource the App's binding below would reference a
+    # database nothing creates, and `alembic upgrade head` would have nowhere to run.
+    shellbox_db:
+      parent: ${resources.postgres_branches.production.id}
+      database_id: ${var.pg_database}
+      replace_existing: true

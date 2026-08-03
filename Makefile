@@ -1,4 +1,16 @@
-.PHONY: install sync fmt lint test test-tmux test-registry test-integration migrate migration migrate-roundtrip
+.PHONY: install sync fmt lint test test-tmux test-registry test-integration migrate migration \
+	migrate-roundtrip deploy require-pg-host
+
+# The workspace, and the target inside the bundle. Both overridable on the command line:
+#
+#     make deploy TARGET=prod
+#
+# CRITICAL: the profile name is `fevm-west`. There is a second, similarly named workspace in
+# this account, and it is a DIFFERENT workspace. `databricks.yml` pins the host for both targets
+# so a wrong profile errors instead of deploying somewhere unexpected.
+PROFILE ?= fevm-west
+TARGET  ?= dev
+
 
 
 install: sync
@@ -20,6 +32,20 @@ lint:
 	uv run ruff check packages tests
 	uv run mypy packages/shellbox-mcp/src packages/shellbox-registry/src \
 		packages/shellbox-transport/src packages/shellbox-app/src
+	@# The bundle statics, and they are steps HERE rather than a target of their own or a
+	@# pytest module. Three reasons, in order of how much they constrain the choice:
+	@#
+	@# 1. CI invokes a fixed list of make targets. A new target would be in none of them, and
+	@#    a mitigation lane nothing invokes is a comment with a Makefile around it.
+	@# 2. They assert on bundle files the Python test suite has no other reason to know about,
+	@#    and a failure belongs in the lane a reader already reads as "static checks".
+	@# 3. They must run on a checkout with NO Databricks credential, which they do -- they
+	@#    parse files and never authenticate. Nothing here calls `bundle validate`.
+	@#
+	@# `--with pyyaml --no-project` rather than a dev dependency: this needs a YAML parser and
+	@# nothing else in the repo does. The same idiom is in scripts/deploy-app.sh, and keeping
+	@# it out of pyproject.toml keeps it out of the deployed requirement set.
+	uv run --no-project --quiet --with pyyaml python scripts/check_bundle_statics.py
 
 test:
 	uv run pytest
@@ -64,7 +90,65 @@ test-tmux:
 test-integration:
 	uv run pytest tests/integration -v
 
-migrate:
+# The guard the donor project called its PGHOST guard. The variable name differs here on
+# purpose: `dsn_from_env` in packages/shellbox-registry/src/shellbox_registry/dsn.py reads
+# SHELLBOX_DATABASE_URL, then SHELLBOX_PG_USER / _PASSWORD / _HOST / _PORT / _DB. Guarding
+# PGHOST would guard a name nothing in this repo consumes, which is a check that cannot fail.
+#
+# What it stops: `dsn_from_env` DEFAULTS the host to localhost:55432 as soon as ANY
+# SHELLBOX_PG_* variable is set. So a developer with a half-configured local environment runs
+# `make migrate`, migrates their laptop, and reads the green result as a production migration.
+# On `make deploy` it is worse, because the App half of that run really did reach production.
+#
+# It asserts the host is SET, not that it is remote. A deliberate `make migrate` against a
+# local Postgres stays possible, because that is a thing developers legitimately do -- what is
+# no longer possible is reaching one by accident.
+#
+# NOTE on the FIRST deploy of a target: the endpoint does not exist yet, so its host cannot be
+# resolved yet, and this guard has nothing to accept. The answer is not a placeholder value --
+# that is how a guard becomes something people route around by reflex. Run `databricks bundle
+# deploy` on its own to create the Lakebase resources, resolve the host from the endpoint it
+# made, and then `make deploy`. The message below says so, because the alternative is an
+# operator inventing `SHELLBOX_PG_HOST=x` and never unlearning it.
+require-pg-host:
+	@if [ -z "$${SHELLBOX_DATABASE_URL:-}" ] && [ -z "$${SHELLBOX_PG_HOST:-}" ]; then \
+		echo "ERROR: neither SHELLBOX_PG_HOST nor SHELLBOX_DATABASE_URL is set." >&2; \
+		echo "  Without one of them the registry DSN silently defaults to localhost:55432," >&2; \
+		echo "  so this command would target a local Postgres and report success." >&2; \
+		echo "  Resolve the host from the endpoint this bundle declares:" >&2; \
+		echo "    eval \"\$$(scripts/bundle-vars.sh -t $(TARGET) -p $(PROFILE))\"" >&2; \
+		echo "    databricks postgres get-endpoint \"\$$SHELLBOX_PG_RESOURCE\" -p $(PROFILE)" >&2; \
+		echo "  On the FIRST deploy of a target the endpoint does not exist yet. Create it" >&2; \
+		echo "  with 'databricks bundle deploy -t $(TARGET) --profile $(PROFILE)', then resolve" >&2; \
+		echo "  the host as above. Do NOT set a placeholder. See docs/deploy.md section 3." >&2; \
+		exit 1; \
+	fi
+
+# `make deploy` is TWO commands, and neither one is redundant.
+#
+# `bundle deploy` reconciles the Lakebase project, branch, endpoint and database, and the App
+# RESOURCE. It does not deploy the App's code: the Databricks docs say "Deploying a bundle
+# doesn't automatically deploy the app to compute", and the code deployment is a separate API
+# call. `scripts/deploy-app.sh` issues that call, after flattening the two uv workspace packages
+# into one importable root -- see its header for why that flattening is not optional.
+#
+# The two mechanisms coexist only because `resources/app.yml` declares no `lifecycle.started`.
+# Read the CRITICAL comment there before changing anything on this path.
+#
+# The App name and its code root are read back out of the bundle rather than recomputed here, so
+# there is one declaration of each. `scripts/bundle-vars.sh` does that in one `validate` call.
+#
+# BEFORE THE FIRST DEPLOY of a target whose App already exists, a human runs the one-time
+# adoption step in docs/deploy.md. It is not a step here: `bundle deployment bind` prompts
+# unless it is passed --auto-approve, so inside this target it would either block or silently
+# re-adopt whatever the name points at on every run.
+deploy: require-pg-host
+	databricks bundle deploy -t $(TARGET) --profile $(PROFILE)
+	eval "$$(scripts/bundle-vars.sh --target $(TARGET) --profile $(PROFILE))" && \
+		scripts/deploy-app.sh --profile $(PROFILE) --app "$$SHELLBOX_APP_NAME" \
+			--source-code-path "$$SHELLBOX_APP_SOURCE_PATH"
+
+migrate: require-pg-host
 	uv run alembic -c alembic.ini upgrade head
 
 migration:

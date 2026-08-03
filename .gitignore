@@ -1,6 +1,10 @@
 .omc/
 .claude/settings.local.json
 
+# `databricks bundle` writes per-target deployment state and sync snapshots here. It is local
+# machine state, and `.databricks/sync-snapshots/` in particular changes on every sync.
+.databricks/
+
 # Python / uv workspace
 .venv/
 __pycache__/

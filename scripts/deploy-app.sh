@@ -17,21 +17,31 @@
 # ordinary sibling import -- no wheel, no editable install, no path manipulation in the app.
 #
 # Usage:  scripts/deploy-app.sh [--profile fevm-west] [--app shellbox] [--verify]
+#                               [--source-code-path /Workspace/...]
 #
 #   --verify  after deploying, dial the live edge and assert a real frame relays through it.
 #             Needs a workspace OAuth token; the Apps edge 302s a PAT (Phase 1, `probe/`).
+#
+#   --source-code-path
+#             the workspace directory to sync the staged root into, and to deploy from.
+#             `make deploy` passes the value declared in `resources/app.yml` and resolved by
+#             `scripts/bundle-vars.sh`, so the bundle and this script cannot disagree about
+#             where the code lives. Omitted, the path is derived exactly as it was for the
+#             verified 2026-08-02 run, which keeps this script usable on its own.
 
 set -euo pipefail
 
 PROFILE="${DATABRICKS_PROFILE:-fevm-west}"
 APP_NAME="shellbox"
+SOURCE_CODE_PATH=""
 VERIFY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --profile) PROFILE="$2"; shift 2 ;;
-    --app)     APP_NAME="$2"; shift 2 ;;
-    --verify)  VERIFY=1; shift ;;
+    --profile)          PROFILE="$2"; shift 2 ;;
+    --app)              APP_NAME="$2"; shift 2 ;;
+    --source-code-path) SOURCE_CODE_PATH="$2"; shift 2 ;;
+    --verify)           VERIFY=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,7 +89,15 @@ if (cd "$STAGE" && find . -name '*.pyc' | grep -q .); then
   exit 1
 fi
 
-WS_PATH="/Workspace/Users/$(databricks current-user me --profile "$PROFILE" --output json | python3 -c 'import sys,json; print(json.load(sys.stdin)["userName"])')/${APP_NAME}-app"
+# The bundle's value wins when it is given. The fallback below is the same expression the
+# 2026-08-02 run used, and `resources/app.yml` declares the same shape, so a bundle-driven
+# deploy and a bare one land in the same place for the same app name. That is deliberate: it
+# means adding the bundle did not move the live code root.
+if [[ -n "$SOURCE_CODE_PATH" ]]; then
+  WS_PATH="$SOURCE_CODE_PATH"
+else
+  WS_PATH="/Workspace/Users/$(databricks current-user me --profile "$PROFILE" --output json | python3 -c 'import sys,json; print(json.load(sys.stdin)["userName"])')/${APP_NAME}-app"
+fi
 
 if ! databricks apps get "$APP_NAME" --profile "$PROFILE" >/dev/null 2>&1; then
   echo "==> creating app $APP_NAME (provisions compute; takes a few minutes)"

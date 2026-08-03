@@ -53,13 +53,20 @@ resources:
             The Lakebase database holding the hosts and sessions registry. The App reads it;
             the shellbox-mcp processes write it as the real user.
           postgres:
-            branch: ${resources.postgres_branches.production.id}
-            database: ${var.pg_database}
-            # CAN_CONNECT_AND_CREATE is the only value this field accepts, so it is forced
-            # rather than chosen. It is NOT the App's effective privilege: it gets the service
-            # principal a Postgres role that can connect, and the actual table privileges are a
-            # separate GRANT. The App's only legitimate need is SELECT on hosts and sessions,
-            # and that scoping lives in the grant, not here. A role that can connect and has no
-            # table grant ships green and fails on the first inventory call, which is why the
-            # grant is verified against a real query rather than assumed from this line.
+            # `branch` and `database` are resource-path STRINGS built from the project's `.id`
+            # reference rather than written as a literal `projects/<name>/...` path. Building
+            # them this way creates the DABs dependency edge, so the project exists before the
+            # App binds to it -- and it keeps a project name out of this file, which
+            # `make lint`'s no-literal-project check requires.
+            #
+            # Both objects are AUTO-PROVISIONED with the project; nothing here declares them.
+            # See `lakebase.yml` for why declaring them would be a data-loss hazard.
+            branch: ${resources.postgres_projects.pg_project.id}/branches/${var.pg_branch_id}
+            # CAREFUL: the database RESOURCE id is the hyphenated `databricks-postgres`, and it
+            # is NOT the Postgres database NAME used to connect, which is the underscored
+            # `databricks_postgres`. Measured 2026-08-03 -- `list-databases` reports
+            # `database_id: databricks-postgres` and `postgres_database: databricks_postgres`.
+            # `var.pg_database` carries the connection name and feeds SHELLBOX_PG_DB; the
+            # hyphenated form appears only in this path.
+            database: ${resources.postgres_projects.pg_project.id}/branches/${var.pg_branch_id}/databases/databricks-postgres
             permission: CAN_CONNECT_AND_CREATE

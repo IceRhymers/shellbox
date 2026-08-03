@@ -24,47 +24,29 @@ resources:
         autoscaling_limit_max_cu: 4
         suspend_timeout_duration: "300s"
 
-  postgres_branches:
-    production:
-      parent: ${resources.postgres_projects.pg_project.id}
-      branch_id: ${var.pg_branch_id}
-      no_expiry: true
-      # `replace_existing` is load-bearing, not defensive. Creating a project server-side
-      # AUTO-PROVISIONS a `production` branch and a `primary` read-write endpoint. Declaring
-      # either of them without this flag therefore fails with ALREADY_EXISTS on the very first
-      # deploy, against resources the same deploy just caused to exist. The schema documents
-      # the flag as "take over an existing ... instead of failing", which is exactly the
-      # intent: adopt what the project creation made, then reconcile it to this spec.
-      replace_existing: true
-
-  postgres_endpoints:
-    primary:
-      parent: ${resources.postgres_branches.production.id}
-      endpoint_id: ${var.pg_endpoint_id}
-      endpoint_type: ENDPOINT_TYPE_READ_WRITE
-      replace_existing: true
-      autoscaling_limit_min_cu: 0.5
-      autoscaling_limit_max_cu: 4
-      # CRITICAL: 300s, and the number is a cost decision rather than a default.
-      #
-      # Lakebase at 0.5 to 1 CU costs roughly $0.06 per CU-hour while awake and nothing while
-      # suspended (measured 2026-07-31, docs/lakebase-handoff.md section 6). The App probes the
-      # database every 30 minutes, and each probe wakes the endpoint for one
-      # `suspend_timeout_duration`, so the duty cycle is that timeout divided by 30 minutes:
-      #
-      #     300s  ->  16.7 percent  ->  $3.65 to $7.30 per month
-      #     600s  ->  33.3 percent  ->  $7.30 to $14.60 per month
-      #
-      # 600s is what the Databricks sample bundle ships. Raising this value to it doubles the
-      # standing cost of the whole design, silently, so change it only with that arithmetic in
-      # front of you.
-      suspend_timeout_duration: "300s"
-
-  postgres_databases:
-    # The database the registry migrates into. Creating a project provisions a DEFAULT database
-    # that is not this one, so without this resource the App's binding below would reference a
-    # database nothing creates, and `alembic upgrade head` would have nowhere to run.
-    shellbox_db:
-      parent: ${resources.postgres_branches.production.id}
-      database_id: ${var.pg_database}
-      replace_existing: true
+# NO `postgres_branches`, `postgres_endpoints` or `postgres_databases` RESOURCES, deliberately.
+#
+# This follows databricks-code-search/resources/lakebase.yml, which learned it first: creating
+# the project AUTO-PROVISIONS the `production` branch, a READ_WRITE endpoint `primary`, an owner
+# role, and a `databricks-postgres` database. Declaring them explicitly collides with the
+# auto-created objects and forces `replace_existing: true` on a DATA-BEARING production branch --
+# and that flag means take-over-or-recreate, so a redeploy can drop the rows. The donor's comment
+# calls it "index loss on redeploy"; here it would be the hosts and sessions registry.
+#
+# Measured 2026-08-03 on the first real deploy, which is what sent us to look: declaring
+# `postgres_databases` fails with
+#
+#     Field 'database.spec.role' is required, expected non-default value
+#
+# and fails identically WITH `replace_existing: true`, because adoption still POSTs a full spec.
+# The required owner role is itself auto-provisioned per DEPLOYING USER, so it is a property of
+# who deploys rather than of the target and cannot be declared portably. Not declaring the
+# database avoids the question entirely.
+#
+# The autoscaling CU bounds and the 300s suspend are pinned on the PROJECT via
+# `default_endpoint_settings` above, so ADR-18's cost decision survives without an endpoint
+# resource. Downstream, `app.yml` addresses the branch and database by building paths from the
+# project's `.id`, which keeps the DABs dependency edge.
+#
+# Note the bundle JSON schema lists PostgresDatabase.required as ['database_id', 'parent'] only,
+# so the schema is LOOSER than the API: a config that validates can still fail at deploy.

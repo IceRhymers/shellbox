@@ -51,7 +51,17 @@ variables:
       The Postgres database `alembic upgrade head` migrates and the App reads. It matches
       SHELLBOX_PG_DB, which `dsn_from_env` in
       packages/shellbox-registry/src/shellbox_registry/dsn.py assembles a DSN from.
-    default: shellbox
+
+      CAREFUL: this is the Postgres database NAME used to CONNECT, which is the UNDERSCORED
+      `databricks_postgres`. It is NOT the database RESOURCE id, which is the hyphenated
+      `databricks-postgres` and appears only in the app binding path in resources/app.yml.
+      Measured 2026-08-03: `list-databases` reports `database_id: databricks-postgres` and
+      `postgres_database: databricks_postgres`. Using the hyphenated form here produces a DSN
+      that connects to nothing.
+
+      Lakebase auto-provisions this database when the project is created; nothing declares it.
+      See resources/lakebase.yml for why declaring one is both unnecessary and a hazard.
+    default: databricks_postgres
 
 include:
   - resources/*.yml

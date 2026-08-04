@@ -184,7 +184,7 @@ Section 1 has the full pipeline. The three positions that matter for the grant:
 | 3 | `make migrate` — `alembic upgrade head` | you |
 | 4 + 5 | `scripts/deploy-app.sh`, then the wait for `ACTIVE` | you |
 | 6 | `make grant` — `SELECT` on `hosts` and `sessions` for the App's service principal | you |
-| — | The `/ready` check below — the proof that step 6 landed | the App |
+| 7 | [`scripts/check_ready.py`](../scripts/check_ready.py) — the proof that step 6 landed | the App |
 
 Step 3 comes before step 6 because `GRANT SELECT ON TABLE` needs the table. Postgres enforces
 that ordering, and [`scripts/grant_app_sp.py`](../scripts/grant_app_sp.py) turns its error into
@@ -198,10 +198,12 @@ which is what makes retrying safe rather than merely tolerable. The field names 
 on 2026-08-03, `databricks apps get shellbox -o json` reported `compute_status.state` as `ACTIVE`
 and `service_principal_client_id` as a dashed uuid.
 
-**A deploy is green on everything the deploying principal can observe, and silent about the one
+**Step 6 is green on everything the deploying principal can observe, and silent about the one
 thing it cannot.** The grant reads itself back with `has_table_privilege`, which proves the
 catalog agrees. It does not prove the App can read the database **as itself** — only the App can
-exercise its own credential path. The `/ready` check below is that proof, and it is still manual.
+exercise its own credential path. Step 7 is that proof, and it **fails the deploy**: a deploy
+that reported success while the App could connect but not read is the state `/ready` exists to
+catch. The curl below is the same check by hand, for a deploy you did not run.
 
 ### The migration runs as you, never as the App
 
@@ -326,6 +328,21 @@ print("ready: true")
 an HTML body is the same finding with a different shape: the token was refused, so the request
 never reached the App. If `make grant` reported `ok` and this fails, the grant is not the suspect
 — the App's own credential path is.
+
+`make deploy` runs this as step 7, through
+[`scripts/check_ready.py`](../scripts/check_ready.py), and fails the deploy on a false answer.
+Run the curl by hand when you did not run the deploy, or when you want the answer now.
+
+**The body is deliberately generic.** `{"ready": false, "reason": "no_database"}` means the App
+resolved no Lakebase endpoint from its environment; `"query_failed"` means the read raised. The
+route never names a host, a database, a schema or a relation, because every workspace user the
+edge lets through can reach it. The driver error and its traceback go to the App's own log
+instead: `databricks apps logs <app> --profile fevm-west`.
+
+**The App also probes itself every 30 minutes** and logs a WARN line when the probe fails, which
+is what shortens "the App has been broken for a week" to "there is a WARN line at the top of the
+log". It is a recorded failure and **not** a notification — no alerting path is built. See
+[`packages/shellbox-app/src/shellbox_app/ready.py`](../packages/shellbox-app/src/shellbox_app/ready.py).
 
 #### 2. An `INSERT` as the service principal is refused with SQLSTATE `42501`
 

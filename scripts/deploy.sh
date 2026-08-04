@@ -4,7 +4,7 @@
 #
 # Usage:  scripts/deploy.sh [--target dev] [--profile fevm-west]
 #
-# WHY A SCRIPT, and not a Makefile recipe. Six steps, each of which can fail, and the ORDER is
+# WHY A SCRIPT, and not a Makefile recipe. Seven steps, each of which can fail, and the ORDER is
 # the load-bearing part of the arrangement. A recipe is a list of commands with nowhere to
 # record why a step is where it is, and no way to wait for a state to arrive.
 # `databricks-code-search/scripts/deploy.sh` reached the same conclusion for the same pipeline,
@@ -26,6 +26,12 @@
 #   5. wait for ACTIVE   the SP's role appears in `pg_roles` some time AFTER activation, so
 #                        until this passes the grant has no role to grant to.
 #   6. `make grant`      needs the tables from step 3 and the role from step 5.
+#   7. `/ready`          proves the grant landed, and it is LAST because it is the only step
+#                        that exercises the App's OWN credential path. Step 6 reads its grant
+#                        back with `has_table_privilege`, which proves the catalog agrees and
+#                        proves nothing about the App connecting as itself. A deploy that
+#                        reported success while the App could connect but not read is the
+#                        state this step exists to fail.
 #
 # WHAT THIS DOES NOT DO. The one-time `bundle deployment bind` for a target whose App already
 # exists is not a step here -- it prompts unless it is passed --auto-approve, so inside this
@@ -110,10 +116,10 @@ wait_active() {
   exit 1
 }
 
-echo "==> [1/6] bundle deploy -t $TARGET (Lakebase and the App resource)"
+echo "==> [1/7] bundle deploy -t $TARGET (Lakebase and the App resource)"
 databricks bundle deploy -t "$TARGET" --profile "$PROFILE"
 
-echo "==> [2/6] reading the App and the Lakebase endpoint from the bundle"
+echo "==> [2/7] reading the App and the Lakebase endpoint from the bundle"
 if ! BUNDLE_VARS="$("$REPO/scripts/bundle-vars.sh" --target "$TARGET" --profile "$PROFILE")"; then
   die "could not read the bundle for target '$TARGET'; see the message above"
 fi
@@ -138,10 +144,10 @@ echo "    source=$SOURCE_CODE_PATH"
 echo "    endpoint=$SHELLBOX_PG_RESOURCE"
 echo "    database=$SHELLBOX_PG_DB"
 
-echo "==> [3/6] make migrate (alembic upgrade head, as the deploying principal)"
+echo "==> [3/7] make migrate (alembic upgrade head, as the deploying principal)"
 make -C "$REPO" migrate TARGET="$TARGET" PROFILE="$PROFILE"
 
-echo "==> [4/6] deploying the App's code and starting compute"
+echo "==> [4/7] deploying the App's code and starting compute"
 # The endpoint and the database name are PASSED rather than inherited from the environment.
 # `deploy-app.sh` stamps them into the staged `app.yaml`, which is the App's only source of
 # them -- nothing in this shell reaches the container. Passing them makes the flag list the
@@ -151,24 +157,34 @@ echo "==> [4/6] deploying the App's code and starting compute"
   --source-code-path "$SOURCE_CODE_PATH" \
   --pg-resource "$SHELLBOX_PG_RESOURCE" --pg-database "$SHELLBOX_PG_DB"
 
-echo "==> [5/6] waiting for the App to reach ACTIVE"
+echo "==> [5/7] waiting for the App to reach ACTIVE"
 wait_active "$APP_NAME"
 
-echo "==> [6/6] granting the App's service principal its reads"
+echo "==> [6/7] granting the App's service principal its reads"
 make -C "$REPO" grant TARGET="$TARGET" PROFILE="$PROFILE"
-
-# NOTE: the sequencing point for the `/ready` gate is HERE, and it is deliberately empty.
-#
-# `make grant` reads its own grant back with `has_table_privilege`, which proves the catalog
-# agrees. It does NOT prove the App can read the database AS ITSELF -- that is the App's own
-# credential path, and only the App can exercise it. The `/ready` route that answers it is a
-# later work item; docs/deploy.md section 4 carries the manual curl in the meantime, including
-# why the check is on the response BODY and not on the status code.
-#
-# A deploy that ends here is therefore green on everything the deploying principal can observe,
-# and silent about the one thing it cannot.
 
 APP_URL="$(databricks apps get "$APP_NAME" --profile "$PROFILE" --output json \
   | python3 -c 'import json, sys; print((json.load(sys.stdin) or {}).get("url") or "")')"
-echo "==> deployed: $(req "$APP_URL" "the App url")"
-echo "    Verify the grant landed with the /ready check in docs/deploy.md section 4."
+APP_URL="$(req "$APP_URL" "the App url")"
+
+echo "==> [7/7] proving the App can read the registry as itself (GET /ready)"
+# This is the step that closes the gap step 6 leaves open. `make grant` proves the CATALOG
+# agrees; only the App can exercise its own credential path, so only the App can answer this.
+#
+# The token is minted here rather than earlier because the steps above can take minutes, and a
+# workspace token has a lifetime. `scripts/deploy-app.sh --verify` mints its own the same way.
+#
+# CRITICAL: `scripts/check_ready.py` asserts on the response BODY, never on the status code.
+# An unauthenticated request to this edge returns HTTP 200 with an HTML login page, measured by
+# the Phase 1 probe, so a status check reads an auth failure as success. `set -e` turns a
+# non-zero exit here into a FAILED DEPLOY, which is the point: a deploy that reports success
+# while the App can connect and not read is what this whole step exists to prevent.
+#
+# python3 rather than `uv run`: the check imports nothing outside the standard library, which
+# is the same reasoning the Makefile records for `scripts/check_lockfile.py`.
+SHELLBOX_APP_URL="$APP_URL" \
+SHELLBOX_EDGE_TOKEN="$(databricks auth token --profile "$PROFILE" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["access_token"])')" \
+  python3 "$REPO/scripts/check_ready.py"
+
+echo "==> deployed: $APP_URL"

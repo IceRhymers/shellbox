@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import fields
 from pathlib import Path
@@ -33,10 +34,13 @@ from shellbox_app.server import (
     CONTROL_SEQ,
     DEFAULT_PORT,
     REFUSED_CLOSE_CODE,
+    WS_PING_INTERVAL_SECONDS,
+    WS_PING_TIMEOUT_SECONDS,
     Attachment,
     Relay,
     build_app,
     health_payload,
+    main,
     resolve_port,
     serve_publisher,
     serve_subscriber,
@@ -605,7 +609,7 @@ def test_resolve_port_refuses_a_value_it_cannot_serve(raw: str) -> None:
 
 def test_build_app_exposes_the_health_route_and_both_socket_routes() -> None:
     paths = {getattr(route, "path", None) for route in build_app().routes}
-    assert {"/", "/publish/{session_id}", "/subscribe/{session_id}"} <= paths
+    assert {"/", "/ready", "/publish/{session_id}", "/subscribe/{session_id}"} <= paths
 
 
 def test_two_apps_in_one_interpreter_share_no_relay() -> None:
@@ -616,3 +620,87 @@ def test_two_apps_in_one_interpreter_share_no_relay() -> None:
     state passes a process-level check and fails this one.
     """
     assert build_app().state.relay is not build_app().state.relay
+
+
+# --------------------------------------------------------------------------------------
+# The entrypoint: logging, and the WebSocket keepalive
+# --------------------------------------------------------------------------------------
+
+
+def _run_main(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Run ``main`` with ``uvicorn.run`` replaced, and return the keyword arguments it got.
+
+    ``main`` imports uvicorn inside the function and calls the module attribute, so patching
+    the attribute is enough and no server is started.
+    """
+    import uvicorn
+
+    seen: dict[str, object] = {}
+
+    def fake_run(application: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+        seen["app"] = application
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    main()
+    return seen
+
+
+def test_main_passes_both_websocket_ping_settings_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Principle 5, applied to the two values the browser's retry bound is derived from.
+
+    This app has no reaper of its own: uvicorn's failed ping is what releases a silently-dead
+    subscriber's slot. A bound derived from a library default nobody wrote down moves on a
+    dependency bump, and the browser then reports a conflict that was about to clear.
+    """
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        seen = _run_main(monkeypatch)
+    finally:
+        for handler in list(root.handlers):
+            if handler not in before:
+                root.removeHandler(handler)
+
+    assert seen["ws_ping_interval"] == WS_PING_INTERVAL_SECONDS
+    assert seen["ws_ping_timeout"] == WS_PING_TIMEOUT_SECONDS
+
+
+def test_main_configures_logging_before_it_serves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prober's only notification is a WARN line, and this is what gives it a destination.
+
+    Measured against the live `dev` deploy on 2026-08-03: with no handler on the root logger,
+    ``databricks apps logs`` carried neither the App's INFO lines nor its WARNINGs. See
+    `packages/shellbox-app/src/shellbox_app/logs.py`.
+    """
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        _run_main(monkeypatch)
+        added = [handler for handler in root.handlers if handler not in before]
+        assert added, "main served without configuring logging"
+        assert root.level <= logging.INFO, f"root logger is at {root.level}, which drops INFO"
+    finally:
+        for handler in list(root.handlers):
+            if handler not in before:
+                root.removeHandler(handler)
+
+
+def test_uvicorns_own_ping_defaults_have_not_drifted_from_the_recorded_values() -> None:
+    """A drift detector, and the reason the constants above can be called MEASURED.
+
+    Read from the installed uvicorn rather than hardcoded a second time, the same habit
+    `tests/unit/test_lakebase.py` uses for SQLAlchemy's ``pool_timeout`` default. The App
+    passes these values explicitly, so a drift changes nothing about how it runs -- it changes
+    whether the comment claiming "these are uvicorn's defaults" is still true.
+
+    A deliberate change to the App's own values makes this fail, which is correct: read the
+    WARNING on the constants first. Shortening them reaches into the sandbox's autostop timer.
+    """
+    import uvicorn
+
+    signature = inspect.signature(uvicorn.run)
+    assert signature.parameters["ws_ping_interval"].default == WS_PING_INTERVAL_SECONDS
+    assert signature.parameters["ws_ping_timeout"].default == WS_PING_TIMEOUT_SECONDS

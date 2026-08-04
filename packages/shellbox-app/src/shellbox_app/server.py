@@ -79,10 +79,14 @@ this repo has evidence for, and a reason carried in a close frame does not.
 through reaches this route, and a session name is not theirs to enumerate.
 
 ``GET /`` also touches NO database, and that is a rule rather than an accident of what it
-happens to report. It is the target of the deploy's own smoke step and of the App's periodic
-prober, so a database call here would put a Lakebase wake on the path of the one check that
-must answer when Lakebase is the thing that is broken. The inventory routes are separate, and
-a reader adding a row count to this payload should add a route instead.
+happens to report. It is the target of the deploy's own smoke step, so a database call here
+would put a Lakebase wake on the path of the one check that must answer when Lakebase is the
+thing that is broken. The inventory routes are separate, and a reader adding a row count to
+this payload should add a route instead.
+
+``GET /ready`` is the peer that DOES read the database, and it is a separate route for exactly
+that reason. See `packages/shellbox-app/src/shellbox_app/ready.py`, which also owns the
+30-minute prober this app starts in its lifespan handler.
 
 ## The database, and the two rules that keep it away from the relay
 
@@ -103,6 +107,8 @@ exist because the event loop of this process is what relays every attached termi
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -122,6 +128,8 @@ from shellbox_transport.codec import (
 from starlette.websockets import WebSocketState
 
 from shellbox_app.database import AppDatabase, open_registry
+from shellbox_app.logs import configure_logging
+from shellbox_app.ready import probe_forever, ready_payload
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +137,8 @@ __all__ = [
     "CONTROL_SEQ",
     "DEFAULT_PORT",
     "REFUSED_CLOSE_CODE",
+    "WS_PING_INTERVAL_SECONDS",
+    "WS_PING_TIMEOUT_SECONDS",
     "Attachment",
     "Relay",
     "app",
@@ -155,6 +165,34 @@ CONTROL_SEQ = UNORDERED_SEQ
 # socket was well-formed and the server declines to serve it. The reason a client branches on
 # is the `control` frame sent before the close, never this number.
 REFUSED_CLOSE_CODE = 1008
+
+# The WebSocket keepalive, passed to uvicorn explicitly rather than inherited.
+#
+# WHAT THIS CONTROLS, and it is not the keepalive itself. This app has NO reaper of its own.
+# When a subscriber's socket dies silently, `_pump`'s `await source.receive()` never returns,
+# so `Relay.release` never runs and the session's one subscriber slot stays held. What frees
+# the slot is uvicorn failing its own ping: it sends one every `ws_ping_interval` and closes
+# the connection when no pong arrives within `ws_ping_timeout`. So the sum below is the
+# worst-case time a dead subscriber holds a slot, and a browser retrying `subscriber_conflict`
+# has to outlast it or it reports a conflict that was about to clear itself.
+#
+# MEASURED, not inferred. Read out of the installed uvicorn 0.51.0 on 2026-08-03:
+# `uvicorn.config.Config.__init__` and `uvicorn.run` both declare `ws_ping_interval=20.0` and
+# `ws_ping_timeout=20.0`, as floats. The values below restate those defaults, so passing them
+# changes nothing about how the App runs today. That is the point: principle 5 says a value the
+# design depends on is declared, and a browser retry bound derived from a library default that
+# nobody wrote down is a bound that silently moves on a dependency bump.
+# `tests/unit/test_app_server.py` asserts both that `main` passes them and that uvicorn's own
+# defaults have not drifted away from them.
+#
+# WARNING: **these apply to the PUBLISHER socket too, not only the browser's.** At the values
+# below that is a no-op versus today. But SHORTENING them to tighten the reaper window makes
+# the App ping the sandbox more often, and
+# `packages/shellbox-mcp/src/shellbox_mcp/transport.py` flags exactly that traffic as an input
+# to the sandbox's autostop timer, which is Phase 5's variable. Shortening this is therefore
+# not a local decision. Lengthening it is safe here and must move the browser's retry bound.
+WS_PING_INTERVAL_SECONDS = 20.0
+WS_PING_TIMEOUT_SECONDS = 20.0
 
 
 @dataclass
@@ -354,16 +392,31 @@ def build_app(relay: Relay | None = None, database: AppDatabase | None = None) -
 
     @asynccontextmanager
     async def lifespan(api: FastAPI) -> AsyncIterator[None]:
-        """Start the credential refresher, serve, then stop it.
+        """Start the credential refresher and the prober, serve, then stop both.
 
         The App is long-lived and is the case the background refresher exists for -- see the
         module docstring of `packages/shellbox-app/src/shellbox_app/database.py`. ``stop()`` is
         in the unwind path so a reload or a failed startup elsewhere still joins the thread.
+
+        The prober is a task rather than a thread, and it is started here rather than in
+        `build_app` for the reason the refresher is: this function runs at import, and a module
+        a test suite imports must not start background work. See
+        `packages/shellbox-app/src/shellbox_app/ready.py` for what it does and why it runs
+        inside the App at all.
         """
         store.start()
+        # Kept on `state` rather than in a local, so a test has a handle on it and an operator
+        # reading this file can see that the App owns exactly one background task.
+        api.state.prober = prober = asyncio.create_task(probe_forever(store))
         try:
             yield
         finally:
+            # Cancel and await, in that order. Dropping the reference instead leaves the task
+            # to be cancelled at loop teardown, which surfaces as an unretrieved exception
+            # after the App has otherwise shut down cleanly.
+            prober.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await prober
             store.stop()
 
     api = FastAPI(lifespan=lifespan)
@@ -374,6 +427,15 @@ def build_app(relay: Relay | None = None, database: AppDatabase | None = None) -
     def health() -> dict[str, object]:
         """CRITICAL: zero database. See this module's docstring -- the rule, not the payload."""
         return health_payload(sessions)
+
+    @api.get("/ready")
+    def ready() -> dict[str, object]:
+        """The database diagnostic. CRITICAL: a sync ``def``, and the body is generic.
+
+        Both rules, and the reason this route is separate from ``GET /`` at all, are in
+        `packages/shellbox-app/src/shellbox_app/ready.py`.
+        """
+        return ready_payload(store)
 
     @api.websocket("/publish/{session_id}")
     async def publish(websocket: WebSocket, session_id: str) -> None:
@@ -501,7 +563,25 @@ def main() -> None:
     """Serve ``app`` on the port the Apps runtime chose. The ``app.yaml`` entrypoint."""
     import uvicorn
 
+    # FIRST, and before anything that might log. The App configured no logging until this call
+    # existed, which dropped every INFO line and left every WARNING to the standard library's
+    # last-resort handler -- measured against the live `dev` deploy. The prober's only
+    # notification mechanism is a WARN line, so it does not work without this. See
+    # `packages/shellbox-app/src/shellbox_app/logs.py`.
+    configure_logging()
+
     # 0.0.0.0 because the edge terminates outside the container and proxies in -- the probe
     # measured the App seeing `host: localhost:8000`, so binding the loopback alone would be
     # reachable, but the runtime does not promise that and the probe's shape is what is measured.
-    uvicorn.run(app, host="0.0.0.0", port=resolve_port())  # noqa: S104 -- see above
+    #
+    # The two ping settings are uvicorn's own current defaults, passed rather than inherited.
+    # They are what reaps a silently-dead subscriber's slot, and the browser's retry bound is
+    # derived from their sum. See the constants above, including the WARNING about the
+    # publisher socket.
+    uvicorn.run(
+        app,
+        host="0.0.0.0",  # noqa: S104 -- see above
+        port=resolve_port(),
+        ws_ping_interval=WS_PING_INTERVAL_SECONDS,
+        ws_ping_timeout=WS_PING_TIMEOUT_SECONDS,
+    )

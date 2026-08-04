@@ -570,24 +570,38 @@ def test_the_health_route_is_still_zero_database() -> None:
 
 
 def test_every_route_that_could_touch_the_database_is_a_sync_def() -> None:
-    """The rule, applied to the route table this item builds.
+    """T-P4-SYNC-ROUTES. Every `APIRoute` under `/api/` or equal to `/ready` is non-coroutine.
 
     `PostgresRegistry` is synchronous SQLAlchemy, and a blocking call in a coroutine route
     stalls the event loop that relays every attached terminal. The WebSocket routes are
-    correctly coroutines: they suspend on socket I/O and touch no database.
+    correctly coroutines: they suspend on socket I/O and touch no database. Naming `APIRoute`
+    is what excludes them, by construction rather than by a path exception.
 
-    WARNING: This check has NO positive witness yet, and it cannot have one here. The full
-    rule names `/ready`, `/api/hosts` and `/api/sessions`, and none of them exists on this
-    tree -- this item wires the database and adds no route. Whoever adds the first one owns
-    replacing this with the version that asserts the route table contains all three.
+    The positive witness is the half that stops this passing vacuously. A rule with no witness
+    is satisfied by a route table containing nothing it governs, which is the state this file
+    was in before `/ready` existed.
+
+    NOTE: the witness is `/ready` alone, because `/ready` is the only governed route on this
+    tree. The full rule also names `/api/hosts` and `/api/sessions`, and the item that adds
+    them owns extending the witness below to all three. Asserting them here would be a failing
+    test for routes nobody has claimed yet.
     """
     import inspect as inspect_module
 
     from fastapi.routing import APIRoute
 
     api_routes = [route for route in build_app().routes if isinstance(route, APIRoute)]
-    assert api_routes, "no HTTP routes at all, so this test asserts nothing"
-    for route in api_routes:
+    governed = [
+        route for route in api_routes if route.path == "/ready" or route.path.startswith("/api/")
+    ]
+
+    witness = {"/ready"}
+    assert witness <= {route.path for route in governed}, (
+        f"the route table is missing {sorted(witness - {route.path for route in governed})}, "
+        "so this rule governs nothing and passes for the wrong reason"
+    )
+
+    for route in governed:
         assert not inspect_module.iscoroutinefunction(route.endpoint), (
             f"{route.path} is an async def; a blocking database call there stalls every "
             "attached terminal at once"

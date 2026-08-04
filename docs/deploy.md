@@ -484,6 +484,39 @@ answer:
 never changes which rows come back. That is decision D5, and
 [`tests/unit/test_app_inventory.py`](../tests/unit/test_app_inventory.py) asserts it.
 
+### Checking the renderer
+
+The page is at **`$APP_URL/ui/`**, and the trailing slash matters — every asset it loads is
+referenced relatively, so `/ui` without it would resolve `app.css` against the App root. The
+mount redirects, so a browser is fine either way; a `curl` that does not follow redirects is not.
+
+```sh
+curl -sS -H "Authorization: Bearer $TOKEN" "$APP_URL/ui/" | head -5
+curl -sS -o /dev/null -w '%{http_code} %{size_download}\n' \
+  -H "Authorization: Bearer $TOKEN" "$APP_URL/ui/vendor/xterm.js"
+```
+
+`GET /` stays JSON and is still the smoke target — it must not become the page, because it is
+the one check that has to answer when Lakebase is the thing that is broken. It carries a `ui`
+field naming the path above, so a person who opens the App URL is told where to go.
+
+**Everything under `/ui/` is same-origin and vendored**, xterm.js included. There is no CDN
+reference and there must not be one: the Apps edge authenticates the request that fetched the
+page, so a third-party host would be an unauthenticated dependency on its load path.
+[`tests/unit/test_static_assets.py`](../tests/unit/test_static_assets.py) asserts the absence of
+any absolute URL and checks the vendored bundles against the hashes recorded in
+[`static/vendor/README.md`](../packages/shellbox-app/src/shellbox_app/static/vendor/README.md) —
+browser assets have no lockfile, so that table is their only integrity record.
+
+WARNING: **the renderer above the protocol layer has no automated gate at all.** ADR-23 tests
+the browser client's protocol half in Python
+([`tests/unit/test_client_protocol.py`](../tests/unit/test_client_protocol.py)) and compares the
+JavaScript's declared constants against it
+([`tests/unit/test_client_parity.py`](../tests/unit/test_client_parity.py)), and nothing
+executes the JavaScript. Frame decode, reconnect, resume and the bounded `subscriber_conflict`
+retry are covered; xterm.js wiring and every later change to it are covered by a human opening
+this page. That is a standing cost of the decision, not a gap to be closed later.
+
 ---
 
 ## 5. The endpoint path is constructed, never resolved

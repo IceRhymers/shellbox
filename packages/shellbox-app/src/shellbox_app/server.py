@@ -150,6 +150,7 @@ from shellbox_app.database import AppDatabase, open_registry
 from shellbox_app.inventory import hosts_payload, sessions_payload
 from shellbox_app.logs import configure_logging
 from shellbox_app.ready import probe_forever, ready_payload
+from shellbox_app.ui import UI_PATH, mount_ui
 
 logger = logging.getLogger(__name__)
 
@@ -328,9 +329,16 @@ def resolve_port(environ: dict[str, str] | None = None) -> int:
 
 
 def health_payload(relay: Relay) -> dict[str, object]:
-    """What ``GET /`` returns. Counts only, never identifiers -- see this module's docstring."""
+    """What ``GET /`` returns. Counts only, never identifiers -- see this module's docstring.
+
+    ``ui`` is a constant, not a count, and it is here because this route is what a human reaches
+    by opening the App's URL. The renderer cannot live at ``/`` -- this payload is the deploy's
+    smoke target and must stay JSON -- so the alternative to naming the path is a person seeing
+    this object and having nowhere to go. See `packages/shellbox-app/src/shellbox_app/ui.py`.
+    """
     return {
         "service": "shellbox-app",
+        "ui": f"{UI_PATH}/",
         "sessions": len(relay.attachments),
         "publishers": sum(1 for held in relay.attachments.values() if held.publisher is not None),
         "subscribers": sum(1 for held in relay.attachments.values() if held.subscriber is not None),
@@ -372,8 +380,7 @@ async def serve_subscriber(relay: Relay, websocket: WebSocket, session_id: str) 
         # fan-out is a protocol addition and is out of its scope. See `_refuse` below, and
         # `_pump`'s WARNING, which carries the reason.
         logger.warning(
-            "refused a second subscriber for session %s: one subscriber per session, by "
-            "design",
+            "refused a second subscriber for session %s: one subscriber per session, by design",
             session_id,
         )
         await _refuse(
@@ -490,6 +497,12 @@ def build_app(relay: Relay | None = None, database: AppDatabase | None = None) -
     @api.websocket("/subscribe/{session_id}")
     async def subscribe(websocket: WebSocket, session_id: str) -> None:
         await serve_subscriber(sessions, websocket, session_id)
+
+    # LAST, and after every route above. A mount matches by prefix, so one registered earlier
+    # would shadow anything sharing it. Nothing shares `/ui` today; the ordering is what keeps
+    # that true when someone adds a route later. See
+    # `packages/shellbox-app/src/shellbox_app/ui.py` for why the page is not at `/`.
+    mount_ui(api)
 
     return api
 

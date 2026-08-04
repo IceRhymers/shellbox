@@ -1,0 +1,67 @@
+<!doctype html>
+<!--
+  The shellbox renderer.
+
+  EVERY ASSET IS SAME-ORIGIN AND VENDORED. There is no CDN reference here and there must not be
+  one: the Databricks Apps edge authenticates the request that fetched this page, and a
+  third-party host is both an unauthenticated dependency at load time and a request this page
+  cannot promise anything about. `tests/unit/test_static_assets.py` asserts the absence of any
+  absolute URL in this file, so adding one fails `make test` rather than failing in a browser.
+
+  `vendor/` holds xterm.js 5.5.0 and its fit addon, committed as built files. See
+  `vendor/README.md` for what was fetched and how to refresh it.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>shellbox</title>
+    <link rel="stylesheet" href="vendor/xterm.css" />
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <header>
+      <a class="home" href="#">shellbox</a>
+      <span id="session-name" class="session"></span>
+      <!--
+        DISPLAY ONLY. This is whatever the edge injected as `X-Forwarded-Email`, echoed back by
+        the App. It is not an authorization input anywhere in shellbox -- decision D5 of the
+        epic -- and both inventory routes return the same rows whatever it says.
+      -->
+      <span id="viewer" class="viewer"></span>
+    </header>
+
+    <p id="banner" class="banner" hidden></p>
+
+    <main>
+      <section id="inventory-view">
+        <p id="inventory-note" class="note" hidden></p>
+        <table>
+          <thead>
+            <tr>
+              <th>session</th>
+              <th>sandbox</th>
+              <th>owner</th>
+              <th>status</th>
+              <th>size</th>
+            </tr>
+          </thead>
+          <tbody id="sessions"></tbody>
+        </table>
+      </section>
+
+      <section id="terminal-view" hidden>
+        <div id="terminal"></div>
+      </section>
+    </main>
+
+    <!--
+      The vendored UMD bundles, which define `window.Terminal` and `window.FitAddon`. Plain
+      scripts rather than modules because that is the form xterm.js ships; `terminal.js` is a
+      module and runs after both, since `type="module"` is deferred by definition.
+    -->
+    <script src="vendor/xterm.js"></script>
+    <script src="vendor/addon-fit.js"></script>
+    <script type="module" src="terminal.js"></script>
+  </body>
+</html>

@@ -318,15 +318,20 @@ def test_a_stale_handler_cannot_detach_its_successor() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# T-APP-SUBSCRIBER-CONFLICT -- fan-out is Phase 4's
+# T-APP-SUBSCRIBER-CONFLICT -- one subscriber, by decision
 # --------------------------------------------------------------------------------------
 
 
 def test_a_second_subscriber_is_refused() -> None:
-    """T-APP-SUBSCRIBER-CONFLICT. One subscriber, by scope.
+    """T-APP-SUBSCRIBER-CONFLICT. One subscriber, by decision rather than by scope.
 
-    Multi-subscriber fan-out is a Phase 4 product behavior (D6), and refusing the second socket
-    is how that boundary is visible at runtime rather than only in a docstring.
+    CORRECTED: this docstring said fan-out was Phase 4's work. Phase 4 decided the opposite.
+    The reason is backpressure, and it is stated in full in the module docstring of
+    `packages/shellbox-app/src/shellbox_app/server.py` -- fan-out needs bounded per-subscriber
+    queues plus a resync request path the protocol does not have.
+
+    Asserted on the CODE and never on the message text, so the refusal's wording can carry the
+    corrected reason without this test having an opinion about prose.
     """
     relay = Relay()
     first = FakeSocket(hold=True)

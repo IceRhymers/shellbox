@@ -356,7 +356,21 @@ export SHELLBOX_PG_USER=<service_principal_client_id>
 export SHELLBOX_PG_PASSWORD=$(databricks postgres generate-database-credential \
   "$SHELLBOX_PG_RESOURCE" -p <sp-profile> -o json \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-export SHELLBOX_PG_PORT=5432 SHELLBOX_PG_DB=shellbox SHELLBOX_PG_SSLMODE=require
+
+# CRITICAL: SHELLBOX_PG_HOST, and it is not optional. `dsn_from_env` defaults the host to
+# localhost:55432 as soon as ANY SHELLBOX_PG_* variable is set, so a block that set the user
+# and the token and not the host would run this whole check against a LOCAL Postgres and
+# report a refusal that says nothing about Lakebase. That is the same trap `make migrate`
+# guards with `require-pg-host`, arriving here through a hand-written DSN instead.
+export SHELLBOX_PG_HOST=$(databricks postgres get-endpoint "$SHELLBOX_PG_RESOURCE" \
+  -p fevm-west -o json \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"]["hosts"]["host"])')
+
+# `databricks_postgres`, which is what `variables.pg_database` declares and what
+# `scripts/bundle-vars.sh` prints as SHELLBOX_PG_DB. A wrong database name reaches a real
+# endpoint and fails with `42P01`, which reads as "the migration never ran".
+export SHELLBOX_PG_PORT=5432 SHELLBOX_PG_SSLMODE=require
+export SHELLBOX_PG_DB="${SHELLBOX_PG_DB:-databricks_postgres}"
 
 uv run python - <<'PY'
 import psycopg
@@ -381,6 +395,29 @@ App's service principal, created with `databricks account service-principal-secr
 **Whether an App-managed service principal accepts a client secret is unverified here**, and it
 is the one part of this procedure nobody has run.
 
+##### This procedure is still unrun, and `SET ROLE` is not a way around it
+
+**Measured 2026-08-03** against the `dev` endpoint, PostgreSQL 17.10, as the deploying
+principal:
+
+```
+pg_has_role('tanner.wendland@databricks.com', '<app_sp_client_id>', 'MEMBER') = False
+```
+
+So the deploying principal **cannot assume the App SP's role**, and `SET ROLE` followed by an
+`INSERT` is not an alternative route to the refusal. That is the obvious shortcut and it is
+closed. The block above, with a real client secret, remains the only known way to attempt a
+write **as** the service principal.
+
+**What is measured today, and what each half proves:**
+
+| Claim | Evidence | Strength |
+|---|---|---|
+| The SP **can read** both granted tables | `/ready` on the deployed App returns `{"ready": true}`. That is the App minting a token as itself and reading both relations through the production path | Stronger than a laptop-minted credential. It exercises the path that actually runs |
+| The SP **cannot write** | `has_table_privilege` reports `SELECT` true and `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` false on both tables | **Catalog evidence, NOT an attempted-write refusal.** The two are different claims. A catalog answer says what the grant records; only a refused statement says what Postgres enforces |
+
+Do not read the second row as satisfying the `42501` requirement. It does not.
+
 **Assert the SQLSTATE, never the message text**, which is not stable across Postgres versions.
 
 **Measured 2026-08-03**, against PostgreSQL 17.10 in a local container with a stand-in role
@@ -397,6 +434,55 @@ check.
 | `42501` | Correct. The role has no `INSERT` |
 | `23502`, `23503` | A `NOT NULL` or foreign-key violation. The statement never reached a privilege check, so it proves nothing. Fix the row, not the grant |
 | `42P01` | The table does not exist. `make migrate` has not run against this database |
+
+### The seeded inventory rows on `dev`
+
+The `dev` registry carries four rows whose ids all start with `w37a-`. They are **deliberate and
+durable**, written **2026-08-03** by the deploying principal, and they are not test debris.
+
+| Row | Id | Why it exists |
+|---|---|---|
+| host | `w37a-host-bootstrapped` | The ordinary case: a real `sandbox_id` (`w37a-sandbox-0001`) and a real `owner_email` |
+| host | `w37a-host-not-bootstrapped` | `sandbox_id` is **NULL**, which a host that was never bootstrapped has by design — a sandbox cannot learn its own id, section 1 of [`docs/sandbox-environment.md`](sandbox-environment.md). It is the rendering case `NOT_BOOTSTRAPPED_LABEL` in [`inventory.py`](../packages/shellbox-app/src/shellbox_app/inventory.py) exists for |
+| session | `w37a-session-on-bootstrapped` | A session under the bootstrapped host, carrying `cols` and `rows` |
+| session | `w37a-session-on-not-bootstrapped` | A session under the host with no `sandbox_id`, which is what a renderer must not draw as a blank row |
+
+The second host's `owner_email` is `w37a-other@example.invalid`. That is RFC 2606's reserved
+TLD, so it can never be a real mailbox — and a second owner is what makes the `mine` label
+observable: one row is the viewer's and one is not.
+
+**Without these rows the inventory endpoints cannot be checked at all.** An empty registry makes
+`GET /api/hosts` return an empty list, which is indistinguishable from a broken endpoint.
+
+### Checking the inventory endpoints
+
+The same token and URL as the `/ready` check above:
+
+```sh
+curl -sS -H "Authorization: Bearer $TOKEN" "$APP_URL/api/hosts" | python3 -c '
+import json, sys
+body = sys.stdin.read()
+data = json.loads(body)
+assert data["stale"] is False, body
+labels = {row["host_id"]: row["sandbox_label"] for row in data["hosts"]}
+assert labels["w37a-host-not-bootstrapped"] == "not bootstrapped", labels
+print("hosts:", labels)
+'
+```
+
+**Content, not status code**, for the reason the `/ready` check gives. Two fields carry the
+answer:
+
+- `stale` separates "there is nothing to show" from "the App cannot see anything".
+  `NullRegistry` returns an empty list and never raises, so an empty `hosts` alone does not tell
+  you which state you are in. When `stale` is true a `reason` accompanies it, from the same
+  closed set `/ready` uses.
+- `sandbox_label` is `not bootstrapped` for a host with no `sandbox_id`, never an empty string
+  and never the bare `host_id`.
+
+`X-Forwarded-Email` changes **only** the `viewer_email` field and the per-row `mine` flag. It
+never changes which rows come back. That is decision D5, and
+[`tests/unit/test_app_inventory.py`](../tests/unit/test_app_inventory.py) asserts it.
 
 ---
 

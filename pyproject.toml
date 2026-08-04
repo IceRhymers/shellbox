@@ -6,6 +6,18 @@ dev = [
     "pytest>=8.3,<9",
     "ruff>=0.6,<1",
     "mypy>=1.10,<2",
+    # `fastapi.testclient.TestClient` needs it, and `tests/unit/test_app_inventory.py` drives
+    # the inventory routes through a real request because the `X-Forwarded-Email` binding is
+    # half of what that file asserts.
+    #
+    # Declared rather than inherited. It already arrives transitively through the MCP SDK, so
+    # this changes nothing about what installs today -- which is the point: the App lane's
+    # tests would otherwise break the day `shellbox-mcp` changed a dependency of its own, and
+    # the failure would surface as an ImportError in a package that never mentioned httpx.
+    #
+    # A DEV dependency, so it never reaches the deployed App. That artifact's requirement set
+    # is `packages/shellbox-app/src/requirements.txt` and nothing here is copied into it.
+    "httpx>=0.27,<1",
 ]
 
 [tool.pytest.ini_options]

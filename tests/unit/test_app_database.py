@@ -581,10 +581,12 @@ def test_every_route_that_could_touch_the_database_is_a_sync_def() -> None:
     is satisfied by a route table containing nothing it governs, which is the state this file
     was in before `/ready` existed.
 
-    NOTE: the witness is `/ready` alone, because `/ready` is the only governed route on this
-    tree. The full rule also names `/api/hosts` and `/api/sessions`, and the item that adds
-    them owns extending the witness below to all three. Asserting them here would be a failing
-    test for routes nobody has claimed yet.
+    The witness is now all three governed routes. It was `/ready` alone while `/ready` was the
+    only one, and the item that added the inventory routes extended it.
+
+    NOTE: the witness is asserted against ``governed``, not against the whole route table. So a
+    route registered outside the governed paths cannot satisfy it, and the scoping rule and the
+    witness cannot drift apart.
     """
     import inspect as inspect_module
 
@@ -595,7 +597,7 @@ def test_every_route_that_could_touch_the_database_is_a_sync_def() -> None:
         route for route in api_routes if route.path == "/ready" or route.path.startswith("/api/")
     ]
 
-    witness = {"/ready"}
+    witness = {"/ready", "/api/hosts", "/api/sessions"}
     assert witness <= {route.path for route in governed}, (
         f"the route table is missing {sorted(witness - {route.path for route in governed})}, "
         "so this rule governs nothing and passes for the wrong reason"

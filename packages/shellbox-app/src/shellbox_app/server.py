@@ -27,6 +27,16 @@ transport.
   or restarted publisher mints a new epoch, and an unfamiliar epoch already means "distrust
   everything, repaint" to a subscriber. Adding a second, server-originated signal for the same
   event would give a subscriber two sources of truth for one fact.
+* **It serves one subscriber per session, and that is a decision rather than a stub.** The
+  reason is backpressure: a slow subscriber applies it to the publisher through an ``await``
+  in ``_pump``, which stalls the pane's reader. That is acceptable at one subscriber and not
+  at several. Fixing it needs bounded per-subscriber queues plus a drop policy, and a drop
+  policy on a terminal stream means a subscriber that falls behind must be RESYNCED -- which
+  needs a resync request path from the App to the publisher that no version of this protocol
+  has. Fan-out is therefore a protocol addition, not a loop change, and no phase of this
+  project has scheduled it. A refusal is transient rather than terminal for the session: see
+  ``WS_PING_INTERVAL_SECONDS``, whose sum with the timeout bounds how long a silently-dead
+  subscriber holds the slot.
 * **It holds no capability over any sandbox.** See this package's ``__init__.py``. The header
   ``X-Forwarded-Email`` is identity DISPLAY only, never authorization.
 
@@ -88,17 +98,25 @@ this payload should add a route instead.
 that reason. See `packages/shellbox-app/src/shellbox_app/ready.py`, which also owns the
 30-minute prober this app starts in its lifespan handler.
 
+``GET /api/hosts`` and ``GET /api/sessions`` DO return identifiers, and that is not a
+contradiction. They are the product rather than a liveness check: under decision D6 the App is
+open to every workspace user, so the host list is not a per-viewer secret. See
+`packages/shellbox-app/src/shellbox_app/inventory.py`, which states all five rules those two
+routes obey.
+
 ## The database, and the two rules that keep it away from the relay
 
 The registry lives on ``app.state.database``, opened once per app by
 ``shellbox_app.database.open_registry``. Two rules govern every route built on it, and both
 exist because the event loop of this process is what relays every attached terminal:
 
-1. **Every database-touching route is a sync ``def``, never ``async def``.**
-   ``PostgresRegistry`` is synchronous SQLAlchemy. FastAPI runs a sync ``def`` in a threadpool
-   and an ``async def`` on the event loop, so one blocking query in a coroutine route stalls
-   every attached terminal at once. The WebSocket routes below are correctly ``async def``,
-   which is a different case: they suspend on socket I/O and never touch the database.
+1. **Every database-touching route is a sync ``def``, never ``async def``.** The rule covers
+   every route under ``/api/`` and ``/ready``, and ``tests/unit/test_app_database.py`` asserts
+   it against that list. ``PostgresRegistry`` is synchronous SQLAlchemy. FastAPI runs a sync
+   ``def`` in a threadpool and an ``async def`` on the event loop, so one blocking query in a
+   coroutine route stalls every attached terminal at once. The WebSocket routes below are
+   correctly ``async def``, which is a different case: they suspend on socket I/O and never
+   touch the database.
 2. **Opening the registry is never fatal.** See the module docstring of
    `packages/shellbox-app/src/shellbox_app/database.py`. A Lakebase outage means the inventory
    goes stale. It never means a browser cannot attach, and
@@ -115,8 +133,9 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Annotated
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from shellbox_transport.codec import (
     UNORDERED_SEQ,
     ControlMessage,
@@ -128,6 +147,7 @@ from shellbox_transport.codec import (
 from starlette.websockets import WebSocketState
 
 from shellbox_app.database import AppDatabase, open_registry
+from shellbox_app.inventory import hosts_payload, sessions_payload
 from shellbox_app.logs import configure_logging
 from shellbox_app.ready import probe_forever, ready_payload
 
@@ -348,16 +368,21 @@ async def serve_subscriber(relay: Relay, websocket: WebSocket, session_id: str) 
     await websocket.accept()
     attachment = relay.bind_subscriber(session_id, websocket)
     if attachment is None:
+        # CORRECTED. This line said "fan-out is Phase 4's", and Phase 4 decided the opposite:
+        # fan-out is a protocol addition and is out of its scope. See `_refuse` below, and
+        # `_pump`'s WARNING, which carries the reason.
         logger.warning(
-            "refused a second subscriber for session %s: fan-out is Phase 4's", session_id
+            "refused a second subscriber for session %s: one subscriber per session, by "
+            "design",
+            session_id,
         )
         await _refuse(
             websocket,
             session_id,
             code="subscriber_conflict",
             message=(
-                "a subscriber is already bound to this session; multi-subscriber fan-out is "
-                "not implemented"
+                "a subscriber is already bound to this session; one subscriber per session "
+                "is a design decision, so retry and expect the slot to clear"
             ),
         )
         return
@@ -436,6 +461,27 @@ def build_app(relay: Relay | None = None, database: AppDatabase | None = None) -
         `packages/shellbox-app/src/shellbox_app/ready.py`.
         """
         return ready_payload(store)
+
+    @api.get("/api/hosts")
+    def api_hosts(
+        x_forwarded_email: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """The host inventory. CRITICAL: a sync ``def``, and the header is DISPLAY only.
+
+        The header binds through FastAPI rather than being read off a ``Request``, so the one
+        name this route trusts is visible in its signature. Every rule it obeys is in
+        `packages/shellbox-app/src/shellbox_app/inventory.py`.
+
+        CRITICAL: the header selects NO rows. It decides only which rows carry ``mine``.
+        """
+        return hosts_payload(store, x_forwarded_email)
+
+    @api.get("/api/sessions")
+    def api_sessions(
+        x_forwarded_email: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """The session inventory. The same two rules as ``/api/hosts``, unchanged."""
+        return sessions_payload(store, x_forwarded_email)
 
     @api.websocket("/publish/{session_id}")
     async def publish(websocket: WebSocket, session_id: str) -> None:
@@ -530,8 +576,9 @@ async def _pump(source: WebSocket, peer: Callable[[], WebSocket | None], peer_ro
       agent's publisher.
 
     WARNING: A slow subscriber applies backpressure to the publisher through this ``await``,
-    which would stall the pane's reader. Acceptable at one subscriber and not at several, so
-    whoever implements fan-out owns bounding it.
+    which would stall the pane's reader. Acceptable at one subscriber and not at several, and
+    it is the reason ``serve_subscriber`` refuses the second one. Whoever implements fan-out
+    owns bounding it, plus the resync path this module's docstring names.
     """
     while True:
         message = await source.receive()

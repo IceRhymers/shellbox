@@ -241,8 +241,22 @@ echo "    ok"
 find "$STAGE" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 find "$STAGE" -name '*.pyc' -delete 2>/dev/null || true
 
+# CAPTURED HERE, BEFORE THE SYNC, and reused by the destination assertion below. It must not be
+# recomputed after the sync, and this is not a style preference:
+#
+# `databricks sync` writes `.databricks/sync-snapshots/<hash>.json` INTO ITS SOURCE ROOT while
+# it runs, and then correctly declines to upload it. So a staged list computed afterwards holds
+# one file the destination will never have, and the assertion reports a stale-file failure on a
+# perfectly clean deploy -- with a remedy that says to delete the deployed root.
+#
+# MEASURED on the first real run, 2026-08-03: the deploy reached the assertion having uploaded
+# all 22 files correctly, and failed on `./.databricks/sync-snapshots/c2c6837e3653b878.json`.
+# The hazard was already recorded for the build stamp; it reaches anything that reads `$STAGE`
+# after the sync.
+STAGED_FILES="$(cd "$STAGE" && find . -type f | sort)"
+
 echo "==> the root that will be uploaded"
-(cd "$STAGE" && find . -type f | sort | sed 's/^/    /')
+printf '%s\n' "$STAGED_FILES" | sed 's/^/    /'
 if (cd "$STAGE" && find . -name '*.pyc' | grep -q .); then
   echo "ERROR: bytecode survived into the deploy root." >&2
   exit 1
@@ -301,7 +315,7 @@ databricks workspace export-dir "$WS_PATH" "$EXPORTED" --overwrite --profile "$P
 # `|| true` because diff exits 1 on a difference, which `set -e` would otherwise turn into a
 # bare exit with none of the explanation below.
 ROOT_DIFF="$(diff -u \
-  <(cd "$STAGE" && find . -type f | sort) \
+  <(printf '%s\n' "$STAGED_FILES") \
   <(cd "$EXPORTED" && find . -type f | sort) || true)"
 if [[ -n "$ROOT_DIFF" ]]; then
   echo "ERROR: the deployed root does not match the staged root." >&2
@@ -314,6 +328,32 @@ if [[ -n "$ROOT_DIFF" ]]; then
   exit 1
 fi
 echo "    ok"
+
+# THE COMPUTE MUST BE RUNNING BEFORE THE CODE CAN DEPLOY, and this is measured rather than
+# assumed. `databricks apps deploy` against a stopped app fails:
+#
+#     Error: Cannot deploy app shellbox-dev as it is not in RUNNING state.
+#            Please start the app first.
+#
+# and `apps get` says the same thing from the other side: "Start the app compute to deploy the
+# app." Measured 2026-08-03, CLI v1.8.0, on the first real `make deploy`.
+#
+# WHY THE APP IS STOPPED AT ALL, and why that is correct. `resources/app.yml` declares no
+# `lifecycle.started`, so `bundle deploy` creates the App RESOURCE and no deployment -- which is
+# the single line that stops the bundle from clobbering what this script uploads. The cost of
+# that choice is exactly this: nobody starts the compute, so this script must.
+#
+# CORRECTION: `resources/app.yml` claimed "an app deployment starts the compute". It does not.
+# The dependency runs the other way, and the comment there now says so.
+#
+# `apps start` BLOCKS until ACTIVE by default (20m timeout), so no bespoke wait loop is needed
+# here. It is a no-op on an already-running app, which keeps this script idempotent.
+APP_COMPUTE="$(databricks apps get "$APP_NAME" --profile "$PROFILE" --output json \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("compute_status",{}).get("state") or "")')"
+if [[ "$APP_COMPUTE" != "ACTIVE" ]]; then
+  echo "==> starting the app compute (state: ${APP_COMPUTE:-unknown}; provisioning takes a few minutes)"
+  databricks apps start "$APP_NAME" --profile "$PROFILE" >/dev/null
+fi
 
 echo "==> deploying"
 databricks apps deploy "$APP_NAME" --source-code-path "$WS_PATH" --profile "$PROFILE"

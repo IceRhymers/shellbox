@@ -40,8 +40,21 @@ resources:
       # the wrong lever: the app not starting is a compute or a code problem, and this field
       # converts two mechanisms that coexist into one that silently reverts the other on every
       # deploy. `make lint` asserts the absence, because a comment alone would not have stopped
-      # it. If you need the app started, use `databricks apps start`, or let
-      # `scripts/deploy-app.sh` deploy it -- an app deployment starts the compute.
+      # it.
+      #
+      # The cost of omitting it, stated because it is not free and was measured wrong here
+      # once: NOTHING starts the compute. `bundle deploy` creates the App resource in state
+      # STOPPED, and this comment used to claim "an app deployment starts the compute" -- it
+      # does not. The dependency runs the OTHER WAY, and the platform says so in both
+      # directions (measured 2026-08-03, CLI v1.8.0):
+      #
+      #     apps deploy -> "Cannot deploy app ... as it is not in RUNNING state.
+      #                     Please start the app first."
+      #     apps get    -> "Start the app compute to deploy the app."
+      #
+      # So `scripts/deploy-app.sh` runs `databricks apps start` before it deploys. That is a
+      # CLI call and not a bundle field, so it starts the app without handing the bundle the
+      # ability to revert this script -- which is the whole point of the absent field above.
       #
       # Worth knowing while you are here: the bundle DOES see the script's deploys as drift. It
       # reads remote state from the active deployment specifically to detect out-of-band

@@ -120,7 +120,7 @@ test-tmux:
 test-integration:
 	uv run pytest tests/integration -v
 
-# The guard the donor project called its PGHOST guard. The variable name differs here on
+# The guard the donor project called its PGHOST guard. The variable names differ here on
 # purpose: `dsn_from_env` in packages/shellbox-registry/src/shellbox_registry/dsn.py reads
 # SHELLBOX_DATABASE_URL, then SHELLBOX_PG_USER / _PASSWORD / _HOST / _PORT / _DB. Guarding
 # PGHOST would guard a name nothing in this repo consumes, which is a check that cannot fail.
@@ -128,55 +128,57 @@ test-integration:
 # What it stops: `dsn_from_env` DEFAULTS the host to localhost:55432 as soon as ANY
 # SHELLBOX_PG_* variable is set. So a developer with a half-configured local environment runs
 # `make migrate`, migrates their laptop, and reads the green result as a production migration.
-# On `make deploy` it is worse, because the App half of that run really did reach production.
 #
-# It asserts the host is SET, not that it is remote. A deliberate `make migrate` against a
-# local Postgres stays possible, because that is a thing developers legitimately do -- what is
-# no longer possible is reaching one by accident.
+# It accepts EITHER a Lakebase endpoint (SHELLBOX_PG_RESOURCE) or a DSN, because those are the
+# two things the migration and the grant can now connect from. The endpoint is the easy path
+# and the message names it first: one variable, and the host, the Postgres role and the OAuth
+# token are all derived from it in code. A DSN stays supported -- it is how a deliberate
+# migration against a local Postgres works, and that is a thing developers legitimately do.
 #
-# NOTE on the FIRST deploy of a target: the endpoint does not exist yet, so its host cannot be
-# resolved yet, and this guard has nothing to accept. The answer is not a placeholder value --
-# that is how a guard becomes something people route around by reflex. Run `databricks bundle
-# deploy` on its own to create the Lakebase resources, resolve the host from the endpoint it
-# made, and then `make deploy`. The message below says so, because the alternative is an
-# operator inventing `SHELLBOX_PG_HOST=x` and never unlearning it.
+# NOTE: the name predates the resource path. It asserts "a database is configured", not "a host
+# variable is set". Renaming it would mean editing the three files that cite it by name --
+# scripts/check_deploy_principal.py, tests/unit/test_deploy_principal.py, and
+# packages/shellbox-app/src/shellbox_app/config.py -- so the name stays and this note is here
+# instead.
+#
+# NOTE on the FIRST deploy of a target: the endpoint does not exist yet, but its RESOURCE PATH
+# is constructed from ids the bundle already declares, so `scripts/bundle-vars.sh` prints it
+# before anything is provisioned and this guard has something to accept. `make deploy` runs
+# `bundle deploy` first for that reason. Do NOT set a placeholder host -- that is how a guard
+# becomes something people route around by reflex.
 require-pg-host:
-	@if [ -z "$${SHELLBOX_DATABASE_URL:-}" ] && [ -z "$${SHELLBOX_PG_HOST:-}" ]; then \
-		echo "ERROR: neither SHELLBOX_PG_HOST nor SHELLBOX_DATABASE_URL is set." >&2; \
-		echo "  Without one of them the registry DSN silently defaults to localhost:55432," >&2; \
-		echo "  so this command would target a local Postgres and report success." >&2; \
-		echo "  Resolve the host from the endpoint this bundle declares:" >&2; \
+	@if [ -z "$${SHELLBOX_PG_RESOURCE:-}" ] && [ -z "$${SHELLBOX_DATABASE_URL:-}" ] \
+			&& [ -z "$${SHELLBOX_PG_HOST:-}" ]; then \
+		echo "ERROR: no database is configured for this command." >&2; \
+		echo "  Without one the registry DSN silently defaults to localhost:55432, so this" >&2; \
+		echo "  command would target a local Postgres and report success." >&2; \
+		echo "  The easy path is the endpoint this bundle declares. It needs no credential of" >&2; \
+		echo "  its own -- the host, the role and the token are derived from it:" >&2; \
 		echo "    eval \"\$$(scripts/bundle-vars.sh -t $(TARGET) -p $(PROFILE))\"" >&2; \
-		echo "    databricks postgres get-endpoint \"\$$SHELLBOX_PG_RESOURCE\" -p $(PROFILE)" >&2; \
-		echo "  On the FIRST deploy of a target the endpoint does not exist yet. Create it" >&2; \
-		echo "  with 'databricks bundle deploy -t $(TARGET) --profile $(PROFILE)', then resolve" >&2; \
-		echo "  the host as above. Do NOT set a placeholder. See docs/deploy.md section 3." >&2; \
+		echo "    export SHELLBOX_PG_RESOURCE" >&2; \
+		echo "  Or set SHELLBOX_DATABASE_URL, or SHELLBOX_PG_HOST and the credential parts." >&2; \
+		echo "  See docs/deploy.md section 3." >&2; \
 		exit 1; \
 	fi
 
-# `make deploy` is TWO commands, and neither one is redundant.
+# `make deploy` is SIX ordered steps, and the order is the load-bearing part. They live in
+# `scripts/deploy.sh` rather than here: a recipe is a list of commands with nowhere to record
+# why a step is where it is, and no way to wait for the App to reach ACTIVE. Read that script's
+# header for the order and the reason behind each position.
 #
-# `bundle deploy` reconciles the Lakebase project, branch, endpoint and database, and the App
-# RESOURCE. It does not deploy the App's code: the Databricks docs say "Deploying a bundle
-# doesn't automatically deploy the app to compute", and the code deployment is a separate API
-# call. `scripts/deploy-app.sh` issues that call, after flattening the two uv workspace packages
-# into one importable root -- see its header for why that flattening is not optional.
+# No `require-pg-host` on this target, deliberately. Step 1 is `bundle deploy`, which reads no
+# DSN at all, and step 2 derives SHELLBOX_PG_RESOURCE from the bundle and exports it for the
+# steps that do. A guard here would demand a variable the pipeline is about to produce.
 #
-# The two mechanisms coexist only because `resources/app.yml` declares no `lifecycle.started`.
-# Read the CRITICAL comment there before changing anything on this path.
-#
-# The App name and its code root are read back out of the bundle rather than recomputed here, so
-# there is one declaration of each. `scripts/bundle-vars.sh` does that in one `validate` call.
+# The two deploy mechanisms coexist only because `resources/app.yml` declares no
+# `lifecycle.started`. Read the CRITICAL comment there before changing anything on this path.
 #
 # BEFORE THE FIRST DEPLOY of a target whose App already exists, a human runs the one-time
-# adoption step in docs/deploy.md. It is not a step here: `bundle deployment bind` prompts
-# unless it is passed --auto-approve, so inside this target it would either block or silently
-# re-adopt whatever the name points at on every run.
-deploy: require-pg-host
-	databricks bundle deploy -t $(TARGET) --profile $(PROFILE)
-	eval "$$(scripts/bundle-vars.sh --target $(TARGET) --profile $(PROFILE))" && \
-		scripts/deploy-app.sh --profile $(PROFILE) --app "$$SHELLBOX_APP_NAME" \
-			--source-code-path "$$SHELLBOX_APP_SOURCE_PATH"
+# adoption step in docs/deploy.md section 2. It is not a step in the script: `bundle deployment
+# bind` prompts unless it is passed --auto-approve, so inside the pipeline it would either block
+# or silently re-adopt whatever the name points at on every run.
+deploy:
+	scripts/deploy.sh --target $(TARGET) --profile $(PROFILE)
 
 # The second guard on this path, and it guards the IDENTITY rather than the destination.
 #
@@ -192,16 +194,20 @@ deploy: require-pg-host
 require-deploy-principal:
 	@python3 scripts/check_deploy_principal.py "this command"
 
+# DATABRICKS_CONFIG_PROFILE, and it is not decoration. With SHELLBOX_PG_RESOURCE set, alembic's
+# env.py resolves the host and the Postgres role through the Databricks SDK -- and the SDK reads
+# its profile from the environment, where an unset value resolves to DEFAULT. In this account
+# DEFAULT is a DIFFERENT workspace with a confusingly similar name, so the migration would
+# authenticate somewhere nobody chose. The DSN path ignores this variable entirely.
 migrate: require-pg-host require-deploy-principal
-	uv run alembic -c alembic.ini upgrade head
+	DATABRICKS_CONFIG_PROFILE=$(PROFILE) uv run alembic -c alembic.ini upgrade head
 
 # The App's service principal gets SELECT on hosts and sessions, and nothing else.
 #
-# NOT part of `make deploy`, and the sequencing is the reason: this needs the migration to have run
-# (a grant needs its table) and the App to be ACTIVE (the SP's Postgres role appears after
-# activation). It is a step in the documented bootstrap sequence -- docs/deploy.md section 4 -- and
-# a deploy that skips it fails on `/ready` rather than silently serving 500s from every inventory
-# call.
+# This is step 6 of `scripts/deploy.sh`, and it stays a target of its own because it is also the
+# thing to re-run on its own after a migration adds a table the App reads. Its position in the
+# pipeline is forced twice over: a grant needs its table, so the migration must have run, and the
+# SP's Postgres role appears in pg_roles only after the App reaches ACTIVE.
 #
 # See scripts/grant-app-sp.sh for why this exists at all: everything verified before it
 # authenticated as a workspace user, and the App authenticates as its service principal.

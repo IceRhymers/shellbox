@@ -159,6 +159,28 @@ def disposed() -> Iterator[list[AppDatabase]]:
 # --------------------------------------------------------------------------------------
 
 
+def test_the_app_and_the_registry_share_one_database_default() -> None:
+    """CRITICAL: one constant, so the App and the migration cannot reach different databases.
+
+    `config.DEFAULT_DATABASE` used to be its own literal, ``"shellbox"``, beside a comment
+    claiming it mirrored the bundle. Commit `a50dca8` changed the bundle's `pg_database`
+    default to `databricks_postgres` and the literal stayed, so `alembic upgrade head` would
+    have migrated one database while the App read another -- and both halves report success.
+
+    This asserts IDENTITY rather than equality to a literal. A restated value would satisfy an
+    equality check on the day it was written and drift the next time the bundle moved, which is
+    the exact failure above. `test_the_default_database_is_the_one_the_bundle_declares` in
+    `tests/unit/test_lakebase.py` is the other half: it reads `databricks.yml` from disk, so
+    the one constant is pinned to the bundle rather than merely shared.
+    """
+    from shellbox_registry.lakebase import DEFAULT_DATABASE as REGISTRY_DEFAULT
+
+    assert config.DEFAULT_DATABASE is REGISTRY_DEFAULT, (
+        "shellbox_app.config declares its own database default again; it must re-export "
+        "shellbox_registry.lakebase.DEFAULT_DATABASE, which the bundle pins"
+    )
+
+
 def test_the_endpoint_comes_from_the_environment_and_the_user_is_the_client_id() -> None:
     """The deployed shape: the resource path mints, the host is dialled, the SP client id
     is the Postgres role."""

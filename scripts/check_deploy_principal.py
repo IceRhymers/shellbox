@@ -36,6 +36,23 @@ the variable names ``dsn_from_env`` actually reads -- is pinned by
 ``tests/unit/test_deploy_principal.py``, which imports the real function and asserts it. The
 donor project's guard named ``PGHOST``, a variable nothing in this repo consumes; a test is what
 keeps this one from becoming that.
+
+## What this guard does NOT cover, and where that half lives
+
+``SHELLBOX_PG_RESOURCE`` names a Lakebase endpoint, and the role is then DERIVED from
+``current_user.me()`` at connect time rather than exported. **So on that path this guard has
+nothing to inspect and returns 0.** That is not a hole left open. Deriving the role is itself
+the stronger property -- the connection authenticates as whoever ran the command -- and the
+derived name is checked where it becomes known:
+
+- ``packages/shellbox-registry/src/shellbox_registry/alembic/env.py`` refuses a derived role of
+  this shape before it opens a connection.
+- ``scripts/grant_app_sp.py`` refuses when the SERVER reports ``current_user`` equal to the App
+  SP, which is the only authority on which identity actually connected.
+
+The shape rule is therefore written twice, here and in ``shellbox_registry.lakebase``, because
+this file must import nothing. ``tests/unit/test_deploy_principal.py`` asserts the two copies
+agree on the same corpus, which is what keeps them one rule.
 """
 
 from __future__ import annotations
@@ -96,8 +113,14 @@ def main(argv: list[str] | None = None) -> int:
 
     user = configured_user()
     if user is None:
-        # A missing DSN is a different failure with its own guard: `require-pg-host` in the
-        # Makefile. Reporting it twice, in two wordings, would make one condition look like two.
+        # Two different states reach here, and neither is this guard's to report.
+        #
+        # A missing DSN has its own guard: `require-pg-host` in the Makefile, which says what to
+        # set. Reporting it twice, in two wordings, would make one condition look like two.
+        #
+        # A configured SHELLBOX_PG_RESOURCE with no exported user is the NORMAL deploy path, and
+        # the role is derived there rather than declared. See the module docstring for where the
+        # derived name is checked.
         return 0
 
     if is_service_principal_role(user):

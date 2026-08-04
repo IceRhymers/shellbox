@@ -62,14 +62,27 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_DATABASE",
     "Credential",
     "LakebaseCredentials",
     "LakebaseEndpoint",
     "TokenMinter",
     "create_lakebase_engine",
+    "is_service_principal_role",
     "lakebase_registry",
+    "resolve_lakebase_endpoint",
     "sdk_token_minter",
 ]
+
+# The Postgres database a Lakebase project auto-provisions, and therefore the one every
+# caller reaches unless it says otherwise.
+#
+# It restates the `pg_database` variable's default in `databricks.yml`, which is the
+# authority. Both are the UNDERSCORED name used to CONNECT -- the database RESOURCE id is
+# the hyphenated `databricks-postgres` and appears only in the App binding path in
+# `resources/app.yml`. Measured 2026-08-03: `list-databases` reports
+# `database_id: databricks-postgres` and `postgres_database: databricks_postgres`.
+DEFAULT_DATABASE = "databricks_postgres"
 
 # How long before stated expiry a token is treated as spent.
 #
@@ -161,6 +174,107 @@ class LakebaseEndpoint:
             f"postgresql+psycopg://{quote_plus(self.user)}{secret}"
             f"@{self.host}:{self.port}/{self.database}?sslmode=require"
         )
+
+
+# The canonical dashed 8-4-4-4-12 uuid, and deliberately only that form.
+#
+# `uuid.UUID` also accepts 32 undashed hex characters, which would classify a role legitimately
+# named for a hex digest as a service principal. Refusing a real migration is the expensive
+# direction of a wrong answer, so this matches the shape the CLI actually emits.
+_UUID_SEGMENTS = (8, 4, 4, 4, 12)
+
+
+def is_service_principal_role(user: str) -> bool:
+    """True when ``user`` has the shape of a Lakebase service-principal role name.
+
+    Lakebase names a role for its OAuth principal, so a service principal's role name IS its
+    client id, which is a uuid -- ``databricks postgres create-role --help`` (CLI v1.8.0)
+    documents the spec as ``{"identity_type": "SERVICE_PRINCIPAL", "postgres_role":
+    "<SP_CLIENT_ID>"}``. A workspace user's role name is their email, which never matches.
+
+    ``scripts/check_deploy_principal.py`` carries a second copy of this rule, and it has to:
+    that guard runs under a bare ``python3`` on a checkout with nothing synced, so it cannot
+    import this package. ``tests/unit/test_deploy_principal.py`` asserts the two agree, which
+    is what keeps the copy from drifting into a different rule.
+    """
+    parts = user.split("-")
+    if len(parts) != len(_UUID_SEGMENTS):
+        return False
+    return all(
+        len(part) == width and all(c in "0123456789abcdefABCDEF" for c in part)
+        for part, width in zip(parts, _UUID_SEGMENTS, strict=True)
+    )
+
+
+def resolve_lakebase_endpoint(
+    resource_name: str,
+    *,
+    database: str = DEFAULT_DATABASE,
+    user: str | None = None,
+    client: Any | None = None,
+) -> LakebaseEndpoint:
+    """Turn an endpoint resource name into a complete `LakebaseEndpoint`.
+
+    Only the resource name is ever written down. `scripts/bundle-vars.sh` constructs it from
+    the three ids the bundle declares and prints it as ``SHELLBOX_PG_RESOURCE``; this function
+    supplies the rest from the workspace. That is the difference between a deploy-time command
+    taking ONE value and an operator exporting six.
+
+    ``host`` comes from ``get_endpoint(resource_name).status.hosts.host``. It is a DIFFERENT
+    string from ``resource_name`` -- the resource name mints tokens, the host is what psycopg
+    dials -- and section 6 of ``docs/lakebase-handoff.md`` records that JSON shape.
+
+    **CRITICAL: deriving the user is a safety property, not a convenience.** Omitted, ``user``
+    is ``current_user.me().user_name``, so the connection authenticates as whoever ran the
+    command. A migration therefore runs as the DEPLOYING PRINCIPAL by construction, and it
+    cannot silently run as the App's service principal -- which holds ``SELECT`` on two tables,
+    fails a migration on a permission error, and whose tempting fix is a wider grant.
+    ``scripts/check_deploy_principal.py`` makes that argument in full. Pass ``user`` only to
+    override the derivation deliberately.
+
+    ``client`` is the same testability seam `sdk_token_minter` offers, and the SDK import is
+    lazy for the same reason: `shellbox-registry` is SDK-free at import time and must stay so.
+    """
+    if client is None:
+        try:
+            from databricks.sdk import WorkspaceClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "resolving a Lakebase endpoint needs the databricks-sdk; install "
+                "shellbox-registry[lakebase]"
+            ) from exc
+        client = WorkspaceClient()
+
+    # Each hop is guarded on its own. The SDK returns dataclasses whose fields are all
+    # Optional, so an endpoint that exists but is not reporting a host yet gives `None` at any
+    # of three levels -- and a `None` that reached `LakebaseEndpoint` would surface much later
+    # as a psycopg error naming no host.
+    endpoint = client.postgres.get_endpoint(resource_name)
+    status = getattr(endpoint, "status", None)
+    hosts = getattr(status, "hosts", None) if status is not None else None
+    host = getattr(hosts, "host", None) if hosts is not None else None
+    if not host:
+        raise RuntimeError(
+            f"Lakebase reported no host for {resource_name!r}. The endpoint may not be "
+            f"provisioned yet: run `databricks bundle deploy` for this target first, then "
+            f"`databricks postgres get-endpoint {resource_name}` to see what it reports."
+        )
+
+    resolved_user = user
+    if not resolved_user:
+        resolved_user = getattr(client.current_user.me(), "user_name", None)
+    if not resolved_user:
+        raise RuntimeError(
+            "could not resolve a Postgres role: the workspace reported no user_name for the "
+            "current principal. Pass user=... to name the role explicitly."
+        )
+
+    return LakebaseEndpoint(
+        resource_name=resource_name,
+        host=host,
+        database=database,
+        user=resolved_user,
+    )
 
 
 def sdk_token_minter(

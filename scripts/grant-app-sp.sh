@@ -12,6 +12,11 @@
 #             passed through to `scripts/grant_app_sp.py`. Opt-in and UNVERIFIED -- read that
 #             script's header before using it.
 #
+# THE CONNECTION IS DERIVED, not exported. `scripts/bundle-vars.sh` gives the endpoint resource
+# path, and `scripts/grant_app_sp.py` resolves the host, the Postgres role and the OAuth token
+# from it. An operator therefore mints nothing by hand. A pre-configured DSN still works and is
+# still the local-Postgres path; the endpoint wins when both are present.
+#
 # WHY THIS EXISTS, and it is worth the paragraph. Everything verified before this authenticated as
 # a WORKSPACE USER. The App authenticates as its service principal, whose Postgres role name is
 # the SP client id, and that path has never run. If the role has no grant, the App is broken in
@@ -54,6 +59,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The CLI calls below pass --profile; the SDK reads the environment. `scripts/grant_app_sp.py`
+# resolves the endpoint host and the Postgres role through the SDK, and an unset
+# DATABRICKS_CONFIG_PROFILE resolves to DEFAULT -- a DIFFERENT workspace in this account. This
+# line is what keeps the two halves of the grant pointed at the same place.
+export DATABRICKS_CONFIG_PROFILE="$PROFILE"
 
 # The retry idiom, and the shape is deliberate: attempts, delay, then the command. The plan
 # specifies `retry 5 10 grant_attempt`, so the numbers are the caller's and the budget is 40
@@ -123,13 +134,27 @@ grant_attempt() {
 # The bundle is read only when it has to be. With `--app` given, this script needs no bundle at
 # all, which keeps it usable against an App that no target declares -- and `bundle validate`
 # authenticates, so not calling it is also one fewer thing to fail.
-PG_BRANCH=""
 if [[ -z "$APP_NAME" ]]; then
-  echo "==> resolving the App and the Lakebase branch from the bundle"
-  eval "$("$REPO/scripts/bundle-vars.sh" --target "$TARGET" --profile "$PROFILE")"
+  echo "==> resolving the App and the Lakebase endpoint from the bundle"
+  # Captured BEFORE the eval, on purpose. `eval "$(cmd)"` reports the status of `eval`, not of
+  # `cmd`, so a bundle-vars failure produces an empty string, `eval ""` succeeds, `set -e` sees
+  # nothing wrong, and every variable below stays unset.
+  if ! BUNDLE_VARS="$("$REPO/scripts/bundle-vars.sh" --target "$TARGET" --profile "$PROFILE")"; then
+    echo "ERROR: could not read the bundle for target $TARGET; see the message above." >&2
+    exit 1
+  fi
+  eval "$BUNDLE_VARS"
   APP_NAME="$SHELLBOX_APP_NAME"
-  PG_BRANCH="${SHELLBOX_PG_RESOURCE%/endpoints/*}"
 fi
+
+# EXPORTED, because `scripts/grant_app_sp.py` runs as a child process and reads this from its
+# environment to derive the host, the role and the token. Left unexported it would be invisible
+# there, the grant would fall back to `dsn_from_env`, and on a machine with a stale
+# SHELLBOX_PG_HOST that means granting on a local Postgres and reporting success.
+export SHELLBOX_PG_RESOURCE="${SHELLBOX_PG_RESOURCE:-}"
+# Empty when neither the bundle nor the caller supplied a resource, which only skips the
+# informational control-plane check below.
+PG_BRANCH="${SHELLBOX_PG_RESOURCE%/endpoints/*}"
 echo "    app=$APP_NAME target=$TARGET profile=$PROFILE"
 
 echo "==> checking the credential is the deploying principal and not the App SP"

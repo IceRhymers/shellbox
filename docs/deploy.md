@@ -1,27 +1,36 @@
 # Deploying shellbox
 
-`make deploy` provisions Lakebase and deploys the App. This file covers the two prerequisites
-that are not `make` steps, the grant that follows the first deploy, and the one field nobody
-should add.
+`make deploy` provisions Lakebase, migrates the registry, deploys the App and grants its service
+principal the reads it needs. This file covers the one prerequisite that is not a `make` step,
+the order the pipeline runs in, the grant, and the one field nobody should add.
 
 Everything here was checked against **Databricks CLI v1.8.0** on **2026-08-03**. Where a claim
 was measured, it says so.
 
 ---
 
-## 1. Two mechanisms, and why
+## 1. The pipeline, and the two deploy mechanisms inside it
 
-`make deploy TARGET=<target>` runs two commands:
+`make deploy TARGET=<target>` runs [`scripts/deploy.sh`](../scripts/deploy.sh). That is six
+ordered steps, and the order is the load-bearing part:
 
-1. `databricks bundle deploy` reconciles the Lakebase project, branch, endpoint and database,
-   plus the App **resource**.
-2. [`scripts/deploy-app.sh`](../scripts/deploy-app.sh) deploys the App's **code**.
+| | Step | Why it is here and not earlier |
+|---|---|---|
+| 1 | `databricks bundle deploy` | Provisions Lakebase and the App **resource**. Steps 2 and 3 address an endpoint that does not exist until it runs |
+| 2 | [`scripts/bundle-vars.sh`](../scripts/bundle-vars.sh) | One `validate` call for the App name, its code root, and the endpoint resource path |
+| 3 | `make migrate` | Before the code deploys. Running as the deploying principal makes that principal the **owner** of the tables, which is what lets step 6 grant reads on them |
+| 4 | [`scripts/deploy-app.sh`](../scripts/deploy-app.sh) | Deploys the App's **code** and starts compute. The service principal and its Postgres role materialise here, not at step 1 |
+| 5 | Wait for `compute_status.state == ACTIVE` | The SP's role appears in `pg_roles` some time **after** activation |
+| 6 | `make grant` | Needs the tables from step 3 and the role from step 5 |
 
-The second is not redundant. A `bundle deploy` does not create an app deployment, and the
-Databricks docs state it verbatim: *"Deploying a bundle doesn't automatically deploy the app to
-compute."* The code deployment is a separate API call. `deploy-app.sh` issues it, after
-flattening the two uv workspace packages into one importable root — its header explains why that
-flattening is not optional.
+Steps 3 and 6 stay usable on their own — `make migrate` and `make grant` are targets, and the
+grant is what to re-run after a migration adds a table the App reads.
+
+Steps 1 and 4 are the two deploy mechanisms, and the second is not redundant. A `bundle deploy`
+does not create an app deployment, and the Databricks docs state it verbatim: *"Deploying a
+bundle doesn't automatically deploy the app to compute."* The code deployment is a separate API
+call. `deploy-app.sh` issues it, after flattening the two uv workspace packages into one
+importable root — its header explains why that flattening is not optional.
 
 The two coexist because of one absence.
 
@@ -42,8 +51,8 @@ without `started`.
 
 ## 2. Prerequisite: adopt an App that already exists
 
-**Run this once per target, by hand, before that target's first deploy. It is not a `make`
-step.**
+**Run this once per target, by hand, before that target's first deploy. It is not a `make` step
+and it is not a step in [`scripts/deploy.sh`](../scripts/deploy.sh).**
 
 ```sh
 databricks bundle deployment bind shellbox_app shellbox --auto-approve --profile fevm-west
@@ -56,10 +65,10 @@ is a certainty, not a risk. Skip the bind and the first deploy fails loudly.
 
 The `dev` target names its App `shellbox-dev`, which does not exist yet, so `dev` needs no bind.
 
-**Why it is not a `make` step.** `bundle deployment bind` prompts for confirmation unless
-`--auto-approve` is passed. Inside a target it would therefore either block on an interactive
-prompt, or carry `--auto-approve` and silently re-adopt whatever the name points at on every
-run. Adoption is a one-time act and belongs in a runbook.
+**Why it is not automated.** `bundle deployment bind` prompts for confirmation unless
+`--auto-approve` is passed. Inside the pipeline it would therefore either block on an
+interactive prompt, or carry `--auto-approve` and silently re-adopt whatever the name points at
+on every run. Adoption is a one-time act and belongs in a runbook.
 
 `shellbox_app` is the resource key in [`resources/app.yml`](../resources/app.yml). Renaming that
 key changes this command, which is why `make lint` asserts the key still exists.
@@ -75,58 +84,83 @@ Confirm the bind worked by checking that the next `bundle deploy` plans `update`
 
 ---
 
-## 3. Prerequisite: the registry host must be set
+## 3. The connection is derived, not exported
 
-`make deploy` and `make migrate` both refuse to run unless `SHELLBOX_PG_HOST` or
-`SHELLBOX_DATABASE_URL` is set.
+**`make deploy` needs nothing exported.** Step 2 of the pipeline derives `SHELLBOX_PG_RESOURCE`
+from the bundle and exports it for steps 3 and 6, so a deploy is one command:
 
-`dsn_from_env` in [`dsn.py`](../packages/shellbox-registry/src/shellbox_registry/dsn.py)
-defaults the host to `localhost:55432` as soon as **any** `SHELLBOX_PG_*` variable is set. So a
-half-configured environment makes `make migrate` migrate a laptop and report success. The guard
-asserts the host is set; it does not assert that it is remote, because migrating a local
-Postgres on purpose stays legitimate.
+```sh
+make deploy TARGET=dev PROFILE=fevm-west
+```
 
-To point at the endpoint this bundle declares:
+`SHELLBOX_PG_RESOURCE` is the endpoint's resource path,
+`projects/<project>/branches/<branch>/endpoints/<endpoint>`. Everything else is resolved in code
+by `resolve_lakebase_endpoint` in
+[`lakebase.py`](../packages/shellbox-registry/src/shellbox_registry/lakebase.py):
+
+| Value | Where it comes from |
+|---|---|
+| host | `get_endpoint(resource).status.hosts.host` |
+| Postgres role | `current_user.me().user_name` — **whoever ran the command** |
+| password | An OAuth token, minted per physical connection and never written into a URL |
+| database | `SHELLBOX_PG_DB`, defaulting to the bundle's `pg_database` (`databricks_postgres`) |
+
+**Deriving the role is a safety property, not a convenience.** The migration authenticates as
+the deploying principal by construction, so it cannot silently run as the App's service
+principal. Section 4 explains why that matters.
+
+### Running `make migrate` or `make grant` on their own
+
+Both need the same one variable, and
+[`scripts/bundle-vars.sh`](../scripts/bundle-vars.sh) prints it:
 
 ```sh
 eval "$(scripts/bundle-vars.sh --target dev --profile fevm-west)"
-export SHELLBOX_PG_HOST=$(databricks postgres get-endpoint "$SHELLBOX_PG_RESOURCE" \
-  -p fevm-west -o json | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"]["hosts"]["host"])')
-export SHELLBOX_PG_PASSWORD=$(databricks postgres generate-database-credential \
-  "$SHELLBOX_PG_RESOURCE" -p fevm-west -o json | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-export SHELLBOX_PG_USER=$(databricks current-user me -p fevm-west -o json \
-  | python3 -c 'import json,sys;print(json.load(sys.stdin)["userName"])')
-export SHELLBOX_PG_PORT=5432 SHELLBOX_PG_DB=shellbox SHELLBOX_PG_SSLMODE=require
+export SHELLBOX_PG_RESOURCE
+make migrate TARGET=dev PROFILE=fevm-west
+make grant   TARGET=dev PROFILE=fevm-west
 ```
 
-`SHELLBOX_PG_SSLMODE` has no default and Lakebase requires TLS. Section 6 of
-[`docs/lakebase-handoff.md`](lakebase-handoff.md) records why the token goes in its own variable
-rather than into a URL.
+`PROFILE` is not optional in spirit. Both targets pass it to the CLI **and** set
+`DATABRICKS_CONFIG_PROFILE`, because the SDK reads its profile from the environment and an unset
+value resolves to `DEFAULT` — which in this account is a different workspace with a confusingly
+similar name.
 
 ### The first deploy of a target
 
-On the very first deploy the endpoint does not exist, so its host cannot be resolved and the
-guard has nothing to accept. **Do not set a placeholder.** Create the Lakebase resources first,
-then resolve the host from what they made:
+The resource path is **constructed** from ids the bundle already declares, so it exists before
+anything is provisioned — see section 5. There is no chicken-and-egg step any more, and no
+reason to invent a placeholder host.
 
-```sh
-databricks bundle deploy -t dev --profile fevm-west   # creates project, branch, endpoint, database
-eval "$(scripts/bundle-vars.sh --target dev --profile fevm-west)"
-export SHELLBOX_PG_HOST=$(databricks postgres get-endpoint "$SHELLBOX_PG_RESOURCE" \
-  -p fevm-west -o json | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"]["hosts"]["host"])')
-make deploy TARGET=dev
-```
+`databricks postgres get-endpoint "$SHELLBOX_PG_RESOURCE" -p fevm-west` reporting a host is
+still the only authoritative check that the bundle provisioned Lakebase. Nothing before a deploy
+can tell you: `bundle validate` **does not check resource references at all** — see section 8.
 
-That `get-endpoint` reporting a host is also the only authoritative check that the bundle
-provisioned Lakebase. Nothing before a deploy can tell you: `bundle validate` **does not check
-resource references at all** — see section 8.
+### The DSN path still exists
+
+A pre-configured DSN keeps working, and it is how a deliberate migration against a local
+Postgres runs. `dsn_from_env` in
+[`dsn.py`](../packages/shellbox-registry/src/shellbox_registry/dsn.py) reads
+`SHELLBOX_DATABASE_URL`, or the `SHELLBOX_PG_USER` / `_PASSWORD` / `_HOST` / `_PORT` / `_DB`
+components. Section 6 of [`docs/lakebase-handoff.md`](lakebase-handoff.md) records the manual
+recipe, including why the token goes in its own variable rather than into a URL.
+
+> **A configured endpoint WINS over a DSN.** `dsn_from_env` defaults the host to
+> `localhost:55432` as soon as **any** `SHELLBOX_PG_*` variable is set, so a developer who once
+> exported one always has a DSN. If the DSN won, `make deploy` would migrate their laptop and
+> report success while the deployed App read an unmigrated database.
+> [`tests/unit/test_migration_target.py`](../tests/unit/test_migration_target.py) asserts the
+> precedence by checking which host the migration actually dials.
+
+`make migrate` and `make grant` still refuse to run with **neither** configured, because
+`dsn_from_env` would otherwise silently target `localhost:55432`.
 
 ---
 
 ## 4. The service-principal grant
 
-**Run `make grant TARGET=<target>` after the first deploy of a target.** Run it again after any
-migration that adds a table the App reads.
+**`make deploy` runs the grant as its last step.** Run `make grant TARGET=<target>` on its own
+after any migration that adds a table the App reads.
 
 Everything verified before this authenticated as a **workspace user**. The App authenticates as
 its **service principal**, and that service principal's Postgres role name is its client id.
@@ -143,40 +177,48 @@ That is why the grant is a target rather than a paragraph.
 
 ### The order, and why each step is where it is
 
+Section 1 has the full pipeline. The three positions that matter for the grant:
+
 | | Step | Runs as |
 |---|---|---|
-| 1 | `databricks bundle deploy` — the Lakebase resources, the App resource, its database binding | you |
-| 2 | `make migrate` — `alembic upgrade head` | you |
-| 3 | `make deploy` — the App's code. The App reaches ACTIVE | you |
-| 4 | `make grant` — `SELECT` on `hosts` and `sessions` for the App's service principal | you |
-| 5 | The `/ready` check below — the proof that step 4 landed | the App |
+| 3 | `make migrate` — `alembic upgrade head` | you |
+| 4 + 5 | `scripts/deploy-app.sh`, then the wait for `ACTIVE` | you |
+| 6 | `make grant` — `SELECT` on `hosts` and `sessions` for the App's service principal | you |
+| — | The `/ready` check below — the proof that step 6 landed | the App |
 
-Step 2 comes before step 4 because `GRANT SELECT ON TABLE` needs the table. Postgres enforces
+Step 3 comes before step 6 because `GRANT SELECT ON TABLE` needs the table. Postgres enforces
 that ordering, and [`scripts/grant_app_sp.py`](../scripts/grant_app_sp.py) turns its error into
-a sentence naming `make migrate`.
+a sentence naming `make migrate`. Step 3 also makes the deploying principal the **owner** of
+those tables, and a principal cannot grant a privilege it does not hold.
 
-Step 3 comes before step 4 because the service principal's role appears in `pg_roles` some time
-**after** the App is active. `make grant` waits for `compute_status.state` to read `ACTIVE`, then
-retries the grant 5 times at 10-second intervals. Every statement it runs is idempotent, which is
-what makes retrying safe rather than merely tolerable. The field names are **measured**: on
-2026-08-03, `databricks apps get shellbox -o json` reported `compute_status.state` as `ACTIVE`
+Steps 4 and 5 come before step 6 because the service principal's role appears in `pg_roles` some
+time **after** the App is active. `make grant` waits for `compute_status.state` to read `ACTIVE`,
+then retries the grant 5 times at 10-second intervals. Every statement it runs is idempotent,
+which is what makes retrying safe rather than merely tolerable. The field names are **measured**:
+on 2026-08-03, `databricks apps get shellbox -o json` reported `compute_status.state` as `ACTIVE`
 and `service_principal_client_id` as a dashed uuid.
 
-**`make deploy` does not call `make grant`.** The grant needs the App running, and `make deploy`
-is what makes it run. A deploy that skips the grant is caught by the `/ready` check below, which
-fails loudly, rather than by an inventory call a week later.
+**A deploy is green on everything the deploying principal can observe, and silent about the one
+thing it cannot.** The grant reads itself back with `has_table_privilege`, which proves the
+catalog agrees. It does not prove the App can read the database **as itself** — only the App can
+exercise its own credential path. The `/ready` check below is that proof, and it is still manual.
 
 ### The migration runs as you, never as the App
 
 `alembic upgrade head` is a deploy-time action. Granting DDL to the serving principal to save one
 credential switch is how a read-only service acquires write access nobody decided to give it —
-and it arrives disguised as the fix for a permission error. Two mechanisms enforce this, and
-neither is a comment:
+and it arrives disguised as the fix for a permission error. Three mechanisms enforce this, and
+none of them is a comment:
 
+- The Postgres role is **derived** from `current_user.me()`, so the connection authenticates as
+  whoever ran the command. This is the structural half: there is no exported name to get wrong.
 - `make migrate` and `make grant` both run
   [`scripts/check_deploy_principal.py`](../scripts/check_deploy_principal.py) first. It refuses a
   Postgres user whose name has the shape of a service principal role, which is a dashed uuid. A
-  workspace user's role name is their email, so it cannot refuse a human by accident.
+  workspace user's role name is their email, so it cannot refuse a human by accident. On the
+  derived path it has nothing to inspect, and the alembic environment in
+  [`env.py`](../packages/shellbox-registry/src/shellbox_registry/alembic/env.py) applies the same
+  shape rule to the **derived** name instead, before it opens a connection.
 - [`scripts/grant_app_sp.py`](../scripts/grant_app_sp.py) refuses when the server reports
   `current_user` equal to the App's service principal. That is the same rule asserted against the
   identity that actually connected, rather than against the variables.

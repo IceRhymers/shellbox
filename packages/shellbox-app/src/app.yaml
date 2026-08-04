@@ -1,3 +1,41 @@
+# The App's runtime configuration. This file is the TEMPLATE, and it is not what the App gets.
+#
+# `scripts/deploy-app.sh` copies this file verbatim into the staged deploy root and then
+# APPENDS a generated `env:` block to the copy. So the `command` below is exactly what starts
+# the deployed App -- byte for byte, because nothing re-serializes it -- and the environment
+# below it is stamped per deploy.
+#
+# WHY THE ENV IS STAMPED AND NOT WRITTEN HERE. Two reasons, and each one is sufficient:
+#
+#   1. The `dev` and `prod` targets use DIFFERENT Lakebase projects, deliberately. That is
+#      `R49`'s mitigation: the branch and endpoint carry `replace_existing: true`, so two
+#      targets sharing a project would mean a `dev` deploy adopting and reconfiguring the
+#      production database. One static file cannot serve two projects.
+#   2. The endpoint's resource path is `projects/<project>/branches/<branch>/endpoints/
+#      <endpoint>`. Writing one out here is a hardcoded project name, which `make lint`'s
+#      no-literal-project check rejects -- see `scripts/check_bundle_statics.py`.
+#
+# The bundle's own inline `config:` is not the answer either. Bundle variables are NOT resolved
+# in an app's `config` env values; they arrive literally, or the deploy fails with "Must
+# specify environment variable source". So the deploy stamps the file instead.
+#
+# WHAT GETS STAMPED, and `packages/shellbox-app/src/shellbox_app/config.py` is the authority on
+# what each one is for:
+#
+#   SHELLBOX_PG_RESOURCE   the endpoint resource path. It mints OAuth tokens.
+#   SHELLBOX_PG_HOST       what psycopg dials. A DIFFERENT string, resolved at deploy time.
+#   SHELLBOX_PG_DB         the Postgres database name.
+#
+# NOTE: the Postgres ROLE is not stamped. The Apps runtime injects `DATABRICKS_CLIENT_ID`, and
+# that is the App's service principal client id, which is the role name Lakebase maps it onto.
+# Resolving it here, or with `current_user.me()`, would be wrong -- config.py's module
+# docstring argues that in full.
+#
+# Running `scripts/deploy-app.sh` with no database, and therefore with no `env:` block at all,
+# is possible and must be asked for: pass `--no-database`. Absent both that flag and a
+# resource path, the deploy fails rather than shipping an App that serves an empty inventory
+# while `GET /` stays green.
+
 command:
   - "python"
   - "-m"

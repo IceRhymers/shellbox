@@ -1,23 +1,77 @@
 # The Databricks Apps requirement set. Mirrors `probe/requirements.txt`, whose comment records
 # the measurement this file depends on.
 #
-# fastapi and uvicorn are preinstalled on the Apps runtime. `websockets` is NOT, and uvicorn
-# needs it to serve the WebSocket handshake at all -- without it the upgrade fails inside the
-# App, and a caller reads that as the edge blocking WebSockets. The Phase 1 probe avoided that
-# misdiagnosis by declaring it, and so does this.
-websockets
+# CRITICAL: every line carries an EXACT version, and that is ADR-22. `uv.lock` never reaches
+# the Apps runtime -- the runtime reads this file -- so an unpinned requirement means the
+# deployed App can resolve a different version from every version that was ever tested, and
+# nothing reports it. The pins below are the versions the workspace venv resolved on
+# 2026-08-03, which are therefore the versions `make test` exercised.
+#
+# CRITICAL: this file is also the import check's dependency list. `scripts/deploy-app.sh`
+# derives its `uv run --with` arguments from THIS FILE and from nothing else, so the check
+# runs against a strict subset of what the Apps runtime has. One list, so the check and the
+# deployment cannot disagree -- which they did before, silently, and pre-mortem scenario 3 in
+# the Phase 4 plan is that failure written out.
 
-# CRITICAL: `shellbox_transport` is a workspace package and pip cannot resolve it from here.
-# The deploy step must place it at the deploy root beside `shellbox_app/`.
+# --- what the relay needs ---
+
+# `websockets` is NOT preinstalled on the Apps runtime, and uvicorn needs it to serve the
+# WebSocket handshake at all. Without it the upgrade fails inside the App, and a caller reads
+# that as the edge blocking WebSockets. The Phase 1 probe avoided that misdiagnosis by
+# declaring it, and so does this.
+websockets==15.0.1
+
+# fastapi and uvicorn ARE preinstalled on the Apps runtime, and they are declared anyway.
+# `shellbox_app.server` imports fastapi at module scope, so the import check cannot run
+# without them -- and a check that borrowed the runtime's copy would be measuring a different
+# environment from the one this file describes. Declaring them means pip installs these pins
+# over whatever the runtime preinstalls, which is what ADR-22 asks for.
+fastapi==0.140.7
+uvicorn==0.51.0
+
+# --- what the registry needs ---
+#
+# `shellbox_registry` joined the deploy root here. `shellbox_app.database` imports it at module
+# scope, so these are not optional extras: without them the App boots into
+# `ModuleNotFoundError` behind a green deploy. The list is `shellbox-registry`'s own
+# `[project] dependencies` in ../../shellbox-registry/pyproject.toml, plus its `lakebase`
+# extra, pinned.
+
+# SQLAlchemy is the registry's ORM, and `shellbox_registry.postgres` imports it at module
+# scope.
+sqlalchemy==2.0.51
+
+# The Postgres driver, and the `[binary]` extra is load-bearing rather than a preference: it
+# ships a prebuilt wheel. Plain `psycopg` builds against libpq at install time, and the Apps
+# runtime is not a build environment.
+psycopg[binary]==3.3.4
+
+# alembic is a `shellbox-registry` dependency because the package carries the migrations. The
+# App never migrates -- `scripts/deploy.sh` step 3 does, as the deploying principal -- but the
+# staged root holds the whole package, `shellbox_registry/alembic/` included, and a partial
+# copy of a package is a worse thing to deploy than an unused import.
+alembic==1.18.5
+
+# The `lakebase` extra of `shellbox-registry`, written out because pip reads a flat list here.
+# `lakebase.py` mints an OAuth token to use as the Postgres password, and that needs the SDK.
+#
+# WARNING: no import check can verify this line. `lakebase.py` imports the SDK LAZILY by
+# design, so `import shellbox_registry.lakebase` succeeds on a runtime with no SDK at all.
+# `scripts/deploy-app.sh` says the same thing where the check is written. The first thing that
+# actually needs the SDK is minting a token against the live endpoint.
+databricks-sdk==0.123.0
+
+# CRITICAL: `shellbox_transport` and `shellbox_registry` are workspace packages and pip cannot
+# resolve either one from here. The deploy step must place them at the deploy root beside
+# `shellbox_app/`.
 #
 # VERIFIED 2026-08-02 against `fevm-west`, and the mechanism is in `scripts/deploy-app.sh` so
 # it is a script rather than tribal knowledge. `transport/FINDINGS.md` §6 records the run. The
 # flattened root is the whole of the fix -- no editable install, no wheel, no `pip install -e`:
 #
-#     <root>/app.yaml  requirements.txt  shellbox_app/  shellbox_transport/
+#     <root>/app.yaml  requirements.txt  shellbox_app/  shellbox_transport/  shellbox_registry/
 #
 # It works because `python -m shellbox_app` puts the deploy root on `sys.path`, so a sibling
-# top-level package resolves as an ordinary import. Proved against a venv holding ONLY
-# fastapi/uvicorn/websockets, where `import shellbox_app` fails before the copy and serves
-# after it -- which is the assertion that would catch a root silently relying on a local
-# install.
+# top-level package resolves as an ordinary import. Proved against a venv holding ONLY the
+# requirements above, where `import shellbox_app` fails before the copy and serves after it --
+# which is the assertion that would catch a root silently relying on a local install.

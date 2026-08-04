@@ -28,12 +28,24 @@ would still work. A failure that reads as working is the one worth a rule, so
 `make require-pg-host` already guards. Choosing a fourth spelling would mean an operator who
 exported the variables for `make migrate` still has nothing the App can read.
 
-WARNING: **Nothing in this repo yet SETS these variables inside the App container.** The
-bundle declares the database as an app resource (`resources/app.yml`), and this repo has
-never deployed it, so what the Apps runtime injects for such a resource is unmeasured here.
-Until that is measured, the values arrive through `app.yaml`'s environment or through the
-app's configuration, and `open_registry` treats their absence as "no inventory" rather than
-as a failure -- see `packages/shellbox-app/src/shellbox_app/database.py`.
+## What sets these variables in the container
+
+`scripts/deploy-app.sh` stamps them into the staged `app.yaml` as an `env:` block, at stage
+time, from values `scripts/bundle-vars.sh` read back out of the bundle. The repo's
+`packages/shellbox-app/src/app.yaml` is a template carrying only the `command`, and its header
+says why the environment cannot be committed: the two targets use different Lakebase projects
+on purpose, and a literal endpoint path in the repo fails `make lint`.
+
+WARNING: **the App must be given these, and a missing one is silent.** `open_registry` in
+`packages/shellbox-app/src/shellbox_app/database.py` treats an unresolvable environment as "no
+inventory" rather than as a failure, which is correct -- a database outage must never take the
+terminals down. The cost is that an App with nothing configured answers `GET /` exactly like a
+healthy one, and serves an empty inventory. So `deploy-app.sh` refuses to deploy without
+either an endpoint or an explicit `--no-database`.
+
+NOTE: the bundle ALSO declares the database as an app resource in `resources/app.yml`, and
+what the Apps runtime injects for such a resource is still unmeasured here. That binding is
+what grants the App connect permission; it is not what tells the App where to connect.
 """
 
 from __future__ import annotations
@@ -42,7 +54,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from shellbox_registry.lakebase import LakebaseEndpoint
+from shellbox_registry.lakebase import DEFAULT_DATABASE, LakebaseEndpoint
 
 __all__ = [
     "DEFAULT_DATABASE",
@@ -81,12 +93,26 @@ POOL_TIMEOUT_SECONDS = 5
 
 # The Postgres port, and the database `alembic upgrade head` migrates.
 #
-# `DEFAULT_DATABASE` mirrors the `pg_database` bundle variable's default and `dsn_from_env`'s
-# component default, which are already the same value. A default is safe for a database NAME
-# and would not be safe for a HOST: the host decides which server is reached, which is why
-# `SHELLBOX_PG_HOST` below has no default at all.
+# `DEFAULT_DATABASE` is RE-EXPORTED from `shellbox-registry` rather than restated. It used to
+# be the literal `"shellbox"`, with a comment claiming it mirrored the `pg_database` bundle
+# variable's default -- and that claim stopped being true when the bundle adopted the
+# auto-provisioned `databricks_postgres` database. Two literals and a comment is exactly how a
+# migration and an App reach different databases while both report success.
+#
+# There is now ONE constant on the Python side, and `databricks.yml` is its authority:
+# `test_the_default_database_is_the_one_the_bundle_declares` in `tests/unit/test_lakebase.py`
+# reads the bundle FROM DISK and fails if the two diverge. `alembic/env.py` and
+# `scripts/grant_app_sp.py` read the same constant, so the migration, the grant and the App
+# cannot disagree.
+#
+# NOTE: `dsn_from_env` in `packages/shellbox-registry/src/shellbox_registry/dsn.py` keeps its
+# own `"shellbox"` component default, and that is deliberate rather than an oversight. It
+# serves local development and CI, where the database really is called `shellbox`. Its
+# docstring says which caller each default serves.
+#
+# A default is safe for a database NAME and would not be safe for a HOST: the host decides
+# which server is reached, which is why `SHELLBOX_PG_HOST` below has no default at all.
 DEFAULT_PORT = 5432
-DEFAULT_DATABASE = "shellbox"
 
 
 @dataclass(frozen=True, slots=True)

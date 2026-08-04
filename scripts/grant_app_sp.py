@@ -63,6 +63,7 @@ The caller retries on one of them and only one, so they are part of this script'
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -168,26 +169,83 @@ def main(argv: list[str] | None = None) -> int:
     # driver and no synced workspace: `tests/unit/test_grant_scope.py` asserts on the SQL this
     # module builds, and that test must not need psycopg to run.
     import psycopg
-    from shellbox_registry.dsn import dsn_from_env, redact
+    from shellbox_registry.dsn import dsn_from_env
 
+    # A configured endpoint WINS over a DSN, for the reason the alembic env.py docstring gives:
+    # `dsn_from_env` defaults the host to localhost as soon as ANY SHELLBOX_PG_* variable is set,
+    # so a stale variable in the operator's shell must not be able to redirect a deploy-time grant
+    # onto their laptop.
+    resource = (os.environ.get("SHELLBOX_PG_RESOURCE") or "").strip()
     dsn = dsn_from_env()
-    if dsn is None:
+    if not resource and dsn is None:
         return _fail(
-            "no registry DSN is configured, so there is nothing to grant on.\n"
-            "  Set SHELLBOX_PG_HOST and the credential parts -- docs/deploy.md section 3."
+            "no registry connection is configured, so there is nothing to grant on.\n"
+            "  Set SHELLBOX_PG_RESOURCE to the endpoint this bundle declares -- it is the\n"
+            '  easy path, and it needs no credential of its own:\n'
+            '    eval "$(scripts/bundle-vars.sh --target dev --profile fevm-west)"\n'
+            "  Or set SHELLBOX_PG_HOST and the credential parts. Both routes are in\n"
+            "  docs/deploy.md section 3."
         )
 
-    # NOT `normalize_postgres_dsn`. That rewrite names the SQLAlchemy driver, and libpq rejects the
-    # `postgresql+psycopg://` scheme it produces. `dsn_from_env` returns a plain URI, which is what
-    # psycopg wants.
-    print(f"    connecting to {redact(dsn)}")
     try:
-        connection = psycopg.connect(dsn, autocommit=True)
+        connection = _connect_lakebase(resource) if resource else _connect_dsn(str(dsn))
     except psycopg.Error as error:
         return _fail(f"cannot connect to the registry: {error}")
 
     with connection:
         return _grant(connection, args.role, revoke_schema_create=args.revoke_schema_create)
+
+
+def _connect_lakebase(resource_name: str) -> Any:
+    """Connect to the Lakebase endpoint named by ``resource_name``, as the deploying principal.
+
+    Connection PARAMETERS rather than a URI, and that is not a style choice: the OAuth token is
+    the password, so a URI would carry a live credential in a string that an exception, a
+    ``repr`` or a log line could reproduce. ``redact`` exists on the DSN path for that reason;
+    here the token never enters a string at all.
+
+    The Postgres role is DERIVED from ``current_user.me()`` unless ``SHELLBOX_PG_USER`` overrides
+    it -- see ``resolve_lakebase_endpoint``. That is what makes this grant run as the deploying
+    principal by construction rather than by an operator remembering to export the right name.
+    ``_grant`` still asserts it against what the server reports, which is the only authority on
+    which identity actually connected.
+    """
+    import psycopg
+    from shellbox_registry.lakebase import (
+        DEFAULT_DATABASE,
+        resolve_lakebase_endpoint,
+        sdk_token_minter,
+    )
+
+    endpoint = resolve_lakebase_endpoint(
+        resource_name,
+        database=(os.environ.get("SHELLBOX_PG_DB") or "").strip() or DEFAULT_DATABASE,
+        user=(os.environ.get("SHELLBOX_PG_USER") or "").strip() or None,
+    )
+    print(f"    connecting to {endpoint.host}/{endpoint.database} as {endpoint.user}")
+    return psycopg.connect(
+        host=endpoint.host,
+        port=endpoint.port,
+        dbname=endpoint.database,
+        user=endpoint.user,
+        password=sdk_token_minter(resource_name)().token,
+        # Lakebase demands TLS, and libpq's default is `prefer`, which would silently accept
+        # a downgrade rather than fail.
+        sslmode="require",
+        autocommit=True,
+    )
+
+
+def _connect_dsn(dsn: str) -> Any:
+    """Connect to an explicitly configured DSN. The local-Postgres and pre-minted-token path."""
+    import psycopg
+    from shellbox_registry.dsn import redact
+
+    # NOT `normalize_postgres_dsn`. That rewrite names the SQLAlchemy driver, and libpq rejects the
+    # `postgresql+psycopg://` scheme it produces. `dsn_from_env` returns a plain URI, which is what
+    # psycopg wants.
+    print(f"    connecting to {redact(dsn)}")
+    return psycopg.connect(dsn, autocommit=True)
 
 
 def _grant(connection: Any, role: str, *, revoke_schema_create: bool) -> int:

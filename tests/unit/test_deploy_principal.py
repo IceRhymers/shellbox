@@ -137,6 +137,56 @@ def test_the_database_url_wins_over_the_parts(clean_env: pytest.MonkeyPatch) -> 
     assert _guard.main(["make migrate"]) == 1
 
 
+@pytest.mark.parametrize(
+    "user",
+    [
+        SP_ROLE,
+        SP_ROLE.upper(),
+        HUMAN,
+        HUMAN.replace("@", "%40"),
+        "shellbox",
+        "postgres",
+        "3337afacb67b41af8996828620bcc4a8",
+        "",
+        "not-a-uuid-at-all",
+        "3337afac-b67b-41af-8996-828620bcc4a",
+        "3337afac-b67b-41af-8996-828620bcc4a8-extra",
+        "zzzzzzzz-b67b-41af-8996-828620bcc4a8",
+    ],
+)
+def test_the_two_copies_of_the_role_name_rule_agree(user: str) -> None:
+    """CRITICAL: the same rule exists twice, and a test is what keeps it one rule.
+
+    This script must run under a bare ``python3`` on a checkout with nothing synced, so it
+    cannot import ``shellbox_registry``. The alembic environment has the opposite constraint:
+    it refuses a DERIVED role, which this script never sees, because on the endpoint path
+    nobody exports a user for it to inspect. So the predicate is written twice --
+    ``is_service_principal_role`` here and in
+    ``packages/shellbox-registry/src/shellbox_registry/lakebase.py``.
+
+    Copies drift. This case is what makes the drift a failing test instead of a hole: a role
+    the package refuses and the script accepts, or the reverse, means one deploy-time action is
+    guarded and the other is not.
+    """
+    from shellbox_registry.lakebase import is_service_principal_role as package_rule
+
+    assert _guard.is_service_principal_role(user) == package_rule(user), (
+        f"the two copies of the role-name rule disagree about {user!r}"
+    )
+
+
+def test_the_role_name_rule_is_not_vacuously_true_for_everything() -> None:
+    """A predicate that answered the same thing for every input would pass the case above.
+
+    Both directions must be witnessed, on both copies.
+    """
+    from shellbox_registry.lakebase import is_service_principal_role as package_rule
+
+    for rule in (_guard.is_service_principal_role, package_rule):
+        assert rule(SP_ROLE) is True
+        assert rule(HUMAN) is False
+
+
 @pytest.mark.parametrize("user", [HUMAN, SP_ROLE])
 def test_the_guard_reads_the_user_the_dsn_actually_connects_as(
     clean_env: pytest.MonkeyPatch, user: str

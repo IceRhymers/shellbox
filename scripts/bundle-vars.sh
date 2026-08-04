@@ -4,19 +4,26 @@
 #
 # Usage:  eval "$(scripts/bundle-vars.sh --target dev --profile fevm-west)"
 #
-# Emits three variables:
+# Emits four variables:
 #
 #   SHELLBOX_APP_NAME         the App name resolved for that target
 #   SHELLBOX_APP_SOURCE_PATH  the absolute /Workspace code root resolved for that target
-#   SHELLBOX_PG_RESOURCE      projects/<project>/branches/<branch>/endpoints/<endpoint>
+#   SHELLBOX_PG_DB            the Postgres database name the target declares
+#   SHELLBOX_PG_RESOURCE      the endpoint path, built from the three ids below
 #
-# Two of those are READ from the bundle and one is CONSTRUCTED. The difference is not a style
-# choice, and it is the reason this script exists rather than three inline pipelines:
+# Three of those are READ from the bundle and one is CONSTRUCTED. The difference is not a style
+# choice, and it is the reason this script exists rather than four inline pipelines:
 #
 # - `resources.apps.<key>.name` and `.source_code_path` DO resolve in
 #   `bundle validate -o json` (verified against Databricks CLI v1.8.0). Reading them keeps the
 #   code root declared once, in `resources/app.yml`, instead of computed identically in two
 #   places that can drift apart.
+#
+# - `variables.pg_database.value` resolves the same way, and it is read for the same reason.
+#   `scripts/deploy-app.sh` stamps it into the App's environment and has NO default of its own,
+#   so the database the App reads is the database `databricks.yml` declares. A default in the
+#   script would be a second declaration, and a migration and an App reaching different
+#   databases both report success.
 #
 # - The endpoint's resource path does NOT resolve, ever, before a deploy.
 #   `${resources.postgres_projects.pg_project.id}` stays LITERAL in `bundle validate -o json`,
@@ -87,6 +94,9 @@ emit = {
     "SHELLBOX_APP_SOURCE_PATH": resolved(
         "the app source_code_path", app.get("source_code_path")
     ),
+    "SHELLBOX_PG_DB": resolved(
+        "variable pg_database", variables.get("pg_database", {}).get("value")
+    ),
 }
 for key in ("pg_project_id", "pg_branch_id", "pg_endpoint_id"):
     emit[key.upper()] = resolved(f"variable {key!r}", variables.get(key, {}).get("value"))
@@ -108,4 +118,5 @@ SHELLBOX_PG_RESOURCE="projects/${PG_PROJECT_ID}/branches/${PG_BRANCH_ID}/endpoin
 
 printf 'SHELLBOX_APP_NAME=%q\n' "$SHELLBOX_APP_NAME"
 printf 'SHELLBOX_APP_SOURCE_PATH=%q\n' "$SHELLBOX_APP_SOURCE_PATH"
+printf 'SHELLBOX_PG_DB=%q\n' "$SHELLBOX_PG_DB"
 printf 'SHELLBOX_PG_RESOURCE=%q\n' "$SHELLBOX_PG_RESOURCE"

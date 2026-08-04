@@ -172,8 +172,23 @@ export class SubscriberClient {
     // reaches the "first frame was not a hello" branch and is retried as a plain transient with
     // no bound -- so `subscriber_conflict` never reaches the 45 s window and never surfaces.
     if (message.kind === CONTROL_ERROR) return this.#refused(message, now);
-    if (this.phase === PHASE_AWAITING_HELLO) return this.#first(message, now);
-    return this.#control(message, now);
+    const actions =
+      this.phase === PHASE_AWAITING_HELLO
+        ? this.#first(message, now)
+        : this.#control(message, now);
+
+    // A publisher's control frames CARRY AN ORDINAL, and forgetting that reported a gap on
+    // every single resume. MEASURED against the live App: `stream skipped from 2 to 4`.
+    // `plan_resume` sets `base_seq` from the ring's newest at PLANNING time, and the publisher
+    // then sends the resync through its own allocator -- so the resync consumes `base_seq + 1`
+    // and live output resumes at `base_seq + 2`.
+    //
+    // Guarded on UNORDERED_SEQ because the APP originates `hello` and refusals and holds no
+    // allocator. After the dispatch, so `#resync`'s epoch reset and `base_seq` are applied first.
+    if (frame.seq > UNORDERED_SEQ) {
+      this.lastSeq = Math.max(this.lastSeq, frame.seq);
+    }
+    return actions;
   }
 
   /** Advance the deadlines. Called on a timer; reads no clock of its own. */

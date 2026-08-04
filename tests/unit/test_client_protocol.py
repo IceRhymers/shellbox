@@ -83,11 +83,23 @@ def hello(session_id: str = SESSION, *, viewer: str | None = None) -> bytes:
     return _wrap(session_id, hello_message(session_id, None, viewer))
 
 
-def resync(repaint: bytes, *, epoch: str = EPOCH, base_seq: int = 0) -> bytes:
+def resync(
+    repaint: bytes, *, epoch: str = EPOCH, base_seq: int = 0, frame_seq: int | None = None
+) -> bytes:
+    """A resync as the publisher actually sends it.
+
+    ``frame_seq`` defaults to ``base_seq + 1`` because that is what the wire carries: the ring's
+    newest at planning time is ``base_seq``, and `PtyBridge` then allocates the resync's own
+    ordinal from the same `SeqAllocator`. Defaulting it to `base_seq` instead would let a test
+    pass against a shape no publisher produces -- which is how the live run found a gap that
+    every unit test had agreed was fine.
+    """
     from shellbox_transport.codec import resync_message
 
     gap = Discontinuity(epoch=Epoch(epoch), asked_seq=0, base_seq=base_seq, reason="epoch_changed")
-    return _wrap(SESSION, resync_message(gap, repaint))
+    return _wrap(
+        SESSION, resync_message(gap, repaint), seq=base_seq + 1 if frame_seq is None else frame_seq
+    )
 
 
 def refusal(code: str, message: str = "refused") -> bytes:
@@ -100,8 +112,9 @@ def data(seq: int, payload: bytes) -> bytes:
     )
 
 
-def _wrap(session_id: str, message: object) -> bytes:
-    return encode_frame(control_frame(session_id, 0, 1.0, message))  # type: ignore[arg-type]
+def _wrap(session_id: str, message: object, *, seq: int = 0) -> bytes:
+    """Wrap a control message. ``seq=0`` is `UNORDERED_SEQ` -- what the APP originates."""
+    return encode_frame(control_frame(session_id, seq, 1.0, message))  # type: ignore[arg-type]
 
 
 def sent(actions: list[object]) -> list[object]:
@@ -362,11 +375,46 @@ def test_a_resync_resets_the_terminal_and_is_never_appended() -> None:
 
 def test_a_resync_rebases_the_stream_so_the_next_frame_is_not_a_gap() -> None:
     subscriber = live()
-    subscriber.received(resync(b"repaint", base_seq=9), 1.0)
-    assert subscriber.last_seq == 9
+    subscriber.received(resync(b"repaint", base_seq=9, frame_seq=10), 1.0)
+    assert subscriber.last_seq == 10
 
-    actions = subscriber.received(data(10, b"live"), 2.0)
+    actions = subscriber.received(data(11, b"live"), 2.0)
     assert [type(action) for action in actions] == [Write]
+
+
+def test_the_resync_frames_own_ordinal_advances_the_position() -> None:
+    """The live run's finding: `base_seq` is not where the subscriber actually is.
+
+    MEASURED 2026-08-04 against the deployed `dev` App -- a fresh attach reported
+    `stream skipped from 2 to 4` on its very first resume. `plan_resume` sets `base_seq` to the
+    ring's newest at PLANNING time and `PtyBridge` then sends the resync through
+    `control_frame(..., self._seq.next(), ...)`, so the resync itself consumes `base_seq + 1`
+    and live output resumes at `base_seq + 2`. A client that trusted `Discontinuity.base_seq`'s
+    "live frames resume at base_seq + 1" reported a phantom gap on EVERY reconnect -- roughly
+    four times an hour per viewer, on the hot path, telling the reader output was missing when
+    none was.
+    """
+    subscriber = live()
+    # Exactly the live shape: base_seq=2, the resync frame itself carrying seq=3.
+    subscriber.received(resync(b"repaint", base_seq=2, frame_seq=3), 1.0)
+    assert subscriber.last_seq == 3
+
+    actions = subscriber.received(data(4, b"live output"), 2.0)
+    assert [type(action) for action in actions] == [Write], (
+        "the resync frame's own ordinal was not counted, so the next live frame looks like a gap"
+    )
+
+
+def test_the_apps_own_control_frames_never_move_the_position() -> None:
+    """`hello` and refusals carry `UNORDERED_SEQ`; the App holds no allocator.
+
+    Adopting its 0 would drag the position BACKWARDS, and the next resume would then ask for a
+    part of the stream the subscriber had already rendered.
+    """
+    subscriber = live()
+    subscriber.received(resync(b"repaint", base_seq=40, frame_seq=41), 1.0)
+    subscriber.received(hello(), 2.0)
+    assert subscriber.last_seq == 41
 
 
 def test_a_resync_adopts_its_epoch_so_the_next_resume_names_it() -> None:
@@ -379,7 +427,9 @@ def test_a_resync_adopts_its_epoch_so_the_next_resume_names_it() -> None:
     messages = sent(subscriber.received(hello(), 3.0))
     resume = next(message for message in messages if message.kind == CONTROL_RESUME)
     assert resume.epoch == EPOCH
-    assert resume.fields[FIELD_ASKED_SEQ] == 4
+    # 5, not the resync's `base_seq` of 4: the resync frame itself carried ordinal 5, and that
+    # is the last thing this subscriber actually received.
+    assert resume.fields[FIELD_ASKED_SEQ] == 5
 
 
 def test_a_new_epoch_resets_the_ordinal_space() -> None:
@@ -389,7 +439,11 @@ def test_a_new_epoch_resets_the_ordinal_space() -> None:
     subscriber.received(resync(b"second", epoch=OTHER_EPOCH, base_seq=0), 2.0)
 
     assert subscriber.epoch == OTHER_EPOCH
-    assert subscriber.last_seq == 0
+    # 1, not 500: the old epoch's ordinal is gone, and the new epoch's resync is its own
+    # `FIRST_SEQ`. Carrying 500 across would make the next resume name a position in a stream
+    # that no longer exists.
+    assert subscriber.last_seq == 1
+    assert [type(action) for action in subscriber.received(data(2, b"live"), 3.0)] == [Write]
 
 
 def test_an_epoch_change_clears_the_ordinal_even_when_no_base_seq_arrives() -> None:
@@ -404,7 +458,7 @@ def test_an_epoch_change_clears_the_ordinal_even_when_no_base_seq_arrives() -> N
     """
     subscriber = live()
     subscriber.received(resync(b"first", epoch=EPOCH, base_seq=500), 1.0)
-    assert subscriber.last_seq == 500
+    assert subscriber.last_seq == 501
 
     malformed = _wrap(
         SESSION,

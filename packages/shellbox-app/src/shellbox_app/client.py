@@ -408,8 +408,28 @@ class SubscriberClient:
             # failed on it. See `_refused`, which is correct in either phase.
             return self._refused(message, now)
         if self.phase is Phase.AWAITING_HELLO:
-            return self._first(message, now)
-        return self._control(message, now)
+            actions = self._first(message, now)
+        else:
+            actions = self._control(message, now)
+
+        # A publisher's control frames CARRY AN ORDINAL, and forgetting that reported a gap on
+        # every single resume. MEASURED against the live `dev` App: `stream skipped from 2 to 4`.
+        #
+        # `plan_resume` sets `base_seq` to the ring's newest at PLANNING time, and
+        # `PtyBridge` then sends the resync through `control_frame(..., self._seq.next(), ...)`
+        # -- so the resync itself consumes `base_seq + 1`, and live output resumes at
+        # `base_seq + 2`. `Discontinuity.base_seq` says "live frames resume at base_seq + 1",
+        # which describes the ring's arithmetic rather than what a subscriber actually receives.
+        # Tracking the frame's own `seq` here makes the client agree with the wire instead of
+        # with that sentence.
+        #
+        # Guarded on `UNORDERED_SEQ` because the APP originates `hello` and refusals and holds
+        # no allocator; adopting its 0 would drag the position backwards. This runs AFTER the
+        # dispatch above so that `_resync`'s epoch reset and `base_seq` are already applied and
+        # this can only ever move the position forward.
+        if frame.seq > UNORDERED_SEQ:
+            self.last_seq = max(self.last_seq, frame.seq)
+        return actions
 
     def ticked(self, now: float) -> list[Action]:
         """Advance the deadlines. Call this on a timer; it never blocks and reads no clock."""

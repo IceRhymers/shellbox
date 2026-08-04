@@ -157,7 +157,30 @@ def test_the_bare_prefix_redirects_to_the_trailing_slash() -> None:
     with _client() as client:
         answer = client.get(UI_PATH, follow_redirects=False)
         assert answer.status_code in (301, 307, 308)
-        assert answer.headers["location"].endswith("/ui/")
+        assert answer.headers["location"] == f"{UI_PATH}/"
+
+
+def test_the_redirect_names_no_host_of_its_own() -> None:
+    """The assertion this file was missing, and the live run is what found it missing.
+
+    `StaticFiles` redirects a directory URL using ``URL(scope=scope)``, an ABSOLUTE url built
+    from the ASGI scope. The Apps edge terminates outside the container and proxies in, so the
+    App sees ``host: localhost:8000`` -- and MEASURED 2026-08-04 against the live `dev` App, the
+    bare ``/ui`` answered ``307`` with ``location: https://localhost:8000/ui/``, which a browser
+    follows to its own loopback.
+
+    The previous assertion here was ``endswith("/ui/")``, which that broken value satisfies. It
+    passed under `TestClient`, where the host happens to be correct, and shipped anyway. A
+    relative reference cannot carry a wrong host because it carries no host at all.
+    """
+    with _client() as client:
+        location = client.get(UI_PATH, follow_redirects=False).headers["location"]
+        assert "://" not in location, (
+            f"the redirect names a host ({location}). Behind the Apps edge the only host this "
+            "process can see is the loopback it is proxied into, so an absolute location sends "
+            "the browser to itself."
+        )
+        assert location.startswith("/")
 
 
 def test_the_health_route_is_still_json_and_names_the_page() -> None:

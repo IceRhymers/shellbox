@@ -20,12 +20,35 @@ directory with the traversal check already written. A hand-rolled ``FileResponse
 a filename parameter is the shape that ships a ``../../etc/passwd`` bug, and there is no reason
 to write one.
 
-``html=True`` is what makes ``/ui/`` serve ``index.html``, and it also redirects ``/ui`` to
-``/ui/``. That redirect matters more than it looks: every asset in `index.html` is referenced
-RELATIVELY, so without the trailing slash the browser would resolve ``app.css`` against ``/``
-and fetch ``/app.css``, which is not mounted. Relative references are themselves deliberate --
-they are what keeps the page free of any absolute URL, which
-`tests/unit/test_static_assets.py` asserts.
+``html=True`` is what makes ``/ui/`` serve ``index.html``. That trailing slash matters more than
+it looks: every asset in `index.html` is referenced RELATIVELY, so without it the browser would
+resolve ``app.css`` against ``/`` and fetch ``/app.css``, which is not mounted. Relative
+references are themselves deliberate -- they are what keeps the page free of any absolute URL,
+which `tests/unit/test_static_assets.py` asserts.
+
+## Why ``/ui`` gets its own redirect instead of ``StaticFiles``'s
+
+``StaticFiles`` already redirects a directory URL to its trailing-slash form, and **its redirect
+is unusable behind the Apps edge**. MEASURED 2026-08-04 against the live `dev` App: a request to
+``/ui`` answered ``307`` with ``location: https://localhost:8000/ui/``. A browser follows that to
+its own loopback and fails.
+
+The cause is that ``StaticFiles`` builds the target with ``URL(scope=scope)``, an ABSOLUTE url
+taken from the ASGI scope -- and the edge terminates outside the container and proxies in, so the
+App sees ``host: localhost:8000`` (the same value the Phase 1 probe recorded). Nothing the App
+can configure fixes that from inside: uvicorn's proxy-header handling covers the client address
+and the scheme, not a rewritten ``Host``.
+
+So the redirect below is registered FIRST and answers ``/ui`` itself, with a ROOT-RELATIVE
+``location``. A relative reference is resolved by the browser against the origin it actually
+used, which is the one place the real hostname is reliably known. `StaticFiles` never sees the
+bare path, so its own redirect is unreachable.
+
+CRITICAL: `tests/unit/test_static_assets.py` asserts the location carries **no scheme**. The
+earlier assertion was that it merely ENDED in ``/ui/``, which
+``https://localhost:8000/ui/`` satisfies -- so it passed through `TestClient`, where the host
+happens to be right, and shipped a page whose bare URL was broken in a browser. The live run in
+`W38` is what caught it.
 
 ## What a mount does NOT do, and why that is fine here
 
@@ -45,6 +68,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI
+from starlette.responses import RedirectResponse
 from starlette.staticfiles import StaticFiles
 
 __all__ = ["STATIC_ROOT", "UI_PATH", "mount_ui"]
@@ -71,4 +95,16 @@ def mount_ui(api: FastAPI) -> None:
     ENVIRONMENT failure that must degrade the inventory and never the relay; a missing `static/`
     is a BUILD failure, and there is nothing to degrade to.
     """
+
+    @api.get(UI_PATH, include_in_schema=False)
+    def ui_root() -> RedirectResponse:
+        """Send the bare path to its trailing-slash form, ROOT-RELATIVELY.
+
+        Registered before the mount so `StaticFiles` never sees this path -- see this module's
+        docstring for the measurement that made this necessary. The value below must stay a
+        relative reference: an absolute one would have to name a host, and the only host this
+        process can see is the loopback the edge proxies into.
+        """
+        return RedirectResponse(f"{UI_PATH}/", status_code=307)
+
     api.mount(UI_PATH, StaticFiles(directory=STATIC_ROOT, html=True), name="ui")

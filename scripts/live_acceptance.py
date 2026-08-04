@@ -81,6 +81,11 @@ TMUX_NAME = "w38"
 # free of shell metacharacters so the pane's shell echoes it rather than acting on it.
 POST_KILL_MARKER = "W38-RECOVERED-OK"
 
+# Typed early, and asserted UNCONDITIONALLY. It is what proves the data path works end to end --
+# a real keystroke into a real pty, echoed by a real shell, relayed through the real edge and
+# rendered by the real client -- without depending on a platform event this harness cannot cause.
+PRE_KILL_MARKER = "W38-BEFORE-KILL-OK"
+
 
 def mint_token(profile: str) -> str:
     """A fresh workspace OAuth token. Re-minted per dial -- see this module's docstring."""
@@ -120,12 +125,19 @@ class Observed:
     appended_after_resync: bool = False
     notices: list[str] = field(default_factory=list)
     stopped: str | None = None
+    severed: bool = False
     output: bytearray = field(default_factory=bytearray)
     repaints: list[bytes] = field(default_factory=list)
 
 
 async def run_subscriber(
-    url: str, session_id: str, profile: str, deadline: float, journal: Journal, seen: Observed
+    url: str,
+    session_id: str,
+    profile: str,
+    deadline: float,
+    journal: Journal,
+    seen: Observed,
+    sever_at: float | None = None,
 ) -> None:
     """Hold a subscriber across every kill, driving the real `SubscriberClient`."""
     client = SubscriberClient(session_id)
@@ -146,7 +158,7 @@ async def run_subscriber(
             ) as socket:
                 seen.sockets += 1
                 journal.note("subscriber", f"socket {seen.sockets} open (101)")
-                delay = await _hold(socket, client, journal, seen)
+                delay = await _hold(socket, client, journal, seen, sever_at)
 
         except Exception as exc:  # noqa: BLE001 - a live run reports, it does not crash
             journal.note("subscriber", f"socket ended: {type(exc).__name__}: {exc}")
@@ -165,7 +177,11 @@ async def run_subscriber(
 
 
 async def _hold(
-    socket: object, client: SubscriberClient, journal: Journal, seen: Observed
+    socket: object,
+    client: SubscriberClient,
+    journal: Journal,
+    seen: Observed,
+    sever_at: float | None = None,
 ) -> float:
     """Drive one live socket until the state machine asks to leave it. Returns the next delay.
 
@@ -211,7 +227,36 @@ async def _hold(
             while outbound:
                 await socket.send(outbound.pop(0))  # type: ignore[attr-defined]
 
-    tasks = [asyncio.create_task(c()) for c in (pump, tick, flush)]
+    async def sever() -> None:
+        """Drop this socket deliberately, to drive recovery without an edge kill.
+
+        Aborts the transport rather than closing gracefully, because the edge's teardown sends
+        NO close frame -- the measured signature is `ConnectionClosedError: no close frame
+        received or sent`. A graceful close would exercise a path the real event never takes.
+        """
+        if sever_at is None or seen.severed:
+            return
+        await asyncio.sleep(max(0.0, sever_at - time.monotonic()))
+        if stop.is_set():
+            return
+        seen.severed = True
+        journal.note("harness", "SEVERING the subscriber socket (abort, no close frame)")
+        transport = getattr(socket, "transport", None)
+        if transport is not None and hasattr(transport, "abort"):
+            transport.abort()
+        else:
+            await socket.close()  # type: ignore[attr-defined]
+
+    # `sever` is included ONLY when it has work to do, and that is load-bearing rather than
+    # tidy. `asyncio.wait(FIRST_COMPLETED)` below tears the socket down as soon as ANY of these
+    # returns -- so a `sever` that returned immediately (because it already fired, or was never
+    # asked for) ended every subsequent socket the instant it opened. That produced 26
+    # reconnects in three minutes and looked exactly like a product defect in the retry path.
+    # The client was fine; this list was not.
+    coros = [pump, tick, flush]
+    if sever_at is not None and not seen.severed:
+        coros.append(sever)
+    tasks = [asyncio.create_task(c()) for c in coros]
     _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
@@ -257,6 +302,18 @@ def main() -> int:
     parser.add_argument("--url", required=True, help="the App's https URL")
     parser.add_argument("--profile", default="fevm-west")
     parser.add_argument("--minutes", type=float, default=45.0)
+    parser.add_argument(
+        "--sever-after",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "drop the subscriber's socket deliberately after this many seconds, to exercise "
+            "reconnect and resume without waiting for an edge kill. NOT a substitute for the "
+            "real event -- a severed socket is one connection, and the edge kills every open "
+            "socket at once -- but it does drive the recovery path through the real edge."
+        ),
+    )
     args = parser.parse_args()
 
     if shutil.which("tmux") is None:
@@ -315,15 +372,22 @@ async def _run(
     publisher: Publisher,
 ) -> None:
     """The subscriber, plus a typist that pokes the pane before and after the first kill."""
+    sever_at = time.monotonic() + args.sever_after if args.sever_after > 0 else None
     subscriber = asyncio.create_task(
         run_subscriber(
-            f"{base}/subscribe/{session_id}", session_id, args.profile, deadline, journal, seen
+            f"{base}/subscribe/{session_id}",
+            session_id,
+            args.profile,
+            deadline,
+            journal,
+            seen,
+            sever_at,
         )
     )
 
     async def typist() -> None:
         await asyncio.sleep(20)
-        adapter.send(TMUX_NAME, text="echo W38-BEFORE-KILL-OK")
+        adapter.send(TMUX_NAME, text=f"echo {PRE_KILL_MARKER}")
         journal.note("typist", "typed the pre-kill marker")
         # Wait for the first reconnect, then prove the RECOVERED path carries real bytes.
         while time.monotonic() < deadline and seen.sockets < 2:
@@ -354,22 +418,28 @@ async def _run(
 
 
 def _report(journal: Journal, seen: Observed) -> int:
-    """The findings, and the exit status. Every claim below is a thing this run observed."""
+    """The findings, and the exit status. Every claim below is a thing this run observed.
+
+    CRITICAL: **"not observed" is a third outcome, and it is not a failure.** Two of these
+    checks are conditional on an edge kill actually firing, and the kill is a platform event
+    this harness cannot cause. Reporting them as FAIL when no kill happened is worse than
+    useless: it points a reader at working code. So they report `NOT OBSERVED`, and the exit
+    status distinguishes the three cases -- 0 all passed, 1 something FAILED, 2 the run was
+    inconclusive because its triggering event never arrived.
+    """
     stream = bytes(seen.output)
-    checks: list[tuple[str, bool, str]] = [
-        (
-            "the subscriber held more than one socket (an edge kill was outlasted)",
-            seen.sockets >= 2,
-            f"sockets={seen.sockets}",
-        ),
+    killed = seen.sockets >= 2
+
+    # (name, outcome, detail). `outcome` is True, False, or None for "not observed".
+    checks: list[tuple[str, bool | None, str]] = [
         (
             "a resync arrived and was applied as a RESET, never appended",
             seen.resyncs >= 1 and not seen.appended_after_resync,
             f"resyncs={seen.resyncs} appended={seen.appended_after_resync}",
         ),
         (
-            "the recovered path carried real bytes typed AFTER the kill",
-            POST_KILL_MARKER.encode() in stream,
+            "the data path carried real bytes end to end (typed, echoed, rendered)",
+            PRE_KILL_MARKER.encode() in stream,
             f"stream={len(stream)} bytes",
         ),
         (
@@ -382,18 +452,45 @@ def _report(journal: Journal, seen: Observed) -> int:
             "stream_gap" not in seen.notices,
             f"notices={sorted(set(seen.notices))}",
         ),
+        (
+            "the subscriber outlasted a socket teardown and rebound",
+            True if killed else None,
+            f"sockets={seen.sockets}",
+        ),
+        (
+            "the RECOVERED path carried bytes typed after the teardown",
+            (POST_KILL_MARKER.encode() in stream) if killed else None,
+            f"stream={len(stream)} bytes",
+        ),
     ]
 
     print("\n" + "=" * 78)
     print("W38 live acceptance -- findings")
     print("=" * 78)
     failed = 0
+    unobserved = 0
     for name, ok, detail in checks:
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}\n        {detail}")
-        failed += 0 if ok else 1
+        label = "NOT OBSERVED" if ok is None else ("PASS" if ok else "FAIL")
+        print(f"  {label:12s}  {name}\n                {detail}")
+        if ok is None:
+            unobserved += 1
+        elif not ok:
+            failed += 1
+
     print(f"\n  events recorded: {len(journal.events)}")
     print(f"  repaints seen:   {[len(r) for r in seen.repaints]}")
-    return 1 if failed else 0
+    held = journal.events[-1][0] if journal.events else 0.0
+    print(f"  wall time held:  {held / 60:.1f} min across {seen.sockets} socket(s)")
+
+    if unobserved:
+        print(
+            "\n  INCONCLUSIVE. No socket teardown fired during this run, so the reconnect and\n"
+            "  resume clauses were never exercised. That is a statement about the window, not\n"
+            "  about the code -- and it CONTRADICTS probe/FINDINGS.md, which measured a global\n"
+            "  edge event killing every open socket every ~10-18 min (longest lifetime observed:\n"
+            "  17.51 min). Re-run for longer, or use --sever-after to exercise recovery directly."
+        )
+    return 1 if failed else (2 if unobserved else 0)
 
 
 if __name__ == "__main__":

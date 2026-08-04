@@ -1,3 +1,30 @@
+# CRITICAL: THIS FILE NO LONGER REACHES THE DEPLOYED APP. Read this header before citing it.
+#
+# It described the Apps runtime's requirement set while the App installed on the PIP path. As of
+# 2026-08-04 the App installs on the UV path, so that role belongs to `pyproject.toml` and
+# `uv.lock` beside this file. Three specific claims below are now false of the deployed artifact:
+#
+#   * "the runtime reads this file". It does not. `scripts/deploy-app.sh` does not stage this
+#     file, and it asserts the staged root has no `requirements.txt` at all -- one present would
+#     take precedence over `pyproject.toml` and send the App back to pip and PYTHON 3.11.
+#   * "`uv.lock` never reaches the Apps runtime". It does now, and the Apps build installs from
+#     it. `make app-lock` generates that lock and rewrites its mirror hosts.
+#   * "this file is also the import check's dependency list". That list now comes from the staged
+#     `pyproject.toml`'s `[project] dependencies`.
+#
+# WHAT STILL HOLDS, and it is the reason this file is not deleted: the EXACT-VERSION rule and the
+# ONE-LIST rule are both properties of the deploy, not of pip. `pyproject.toml` restates them
+# where they now apply, and its dependency list is these pins at these versions. This file is
+# also what `probe/requirements.txt` and `transport/FINDINGS.md` cite by name, and those are
+# dated records of measurements that used it.
+#
+# It is kept and not deleted here deliberately. Deleting it is a separate change: it is what the
+# App shipped on through the verified 2026-08-02 and 2026-08-03 runs, three tracked files name it,
+# and a reader who finds a citation to a file that no longer exists learns less than one who
+# finds this header. See the report on the uv-path change for the argument.
+#
+# --- the original header follows, and it describes the PIP path ---
+#
 # The Databricks Apps requirement set. Mirrors `probe/requirements.txt`, whose comment records
 # the measurement this file depends on.
 #

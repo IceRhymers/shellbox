@@ -203,6 +203,18 @@ def _stamp(moment: datetime) -> str:
     return moment.isoformat()
 
 
+# PEP 695's type-parameter syntax, which is 3.12 and up.
+#
+# WORTH KNOWING, because this line has been rewritten once already. On the pip path the Apps
+# runtime was PYTHON 3.11 -- measured from a deploy log's `./.venv/lib/python3.11/site-packages`
+# and its `cp311` wheels -- and this spelling was a SyntaxError at import there, so the App
+# crash-looped behind a deploy that reported success. The deploy root now ships `pyproject.toml`
+# and `uv.lock` and no `requirements.txt`, so Apps installs on the uv path, honors
+# `requires-python` and provisions PYTHON 3.12. This syntax is correct again.
+#
+# What keeps it correct is not this comment. `scripts/deploy-app.sh` pins `RUNTIME_PYTHON` and
+# runs its import check on that interpreter, and `tests/unit/test_runtime_python.py` parses every
+# deployed module against the same pin in `make test`. Move the runtime backwards and both fail.
 def _read[Row: (HostRecord, SessionRecord)](
     database: AppDatabase, relation: str, read: Callable[[Registry], list[Row]]
 ) -> tuple[list[Row], dict[str, object]]:

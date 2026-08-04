@@ -1,5 +1,5 @@
 .PHONY: install sync fmt lint test test-tmux test-registry test-integration migrate migration \
-	migrate-roundtrip deploy grant require-pg-host require-deploy-principal
+	migrate-roundtrip deploy app-lock grant require-pg-host require-deploy-principal
 
 # The workspace, and the target inside the bundle. Both overridable on the command line:
 #
@@ -10,6 +10,11 @@
 # so a wrong profile errors instead of deploying somewhere unexpected.
 PROFILE ?= fevm-west
 TARGET  ?= dev
+
+# The deploy root's source directory, declared once. `scripts/deploy-app.sh` stages `app.yaml`,
+# `pyproject.toml`, `uv.lock` and `.python-version` out of here, and `app-lock` below writes the
+# lockfile into it.
+APP_DEPLOY_ROOT := packages/shellbox-app/src
 
 # No `make` target may silently re-lock. UV_LOCKED is the environment form of `--locked`: uv
 # checks `uv.lock` against the pyproject files and FAILS if it is stale, instead of quietly
@@ -177,8 +182,56 @@ require-pg-host:
 # adoption step in docs/deploy.md section 2. It is not a step in the script: `bundle deployment
 # bind` prompts unless it is passed --auto-approve, so inside the pipeline it would either block
 # or silently re-adopt whatever the name points at on every run.
-deploy:
+#
+# `app-lock` is a PREREQUISITE rather than a step inside `scripts/deploy.sh`. The lock is an input
+# to step 4, not an action of the pipeline, and adding an eighth numbered step would renumber the
+# seven whose positions that script's header argues for one by one.
+deploy: app-lock
 	scripts/deploy.sh --target $(TARGET) --profile $(PROFILE)
+
+# The DEPLOY root's lockfile, generated and then rewritten to public package hosts.
+#
+# This is the artifact that puts the App on Python 3.12. Databricks Apps installs on the uv path
+# only when the deploy root ships `pyproject.toml` + `uv.lock` and NO `requirements.txt`, and only
+# that path honors `requires-python` and provisions the interpreter. The header of
+# $(APP_DEPLOY_ROOT)/pyproject.toml carries the measurement and the Databricks doc links.
+#
+# GENERATED PER DEPLOY, AND GITIGNORED. `.gitignore`'s `uv.lock` pattern has no leading slash, so
+# it already covers $(APP_DEPLOY_ROOT)/uv.lock -- verified with `git check-ignore -v`. The reason
+# is the same one written above `uv.lock` there, and the rewrite below is why it is only the same
+# reason and not a stronger one: a lock generated here names whatever index this workstation
+# resolves through.
+#
+# UV_LOCKED := 0 on this target, and it is required rather than a convenience. The exported
+# UV_LOCKED=1 above is the environment form of `--locked`, and MEASURED on uv 0.10.9: `--locked`
+# against a lockfile whose hosts do not match the CONFIGURED index fails at the staleness check,
+# before any download. The rewrite below deliberately produces exactly that file, so this target
+# would fail on its own previous output on every mirror-configured machine. This overrides the
+# variable for this target only and changes nothing about the workspace lockfile lane.
+#
+# THE REWRITE IS REQUIRED, NOT DEFENSIVE, and the reasoning is in
+# `scripts/check_deploy_lock.py`'s header in full: this workstation resolves through an internal
+# PyPI mirror that the Apps BUILD environment cannot reach, the mirror preserves PyPI's URL layout
+# 1:1 so a host substitution is exact, and the lock's per-artifact hashes are verified by the Apps
+# build's `uv sync --locked` -- so a wrong rewrite fails at install rather than shipping a wrong
+# artifact. It is a no-op on a workstation already resolving public PyPI.
+#
+# The two checks are the proof, and they run HERE so a failure names the rewrite rather than
+# surfacing minutes later as a failed deploy. `sed -i.bak` leaves the pre-rewrite bytes in
+# `uv.lock.bak`, which is what the hash comparison reads -- the exact input the rewrite saw, and
+# nothing regenerates it. It is removed only after both checks pass, so a failure leaves it for
+# reading.
+app-lock: UV_LOCKED := 0
+app-lock:
+	uv lock --directory $(APP_DEPLOY_ROOT)
+	sed -i.bak \
+		-e 's#https://pypi-proxy\.dev\.databricks\.com/simple/#https://pypi.org/simple/#g' \
+		-e 's#https://pypi-proxy\.dev\.databricks\.com/packages/#https://files.pythonhosted.org/packages/#g' \
+		$(APP_DEPLOY_ROOT)/uv.lock
+	python3 scripts/check_deploy_lock.py --assert-hashes-unchanged \
+		$(APP_DEPLOY_ROOT)/uv.lock --baseline $(APP_DEPLOY_ROOT)/uv.lock.bak
+	python3 scripts/check_deploy_lock.py --assert-hosts $(APP_DEPLOY_ROOT)/uv.lock
+	rm -f $(APP_DEPLOY_ROOT)/uv.lock.bak
 
 # The second guard on this path, and it guards the IDENTITY rather than the destination.
 #

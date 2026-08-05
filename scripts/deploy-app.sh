@@ -463,7 +463,13 @@ if [[ -n "$ROOT_DIFF" ]]; then
   echo "  deployments are mode: SNAPSHOT, so it would ship in the artifact and stay" >&2
   echo "  importable." >&2
   printf '%s\n' "$ROOT_DIFF" | sed 's/^/    /' >&2
-  echo "  Remedy: databricks workspace rm -r '$WS_PATH' --profile $PROFILE, then re-run." >&2
+  echo "  Remedy, and PREFER THE FIRST -- when this last fired, the whole diff was one stale" >&2
+  echo "  requirements.txt, and deleting the single file was enough:" >&2
+  echo "    1. Delete only the '+' paths:" >&2
+  echo "         databricks workspace delete '$WS_PATH/<path>' --profile $PROFILE" >&2
+  echo "    2. Or, if the diff is large or you want a known-clean root:" >&2
+  echo "         databricks workspace rm -r '$WS_PATH' --profile $PROFILE" >&2
+  echo "  Then re-run. Option 2 forces a full re-upload; option 1 does not." >&2
   exit 1
 fi
 echo "    ok"

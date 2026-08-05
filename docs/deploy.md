@@ -415,8 +415,14 @@ write **as** the service principal.
 |---|---|---|
 | The SP **can read** both granted tables | `/ready` on the deployed App returns `{"ready": true}`. That is the App minting a token as itself and reading both relations through the production path | Stronger than a laptop-minted credential. It exercises the path that actually runs |
 | The SP **cannot write** | `has_table_privilege` reports `SELECT` true and `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` false on both tables | **Catalog evidence, NOT an attempted-write refusal.** The two are different claims. A catalog answer says what the grant records; only a refused statement says what Postgres enforces |
+| The **statements** `make grant` issues produce a role Postgres refuses to write with | [`tests/registry/test_grant_enforcement.py`](../tests/registry/test_grant_enforcement.py), in `make test-registry`. It applies `grant_statements` verbatim to a stand-in role and asserts `42501` on all four forbidden privileges across both tables | **An enforced refusal, against a STAND-IN identity.** It closes the "is it really enforced?" half in CI. It says nothing about whether the real App SP's role received these statements and nothing wider |
 
 Do not read the second row as satisfying the `42501` requirement. It does not.
+
+The third row does not satisfy it either, and the gap is worth stating precisely: what remains
+unproven is not the *mechanism* but the *identity*. The grant's shape is now enforced on every
+push; that the deployed service principal holds exactly that shape is still only catalog evidence.
+The block below is the only known way to close it.
 
 **Assert the SQLSTATE, never the message text**, which is not stable across Postgres versions.
 
@@ -425,6 +431,20 @@ granted exactly what `make grant` grants: the `SELECT` returns, and the `INSERT`
 SQLSTATE `42501`. The deliberately incomplete row matters and it is safe: Postgres checks the
 privilege **before** it evaluates the constraints, so the statement still reaches the privilege
 check.
+
+That measurement is no longer hand-run. It is
+[`tests/registry/test_grant_enforcement.py`](../tests/registry/test_grant_enforcement.py), which
+applies `grant_statements` verbatim and asserts `42501` on every privilege in
+`FORBIDDEN_PRIVILEGES` across both tables — and rejects `23502` and `23503` by name, because a
+constraint violation means the statement got *past* the privilege check. Verified by mutation:
+widening the grant with `INSERT` makes it fail, reporting `23502`.
+
+NOTE: that lane revokes `USAGE ON SCHEMA public FROM PUBLIC` inside its fixture, and restores it
+afterwards. Without that the explicit `GRANT USAGE` in `grant_statements` is **inert** on
+PostgreSQL 15 and later, whose `public` schema no longer grants `CREATE` to `PUBLIC` but still
+grants `USAGE` — measured here as
+`{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`. Deleting that statement left the
+whole file green until the revoke was added.
 
 **What a wrong answer means:**
 

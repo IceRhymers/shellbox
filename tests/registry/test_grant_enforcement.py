@@ -143,6 +143,24 @@ def granted_role(pg_engine: Engine) -> Iterator[tuple[str, dict[str, Any]]]:
     role = str(uuid.uuid4())
     url = pg_engine.url
 
+    # SKIPPED on the Lakebase path, and the reason is not incidental. This fixture needs an
+    # OWNER connection built from static credentials (`_owner_params` reads `url.password`), and
+    # a Lakebase engine has none -- its token is minted per connect by a ``do_connect`` hook, so
+    # `url.password` is empty. It also needs `CREATE ROLE ... LOGIN PASSWORD`, and a
+    # password-login role is not something a Lakebase endpoint is known to grant.
+    #
+    # This is the right outcome rather than a gap to paper over: what this file proves is that
+    # the STATEMENTS produce a role Postgres refuses to write with, and Postgres is Postgres.
+    # What remains unproven is the IDENTITY -- that the deployed App SP's role holds this exact
+    # shape -- and that is blocked on `databricks service-principal-secrets-proxy create`, not
+    # on which database this suite runs against. See `docs/deploy.md` section 4.
+    if not url.password:
+        pytest.skip(
+            "the grant-enforcement lane needs a static owner credential and CREATE ROLE, so it "
+            "runs against a local Postgres rather than a Lakebase endpoint (whose token is "
+            "minted per connect). Run `make test-registry` with no SHELLBOX_PG_RESOURCE set."
+        )
+
     def as_owner(statements: list[str]) -> None:
         # Autocommit: CREATE ROLE and DROP ROLE are not transactional in the way the rest of this
         # fixture would want, and a half-applied grant would leak into the next test.

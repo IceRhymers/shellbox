@@ -634,3 +634,84 @@ branch_id: ${var.no_such_variable}     ->  "Found 1 error", exit 1
 So `${var.*}` is validated and `${resources.*}` is not. A typo in a resource reference surfaces
 only at deploy time. That is why the check that the bundle provisioned Lakebase is a
 **post-deploy** `databricks postgres get-endpoint`, in section 3, and never `validate` output.
+
+---
+
+## 9. A disposable Lakebase branch, for the destructive registry suite
+
+`make test-registry` runs against `postgres:16-alpine` — in CI, and against the local docker
+instance in dev. That proves the registry **code**. It proves nothing **Lakebase-specific**, and
+the three things most likely to break there are all absent from a Postgres image:
+
+- OAuth tokens minted **per connect** by the `do_connect` hook, rather than a password in a DSN;
+- `pool_pre_ping` discarding a connection whose endpoint suspended underneath the pool;
+- the cold start after `suspend_timeout_duration`, which is `300s` on this project.
+
+The suite is **destructive** — it `drop_all`s on teardown — so it needs a database it may
+destroy. A Lakebase **branch** is a copy-on-write fork, which is exactly that.
+
+[`scripts/lakebase_branch.py`](../scripts/lakebase_branch.py) is borrowed from
+`databricks-code-search`'s `scripts/ci_branch.py`, which learned the platform facts first: a
+branch auto-provisions its own `READ_WRITE` endpoint (so resolve it, never create one), the API
+**requires** an expiry, and `ttl` must be a protobuf `Duration` rather than a string.
+
+```sh
+eval "$(make -s lakebase-branch-up BRANCH=w37b)"
+make test-registry
+make lakebase-branch-down BRANCH=w37b
+```
+
+`up` prints three `export` lines and **no credential** — the endpoint's host and role are resolved
+from the workspace and the token is minted per connect, so nothing you `eval` carries a password.
+
+### `SHELLBOX_THROWAWAY_PG_HOST` — why the narrow permission slip exists
+
+The fixtures' original opt-in, `SHELLBOX_ALLOW_DESTRUCTIVE_TESTS=1`, authorises destroying
+**whatever host happens to be configured**. On Lakebase that is not a difference a human can see:
+
+```
+production   ep-orange-dawn-d1pfsv4t.database.us-west-2.cloud.databricks.com
+a fork       ep-lucky-meadow-d1093951.database.us-west-2.cloud.databricks.com
+```
+
+Same shape, and only the random segment differs. So `up` emits
+`SHELLBOX_THROWAWAY_PG_HOST=<that branch's host>`, and
+[`tests/registry/conftest.py`](../tests/registry/conftest.py) accepts a host that matches it
+**exactly**. The failure this removes is entirely ordinary: a shell still holding
+`SHELLBOX_PG_RESOURCE` from a `make deploy`, plus an opt-in exported an hour ago for a branch that
+has since been purged.
+
+**Verified live, 2026-08-05.** With the production endpoint configured and a stale slip naming the
+fork, the fixtures refused, naming the real host — and `GET /api/hosts` still returned its two
+`w37a-` rows afterwards, so nothing was dropped. `scripts/lakebase_branch.py` refuses the
+`production` branch id outright for the same reason, on both `up` and `down`: forking onto it
+would replace it, since the call passes `replace_existing=True`.
+
+The blanket flag still works and is still documented, because deliberately running against
+Lakebase is how ADR-3 got verified. Prefer the branch.
+
+### What ran, and the one thing that did not
+
+**40 passed, 15 skipped, 0 failed** against a real branch on 2026-08-05.
+
+The skips are honest and each says why. Two files need a **static** DSN and cannot use the shared
+engine: they build their own with `pool_pre_ping=False` for a negative control, and with a
+per-test `application_name` so a test can terminate exactly its own backends.
+`create_lakebase_engine` exposes neither.
+
+That leaves one real gap, and it is the interesting one:
+[`tests/registry/test_pool_resilience.py`](../tests/registry/test_pool_resilience.py) is the file
+that would prove `pool_pre_ping` survives a **real** scale-to-zero suspend rather than a simulated
+kill, and it is precisely the file that cannot run here. Closing it means teaching
+`create_lakebase_engine` to accept `pool_pre_ping` and `connect_args`. Whether Lakebase then
+permits `pg_terminate_backend` on one's own backends is **unmeasured** — check that before
+assuming the extension is sufficient.
+
+### Cost, and the backstop
+
+A branch is billable. It carries a **2 h TTL**, so a run killed between `up` and `down` reclaims
+itself rather than billing indefinitely — `down` is best-effort and deliberately never raises, so
+the TTL is what actually guarantees it. `down` makes it immediate.
+
+**No lane calls either target.** Wiring this into CI is a deliberate later step; the donor's
+`ci-lakebase.yml` shows the shape, including `if: always()` on teardown.

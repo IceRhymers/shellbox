@@ -46,7 +46,14 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
+# NOTE: `yaml` is imported LAZILY, inside the two functions that parse a bundle file. It is not a
+# project dependency -- `make lint` supplies it with `uv run --no-project --with pyyaml`, so that a
+# YAML parser nothing else in the repo needs stays out of pyproject.toml.
+#
+# The lazy import is what lets `tests/unit/test_check_bundle_statics.py` import this module and
+# assert on `_EXPANSION`'s vocabulary without a parser present. Those regexes ARE the rule, so
+# widening one must be a test failure rather than a review catch -- and a top-level import made
+# them unreachable from `make test`.
 
 REPO = Path(__file__).resolve().parent.parent
 BUNDLE_FILE = REPO / "databricks.yml"
@@ -60,7 +67,19 @@ APP_KEY = "shellbox_app"
 # list -- and an exclusion list is exactly how a scope check stops covering the thing that
 # matters.
 _SEGMENT = "projects"
-_EXPANSION = r"(?:\$\(|\$\{)"
+# What counts as "this segment is interpolated, not written down". Two shell forms and one
+# Python form.
+#
+# The Python form -- a bare `{`, as in an f-string's `f"projects/{project}"` -- was added when
+# `scripts/lakebase_branch.py` arrived and this check reported it twice. That was a FALSE
+# POSITIVE: the value comes from a `--project` argument, which `make lakebase-branch-up` cuts out
+# of `SHELLBOX_PG_RESOURCE`, so no project name is written anywhere. The rule was right and its
+# vocabulary was shell-only.
+#
+# It does NOT loosen the rule. A literal `projects/shellbox-pg-dev` still fails, because `s` is
+# none of `{`, `$(` or `${` -- asserted by `test_a_literal_project_name_is_still_caught` in
+# `tests/unit/test_check_bundle_statics.py`.
+_EXPANSION = r"(?:\$\(|\$\{|\{)"
 ANY_PROJECT_PATH = re.compile(rf"{_SEGMENT}/")
 CONSTRUCTED_PATH = re.compile(
     rf"{_SEGMENT}/{_EXPANSION}[^/]+/branches/{_EXPANSION}[^/]+/endpoints/{_EXPANSION}[^/]+"
@@ -99,6 +118,8 @@ def require_bundle_files(failures: Failures) -> bool:
 
 
 def load_resource_files() -> dict[Path, dict]:
+    import yaml
+
     return {path: yaml.safe_load(path.read_text()) or {} for path in resource_files()}
 
 
@@ -185,6 +206,8 @@ def check_per_target_app_name(failures: Failures) -> None:
     so a dev-target validate keeps the app name verbatim. Two targets sharing a name therefore
     means a dev deploy reconciles the production App and reports success.
     """
+    import yaml
+
     bundle = yaml.safe_load(BUNDLE_FILE.read_text()) or {}
     targets = bundle.get("targets") or {}
 

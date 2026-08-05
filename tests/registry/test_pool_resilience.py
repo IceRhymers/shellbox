@@ -14,20 +14,28 @@ that passes against the unprotected configuration is not a resilience test.
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 from shellbox_registry.dsn import normalize_postgres_dsn
 from sqlalchemy import Engine, create_engine, text
 
+from .conftest import static_dsn_or_skip
+
 pytestmark = pytest.mark.registry
 
 
 def _engine(*, pre_ping: bool, app_name: str, pool_size: int = 3) -> Engine:
-    """An engine whose connections are identifiable, so a test can kill exactly its own."""
+    """An engine whose connections are identifiable, so a test can kill exactly its own.
+
+    Built from a STATIC DSN, which is why this whole file skips on the Lakebase path: it needs
+    `pool_pre_ping=False` for its negative control and a per-test ``application_name`` to kill
+    only its own backends, and `create_lakebase_engine` exposes neither. See
+    `static_dsn_or_skip`, which also records what closing that gap would take -- this file is
+    the one that would prove `pool_pre_ping` against a REAL suspend rather than a simulated one.
+    """
     return create_engine(
-        normalize_postgres_dsn(os.environ["SHELLBOX_DATABASE_URL"]),
+        normalize_postgres_dsn(static_dsn_or_skip()),
         pool_size=pool_size,
         max_overflow=0,
         pool_pre_ping=pre_ping,

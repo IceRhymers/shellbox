@@ -267,6 +267,44 @@ migrate: require-pg-host require-deploy-principal
 grant: require-pg-host require-deploy-principal
 	scripts/grant-app-sp.sh --target $(TARGET) --profile $(PROFILE)
 
+# A disposable Lakebase branch, for the destructive registry suite. `W37b`.
+#
+# `make test-registry` on its own proves the registry CODE against a Postgres container. It
+# proves nothing Lakebase-specific -- OAuth minted per connect, `pool_pre_ping` across a suspend,
+# the cold start at `suspend_timeout_duration` -- because none of that exists in a Postgres
+# image. A branch is a copy-on-write fork, so the suite's `drop_all` lands on a copy instead of
+# on the registry the deployed App reads.
+#
+#     eval "$(make -s lakebase-branch-up BRANCH=w37b)"
+#     make test-registry
+#     make lakebase-branch-down BRANCH=w37b
+#
+# WARNING: `up` creates a BILLABLE resource. The branch carries a 2 h ttl so a forgotten one
+# reclaims itself, but `down` is what makes that immediate. No lane calls either target.
+#
+# CRITICAL: DATABRICKS_CONFIG_PROFILE is set explicitly on both. `WorkspaceClient()` falls back
+# to the DEFAULT profile, which on this workstation is a SHARED workspace -- so an unset profile
+# would fork a branch in somebody else's account rather than failing.
+BRANCH ?= dev-$(USER)
+
+.PHONY: lakebase-branch-up lakebase-branch-down
+
+# Prints `export KEY=VALUE` lines on stdout and nothing else, so it is `eval`-able. Every log
+# line from the script goes to stderr for exactly that reason. The project id is CUT out of
+# SHELLBOX_PG_RESOURCE rather than resolved again, so `scripts/bundle-vars.sh` stays the one
+# place a project name is derived.
+lakebase-branch-up:
+	@eval "$$(scripts/bundle-vars.sh -t $(TARGET) -p $(PROFILE))"; \
+	  DATABRICKS_CONFIG_PROFILE=$(PROFILE) uv run python scripts/lakebase_branch.py up \
+	    --project "$$(printf '%s' "$$SHELLBOX_PG_RESOURCE" | cut -d/ -f2)" \
+	    --branch "$(BRANCH)"
+
+lakebase-branch-down:
+	@eval "$$(scripts/bundle-vars.sh -t $(TARGET) -p $(PROFILE))"; \
+	  DATABRICKS_CONFIG_PROFILE=$(PROFILE) uv run python scripts/lakebase_branch.py down \
+	    --project "$$(printf '%s' "$$SHELLBOX_PG_RESOURCE" | cut -d/ -f2)" \
+	    --branch "$(BRANCH)"
+
 migration:
 	uv run alembic -c alembic.ini revision --autogenerate -m "$(name)"
 

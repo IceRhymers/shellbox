@@ -568,6 +568,38 @@ any absolute URL and checks the vendored bundles against the hashes recorded in
 [`static/vendor/README.md`](../packages/shellbox-app/src/shellbox_app/static/vendor/README.md) —
 browser assets have no lockfile, so that table is their only integrity record.
 
+### Checking it in an actual browser
+
+The one thing no lane in this repo can do. `make test` covers the protocol half in Python; the
+JavaScript above it is a transcription nothing executes, so a human has to look.
+
+The App serves **one subscriber per session**, so `scripts/live_acceptance.py` in its normal mode
+would refuse your browser with `subscriber_conflict`. `--publisher-only` holds a real pane and
+leaves the slot free:
+
+```sh
+uv run python scripts/live_acceptance.py \
+  --url "$APP_URL" --profile fevm-west --minutes 30 --publisher-only
+```
+
+It prints the URL to open. Three things to check, which are exactly issue #4's last clause:
+
+1. the terminal **renders** — not a blank pane, not a banner;
+2. you can **type** — `ls`, or `printf 'a\tb\n'` for a tab, or an arrow key for an escape sequence;
+3. **resize** the window and confirm the pane reflows rather than corrupting.
+
+The pane emits a line every 30 s, so you can tell a live stream from a stalled one before typing
+anything.
+
+NOTE: **the session will not appear in the list at `$APP_URL/ui/`, and that is correct.** The
+inventory reads the registry; this harness publishes to the relay and enrols no row. The two are
+deliberately independent — ADR-3, a registry failure degrades the inventory and never the relay —
+so use the fragment URL the harness prints. A reader who does not know this concludes the page is
+broken.
+
+The run exits **2** and reports `NOT OBSERVED` against the browser clause, because nothing in it
+can answer that question. Record what you saw.
+
 WARNING: **the renderer above the protocol layer has no automated gate at all.** ADR-23 tests
 the browser client's protocol half in Python
 ([`tests/unit/test_client_protocol.py`](../tests/unit/test_client_protocol.py)) and compares the

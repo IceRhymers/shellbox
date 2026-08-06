@@ -28,10 +28,25 @@ design is untested against the thing it was designed for.
    real bytes rather than merely reporting itself connected.
 4. No `subscriber_conflict` outlives ADR-20's bound, and no undeclared `seq` gap is ever seen.
 
-## Running it
+## Two modes, and the second exists because ADR-23 leaves a gap no lane can close
 
     eval "$(scripts/bundle-vars.sh -t dev -p fevm-west)"
-    uv run python scripts/live_acceptance.py --minutes 45
+
+    # 1. assert the protocol, with this harness's own subscriber
+    uv run python scripts/live_acceptance.py --url "$APP_URL" --minutes 45
+
+    # 2. hold a pane for a REAL BROWSER, asserting nothing about the subscriber path
+    uv run python scripts/live_acceptance.py --url "$APP_URL" --minutes 30 --publisher-only
+
+Mode 1 drives `SubscriberClient`, which is what makes the run evidence about the browser client's
+PROTOCOL half. It cannot say anything about xterm.js, because ADR-23 declines a browser test lane
+and `static/protocol.js` is a transcription nothing executes.
+
+Mode 2 is the answer to that. The App serves **one subscriber per session**, so this harness's own
+subscriber would refuse a browser with `subscriber_conflict` -- `--publisher-only` leaves the slot
+free and prints the URL to open. It is the only way to reach issue #4's last clause, *"a browser
+can attach to a session, type, and resize"*, and its findings block says so rather than implying
+the run checked anything itself.
 
 It needs a workspace OAuth token: the edge answers a PAT with a 302. The token is re-minted per
 dial rather than captured once, because Apps OAuth expires in about an hour and this run is
@@ -56,6 +71,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 from shellbox_app.client import (
     Notice,
@@ -314,10 +330,34 @@ def main() -> int:
             "socket at once -- but it does drive the recovery path through the real edge."
         ),
     )
+    parser.add_argument(
+        "--publisher-only",
+        action="store_true",
+        help=(
+            "hold the publisher and start NO subscriber, leaving the session's one subscriber "
+            "slot free for a real browser. This is how a human closes issue #4's last clause -- "
+            "'a browser can attach to a session, type, and resize' -- which no automated lane in "
+            "this repo can reach, because ADR-23 declines a browser test lane. The run asserts "
+            "nothing about the subscriber path and exits 2 for inconclusive by design."
+        ),
+    )
     args = parser.parse_args()
 
     if shutil.which("tmux") is None:
         print("tmux is not on PATH; this run needs a real pty", file=sys.stderr)
+        return 2
+
+    # Refused rather than ignored. `--sever-after` severs the SUBSCRIBER's socket, and
+    # `--publisher-only` is the mode with no subscriber -- so the pair is a request the harness
+    # cannot honour, and honouring half of it silently is the class of no-op this repo keeps
+    # finding. See `probe/FINDINGS.md` on the first run reporting "not observed" as FAIL.
+    if args.publisher_only and args.sever_after > 0:
+        print(
+            "--publisher-only starts no subscriber, so --sever-after has no socket to sever.\n"
+            "Pick one: --publisher-only to hold a pane for a browser, or --sever-after to drive "
+            "the recovery path with this harness's own subscriber.",
+            file=sys.stderr,
+        )
         return 2
 
     base = args.url.rstrip("/").replace("https://", "wss://")
@@ -347,6 +387,9 @@ def main() -> int:
     publisher.start(timeout=15.0)
     journal.note("publisher", f"claimed={publisher.claimed}")
 
+    if args.publisher_only:
+        _print_browser_instructions(args.url.rstrip("/"), session_id, args.minutes)
+
     deadline = time.monotonic() + args.minutes * 60
     try:
         asyncio.run(_run(base, session_id, args, deadline, journal, seen, adapter, publisher))
@@ -358,7 +401,50 @@ def main() -> int:
             adapter.kill(TMUX_NAME)
         shutil.rmtree(workspace, ignore_errors=True)
 
-    return _report(journal, seen)
+    return _report(journal, seen, publisher_only=args.publisher_only, publisher=publisher)
+
+
+def _print_browser_instructions(app_url: str, session_id: str, minutes: float) -> None:
+    """Where to point a browser, and the one thing that will otherwise look broken.
+
+    CRITICAL: the session will NOT appear in the inventory list at ``/ui/``, and a reader who does
+    not know that will conclude the page is broken. The inventory reads the REGISTRY -- see
+    `packages/shellbox-app/src/shellbox_app/inventory.py` -- and this harness publishes to the
+    RELAY without enrolling a host or a session row. The two are deliberately independent (ADR-3:
+    a registry failure degrades the inventory and never the relay), and this is that independence
+    showing through from the other side.
+
+    So the fragment URL is the one to open. `terminal.js` reads ``#session=`` and attaches without
+    consulting the inventory at all; `applyHost` simply finds no row, and the no-publisher banner
+    loses its detail rather than its correctness. That is the degraded path working as designed.
+    """
+    fragment = f"{app_url}/ui/#session={quote(session_id, safe='')}"
+    print(
+        "\n"
+        + "=" * 78
+        + f"""
+PUBLISHER-ONLY. The subscriber slot is free -- open this in a browser:
+
+    {fragment}
+
+The pane is a real /bin/sh on a real pty, and it emits a line every 30 s so you can
+see the stream is live without typing.
+
+WHAT TO CHECK, which is issue #4's last unmet clause:
+  1. the terminal renders (not a blank pane, not a banner)
+  2. you can TYPE -- try `ls`, or `printf 'a\\tb\\n'` for a tab, or an arrow key
+  3. RESIZE the window and confirm the pane reflows rather than corrupting
+
+NOTE: this session will NOT be listed at {app_url}/ui/ and that is correct. The
+inventory reads the registry; this harness publishes to the relay and enrols no row.
+Use the fragment URL above.
+
+Holding for {minutes:.0f} min. Ctrl-C when you are done -- the pane and its tmux
+server are reaped on the way out.
+"""
+        + "=" * 78,
+        flush=True,
+    )
 
 
 async def _run(
@@ -371,19 +457,30 @@ async def _run(
     adapter: TmuxAdapter,
     publisher: Publisher,
 ) -> None:
-    """The subscriber, plus a typist that pokes the pane before and after the first kill."""
+    """The subscriber, plus a typist that pokes the pane before and after the first kill.
+
+    In ``--publisher-only`` mode there is no subscriber task at all -- that is the whole point,
+    since the App serves one subscriber per session and this harness's own would refuse the
+    browser with `subscriber_conflict`. The typist becomes a heartbeat instead of a marker writer:
+    with nothing here reading the stream, a marker nothing asserts on is pointless, while a
+    periodic line is what lets a HUMAN see the stream is live without typing.
+    """
     sever_at = time.monotonic() + args.sever_after if args.sever_after > 0 else None
-    subscriber = asyncio.create_task(
-        run_subscriber(
-            f"{base}/subscribe/{session_id}",
-            session_id,
-            args.profile,
-            deadline,
-            journal,
-            seen,
-            sever_at,
+    tasks: list[asyncio.Task[None]] = []
+    if not args.publisher_only:
+        tasks.append(
+            asyncio.create_task(
+                run_subscriber(
+                    f"{base}/subscribe/{session_id}",
+                    session_id,
+                    args.profile,
+                    deadline,
+                    journal,
+                    seen,
+                    sever_at,
+                )
+            )
         )
-    )
 
     async def typist() -> None:
         await asyncio.sleep(20)
@@ -397,17 +494,41 @@ async def _run(
             adapter.send(TMUX_NAME, text=f"echo {POST_KILL_MARKER}")
             journal.note("typist", "typed the post-kill marker")
 
+    async def heartbeat() -> None:
+        """A visible line every 30 s, so a viewer can tell a live pane from a stalled one.
+
+        Written through the same `adapter.send` the typist uses, so it exercises the real
+        buffer-then-keys delivery path rather than writing to the pty behind tmux's back.
+        """
+        beat = 0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(30)
+            beat += 1
+            adapter.send(TMUX_NAME, text=f"echo w38-live beat {beat}")
+
     async def watchdog() -> None:
         while time.monotonic() < deadline:
             await asyncio.sleep(60)
-            journal.note(
-                "harness",
-                f"{(deadline - time.monotonic()) / 60:.0f} min left; "
-                f"sockets={seen.sockets} resyncs={seen.resyncs} "
-                f"publisher_error={publisher.error!r}",
-            )
+            left = f"{(deadline - time.monotonic()) / 60:.0f} min left"
+            if args.publisher_only:
+                # `sockets` is deliberately absent: it counts THIS harness's subscriber sockets,
+                # and there are none by design. Printing `sockets=0` beside a healthy publisher
+                # would read as the failure this mode exists to avoid.
+                journal.note(
+                    "harness",
+                    f"{left}; publisher held, browser slot free; "
+                    f"publisher_error={publisher.error!r}",
+                )
+            else:
+                journal.note(
+                    "harness",
+                    f"{left}; sockets={seen.sockets} resyncs={seen.resyncs} "
+                    f"publisher_error={publisher.error!r}",
+                )
 
-    tasks = [subscriber, asyncio.create_task(typist()), asyncio.create_task(watchdog())]
+    # The typist writes markers only when something is reading them; the heartbeat is for a human.
+    tasks.append(asyncio.create_task(heartbeat() if args.publisher_only else typist()))
+    tasks.append(asyncio.create_task(watchdog()))
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True), timeout=deadline - time.monotonic()
@@ -417,7 +538,13 @@ async def _run(
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _report(journal: Journal, seen: Observed) -> int:
+def _report(
+    journal: Journal,
+    seen: Observed,
+    *,
+    publisher_only: bool = False,
+    publisher: Publisher | None = None,
+) -> int:
     """The findings, and the exit status. Every claim below is a thing this run observed.
 
     CRITICAL: **"not observed" is a third outcome, and it is not a failure.** Two of these
@@ -429,6 +556,30 @@ def _report(journal: Journal, seen: Observed) -> int:
     """
     stream = bytes(seen.output)
     killed = seen.sockets >= 2
+
+    if publisher_only:
+        # Every check below reads the SUBSCRIBER's observations, and this mode runs no subscriber.
+        # Reporting them against an empty `Observed` would print four confident-looking failures
+        # about code that was never exercised -- the same mistake as the first run's "no kill
+        # happened" FAIL, in a new shape. So the mode reports only what it can actually see.
+        checks = [
+            (
+                "the publisher claimed the session and held it",
+                publisher is not None and publisher.error is None,
+                f"error={None if publisher is None else publisher.error!r}",
+            ),
+            (
+                "the subscriber slot was left free for a browser",
+                True,
+                f"sockets={seen.sockets} (this harness opened none, by design)",
+            ),
+            (
+                "a browser attached, typed, and resized",
+                None,
+                "only a human can answer this -- issue #4's last clause",
+            ),
+        ]
+        return _print(journal, seen, checks, publisher_only=True)
 
     # (name, outcome, detail). `outcome` is True, False, or None for "not observed".
     checks: list[tuple[str, bool | None, str]] = [
@@ -464,6 +615,17 @@ def _report(journal: Journal, seen: Observed) -> int:
         ),
     ]
 
+    return _print(journal, seen, checks, publisher_only=False)
+
+
+def _print(
+    journal: Journal,
+    seen: Observed,
+    checks: list[tuple[str, bool | None, str]],
+    *,
+    publisher_only: bool,
+) -> int:
+    """Render the findings block and return the exit status. Shared by both modes."""
     print("\n" + "=" * 78)
     print("W38 live acceptance -- findings")
     print("=" * 78)
@@ -478,8 +640,17 @@ def _report(journal: Journal, seen: Observed) -> int:
             failed += 1
 
     print(f"\n  events recorded: {len(journal.events)}")
-    print(f"  repaints seen:   {[len(r) for r in seen.repaints]}")
     held = journal.events[-1][0] if journal.events else 0.0
+    if publisher_only:
+        print(f"  wall time held:  {held / 60:.1f} min, publisher only")
+        print(
+            "\n  INCONCLUSIVE BY DESIGN. This mode asserts nothing about the subscriber path --\n"
+            "  it holds a pane so a human can attach a real browser, which is the only way to\n"
+            "  reach issue #4's last clause under ADR-23. Record what you saw; nothing here can."
+        )
+        return 1 if failed else 2
+
+    print(f"  repaints seen:   {[len(r) for r in seen.repaints]}")
     print(f"  wall time held:  {held / 60:.1f} min across {seen.sockets} socket(s)")
 
     if unobserved:

@@ -29,10 +29,21 @@ than an assumption::
     has_schema_privilege(role, 'public', 'CREATE')
     has_database_privilege(role, current_database(), 'CREATE')
 
-``--revoke-schema-create`` attempts to narrow the first one. It is opt-in and UNVERIFIED: nothing
-has yet established whether the platform re-grants it on the next ``bundle deploy``, or whether
-the binding needs it. Section 4 of ``docs/deploy.md`` records this as an accepted residual until a
-first deploy measures it.
+MEASURED 2026-08-05, authenticated as the deployed ``dev`` App SP against the deployed ``dev``
+endpoint: **``CREATE TABLE`` in ``public`` was refused with ``42501``.** So on this endpoint the
+paragraph above overstates the binding -- its create capability does not reach ``public``.
+Lakebase runs PostgreSQL 17, where ``PUBLIC`` holds ``USAGE`` and not ``CREATE`` on ``public`` by
+default, and that default is what actually decides it.
+
+Read that narrowly. It was measured on ``public`` only, so the binding may still confer ``CREATE``
+elsewhere -- which is why this script keeps reporting ``has_database_privilege`` too -- and it is
+a property of the Lakebase template rather than of anything this repo controls.
+
+``--revoke-schema-create`` attempts to narrow the schema privilege. It stays opt-in and remains
+UNVERIFIED, because the measurement above means there has been nothing to narrow: nothing has
+established whether the platform re-grants it on the next ``bundle deploy``, or whether the
+binding needs it. It is the remedy if a future template changes that default. Section 4 of
+``docs/deploy.md`` records the run.
 
 What the create capability does NOT put at risk is the registry's existing rows. Creating a table
 is not a privilege on another table, and the verification below asserts the role holds no

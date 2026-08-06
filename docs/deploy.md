@@ -395,7 +395,41 @@ App's service principal, created with `databricks account service-principal-secr
 **Whether an App-managed service principal accepts a client secret is unverified here**, and it
 is the one part of this procedure nobody has run.
 
-##### This procedure is still unrun, and `SET ROLE` is not a way around it
+##### RUN 2026-08-05. `A15` is closed, and `SET ROLE` is still not a way around it
+
+The procedure below was carried out once, against the deployed `dev` App SP and the deployed
+`dev` registry, with an operator-authorized client secret that was deleted immediately
+afterwards. **`A15`'s identity half is closed.**
+
+```
+connected as: dda687fb-…  (id=77024219321776)   <- the App's own service_principal_id
+current_user = session_user = dda687fb-…        <- Postgres agrees, so this is not a scenic
+                                                   route through the operator's credential
+SELECT public.hosts     -> OK, 2 rows
+SELECT public.sessions  -> OK, 2 rows
+INSERT   hosts/sessions -> 42501  (both)
+UPDATE   hosts/sessions -> 42501  (both)
+DELETE   hosts/sessions -> 42501  (both)
+TRUNCATE hosts/sessions -> 42501  (both)
+```
+
+Every statement in `FORBIDDEN_PRIVILEGES`, on both granted tables, refused by the server as the
+real role. The `SELECT`s are the non-vacuity guard and they are not a formality: without
+`USAGE ON SCHEMA` a `SELECT` is refused with `42501` too, so a role locked out entirely would
+have produced eight identical refusals and proved nothing.
+
+**An unexpected result, and it corrects a claim this repo makes elsewhere.** `CREATE TABLE` in
+`public` was **also refused with `42501`**. `scripts/grant_app_sp.py`'s docstring says the
+deployed role arrives holding a create capability the grant never gave it, because the Lakebase
+binding is `CAN_CONNECT_AND_CREATE` — and that is why `revoke_schema_create_statement` exists as
+an opt-in narrowing. Measured, the role **cannot** create in `public` on this endpoint. Lakebase
+runs PostgreSQL 17, where `PUBLIC` holds `USAGE` and not `CREATE` on `public` by default, so the
+binding's create capability does not reach that schema.
+
+Two cautions on how far to read that: it was measured on `public` only, so the binding may still
+confer `CREATE` elsewhere (a schema of its own, or the database); and it is a property of the
+Lakebase template, which could change. `revoke_schema_create_statement` stays, off by default,
+as the remedy if it ever does.
 
 **Measured 2026-08-03** against the `dev` endpoint, PostgreSQL 17.10, as the deploying
 principal:
@@ -416,13 +450,19 @@ write **as** the service principal.
 | The SP **can read** both granted tables | `/ready` on the deployed App returns `{"ready": true}`. That is the App minting a token as itself and reading both relations through the production path | Stronger than a laptop-minted credential. It exercises the path that actually runs |
 | The SP **cannot write** | `has_table_privilege` reports `SELECT` true and `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` false on both tables | **Catalog evidence, NOT an attempted-write refusal.** The two are different claims. A catalog answer says what the grant records; only a refused statement says what Postgres enforces |
 | The **statements** `make grant` issues produce a role Postgres refuses to write with | [`tests/registry/test_grant_enforcement.py`](../tests/registry/test_grant_enforcement.py), in `make test-registry`. It applies `grant_statements` verbatim to a stand-in role and asserts `42501` on all four forbidden privileges across both tables | **An enforced refusal, against a STAND-IN identity.** It closes the "is it really enforced?" half in CI. It says nothing about whether the real App SP's role received these statements and nothing wider |
+| The **deployed SP's own role** is refused | The run recorded above, 2026-08-05: eight write statements, both tables, all `42501`, authenticated as `service_principal_id` 77024219321776 | **The criterion, met.** An enforced refusal against the real identity. It is a POINT-IN-TIME measurement, not a lane — see below |
 
 Do not read the second row as satisfying the `42501` requirement. It does not.
 
-The third row does not satisfy it either, and the gap is worth stating precisely: what remains
-unproven is not the *mechanism* but the *identity*. The grant's shape is now enforced on every
-push; that the deployed service principal holds exactly that shape is still only catalog evidence.
-The block below is the only known way to close it.
+The third row does not satisfy it either, and the distinction it leaves is worth keeping: it
+enforces the *mechanism* on every push, while the fourth row is what settled the *identity*.
+
+**The fourth row is not repeatable in CI, and that is deliberate.** Re-running it means minting
+a client secret for the App's service principal, which is the one credential that otherwise
+exists nowhere outside the Apps runtime — so a scheduled job doing this would keep a standing
+impersonation path open to buy a check that has already returned its answer. What guards the
+grant going forward is the third row, which runs on every push; the fourth is the one-time
+confirmation that the deployed role received what that row enforces.
 
 **Assert the SQLSTATE, never the message text**, which is not stable across Postgres versions.
 

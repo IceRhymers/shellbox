@@ -23,15 +23,21 @@ write with**. That is the enforcement claim, and it is what `test_grant_scope.py
 defers to "a database, an App and a deploy".
 
 CRITICAL: it needs a database. It does NOT need an App and it does not need a deploy, and that is
-the whole reason this lane can exist. What is left for the deploy to prove is narrower than it
-looks: that the REAL App SP's role on the REAL Lakebase endpoint received these statements and
-nothing wider. `W37a`'s remaining bullet is that check, it is blocked on a
-``service-principal-secrets-proxy`` permission, and nothing here closes it -- see `docs/deploy.md`
-section 4, which also records that ``SET ROLE`` is not a way around it
-(``pg_has_role(deploying_principal, app_sp, 'MEMBER') = False``, measured).
+the whole reason this lane can exist. What it does NOT cover is the identity: that the REAL App
+SP's role on the REAL Lakebase endpoint received these statements and nothing wider.
 
-So: this file makes the grant's SHAPE enforced rather than merely asserted. The identity it is
-enforced against is a stand-in.
+That half was settled once, out of band. MEASURED 2026-08-05, authenticated as the deployed `dev`
+App SP with an operator-authorized client secret since deleted: eight write statements across both
+tables, every one refused with `42501`. `docs/deploy.md` section 4 records the run in full,
+including why it is deliberately NOT repeatable in CI -- re-running it means minting a credential
+for an identity that otherwise exists nowhere outside the Apps runtime.
+
+So the division of labour is: **this file is the standing guard** and runs on every push, against
+a stand-in role; that run was the one-time confirmation that the deployed role received what this
+file enforces. If a change here starts failing, the deployed grant is the thing to suspect.
+
+``SET ROLE`` is not a cheaper substitute -- ``pg_has_role(deploying_principal, app_sp, 'MEMBER')``
+is ``False``, measured.
 
 ## Why the incomplete row is the right probe, and not a shortcut
 
@@ -151,9 +157,9 @@ def granted_role(pg_engine: Engine) -> Iterator[tuple[str, dict[str, Any]]]:
     #
     # This is the right outcome rather than a gap to paper over: what this file proves is that
     # the STATEMENTS produce a role Postgres refuses to write with, and Postgres is Postgres.
-    # What remains unproven is the IDENTITY -- that the deployed App SP's role holds this exact
-    # shape -- and that is blocked on `databricks service-principal-secrets-proxy create`, not
-    # on which database this suite runs against. See `docs/deploy.md` section 4.
+    # The IDENTITY half -- that the deployed App SP's role holds this exact shape -- was measured
+    # separately on 2026-08-05 and is not reachable from any suite, whichever database it runs
+    # against: it needs a client secret for the App SP. See `docs/deploy.md` section 4.
     if not url.password:
         pytest.skip(
             "the grant-enforcement lane needs a static owner credential and CREATE ROLE, so it "

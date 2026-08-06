@@ -117,10 +117,15 @@ alongside them.
 
 ### Phase 3 — transport
 - Ships `WSTransport` (B). `SSETransport` (C) is dead: cut at exactly 300.1 s.
-- **Reconnect is the steady state**, roughly every 10–18 minutes, on a wall-clock
-  global event that kills every open socket at once. Not periodic, not
-  per-connection, keepalive-immune, and it sends **no close frame** — so detection
-  must be a client-side liveness timer.
+- **Reconnect must be designed for**, on a wall-clock global event that kills every
+  open socket at once. Not periodic, not per-connection, keepalive-immune, and it
+  sends **no close frame** — so detection must be a client-side liveness timer.
+  Phase 1 measured that event arriving every 10–18 minutes; **Phase 4 held sockets
+  for 44 and 89 minutes without seeing it at all**, so treat the *frequency* as
+  unknown and re-measure before sizing anything against it. The design is unchanged
+  — a socket still dies, and full jitter with a nonzero floor is still right — but
+  "four times an hour" is no longer a number to build on. See
+  [`probe/FINDINGS.md`](../probe/FINDINGS.md).
 - `subscribe(session_id, from_seq)` **repaints from `capture-pane`**; it cannot
   gap-fill, because D7 means no frame log exists to replay from.
 - Validate response *content*, not status codes. An unauthenticated POST returns

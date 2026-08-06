@@ -30,6 +30,7 @@ bare ``Exception`` would also be satisfied by a resolver that raised before deci
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -328,3 +329,40 @@ def test_the_environment_is_what_selects_the_path_not_an_alembic_ini_url(
     """No credential is committed to `alembic.ini`, and nothing here reads one from it."""
     assert alembic_config.get_main_option("sqlalchemy.url", None) is None
     assert "SHELLBOX_PG_RESOURCE" not in os.environ
+
+
+def test_migrating_in_process_does_not_disable_every_other_logger() -> None:
+    """`env.py` must pass ``disable_existing_loggers=False`` to `fileConfig`.
+
+    NOT a style preference. `fileConfig` DEFAULTS that argument to ``True``, which sets
+    ``disabled = True`` on every logger that already exists and is not named in `alembic.ini`'s
+    ``[loggers]`` -- and that file names only ``root``, ``sqlalchemy`` and ``alembic``. So the
+    default silences every module logger in this repo for the remainder of the process.
+
+    MEASURED 2026-08-06, before the fix: `logging.getLogger("lakebase_branch")` came back with
+    ``disabled = True`` after one `fileConfig("alembic.ini")` call. The symptom was
+    `tests/unit/test_lakebase_branch.py` passing alone and failing under the full `make test`,
+    because `tests/registry` migrates first -- an order-dependent failure whose evidence (an
+    empty `caplog`) points nowhere near alembic.
+
+    Nothing is at risk in a deploy today, because `make migrate` runs alembic in its own process.
+    The hazard is any future in-process caller, and the loudest casualty would be the WARN line
+    that is the readiness prober's only notification mechanism -- see
+    `packages/shellbox-app/src/shellbox_app/ready.py`.
+
+    Asserted on the SOURCE rather than by calling `fileConfig` here, deliberately: calling it
+    would reconfigure this test session's own logging, which is the very pollution being guarded
+    against. A static assertion cannot be the thing it is testing.
+    """
+    source = (
+        REPO_ROOT
+        / "packages/shellbox-registry/src/shellbox_registry/alembic/env.py"
+    ).read_text(encoding="utf-8")
+
+    call = re.search(r"fileConfig\((.*?)\)", source, re.DOTALL)
+    assert call is not None, "env.py no longer calls fileConfig at all"
+    assert "disable_existing_loggers=False" in call.group(1), (
+        "env.py calls fileConfig without disable_existing_loggers=False. The default is True, "
+        "which disables every logger not named in alembic.ini -- see this test's docstring for "
+        "the measurement."
+    )

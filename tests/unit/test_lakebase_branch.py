@@ -111,6 +111,22 @@ def _fake(monkeypatch: pytest.MonkeyPatch, api: _FakePostgres) -> _FakePostgres:
     ticks = iter(range(0, 10_000))
     monkeypatch.setattr(branch_script, "_now", lambda: float(next(ticks)))
     monkeypatch.setattr(branch_script, "_sleep", lambda _seconds: None)
+
+    # The log assertion below depends on process-global logging state, so it is asserted rather
+    # than assumed. MEASURED 2026-08-06: `tests/registry` migrates, alembic's `env.py` calls
+    # `fileConfig`, and its `disable_existing_loggers` default set ``disabled = True`` on this
+    # module's logger -- so `test_down_never_raises...` passed alone and failed in the full
+    # `make test` run, with a symptom (an empty `caplog`) pointing nowhere near the cause.
+    #
+    # `env.py` now passes `disable_existing_loggers=False`, so this is a GUARD and not a repair:
+    # it converts a silent order-dependent failure into a named one. `monkeypatch` restores the
+    # attribute afterwards, so this cannot leak into another test.
+    monkeypatch.setattr(branch_script.logger, "disabled", False)
+    assert branch_script.logger.isEnabledFor(logging.WARNING), (
+        "something earlier in this session disabled or raised the level of the "
+        "'lakebase_branch' logger, so the log assertions below would silently see nothing. "
+        "The known cause is alembic's fileConfig -- see this repo's alembic env.py."
+    )
     return api
 
 

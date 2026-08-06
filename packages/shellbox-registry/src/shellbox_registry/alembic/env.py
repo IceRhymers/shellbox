@@ -43,7 +43,22 @@ from shellbox_registry.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers=False` is NOT a default and NOT cosmetic. `fileConfig` defaults it
+    # to True, which sets ``disabled = True`` on every logger that already exists and is not named
+    # in `alembic.ini`'s ``[loggers]`` -- and that file names only root, sqlalchemy and alembic.
+    #
+    # MEASURED 2026-08-06: running a migration IN-PROCESS silently disabled
+    # `logging.getLogger("lakebase_branch")` for the remainder of that process. Found by
+    # `tests/unit/test_lakebase_branch.py`, which passed alone and failed in the full `make test`
+    # run purely because `tests/registry` migrates first -- an order-dependent failure whose
+    # symptom (a log assertion finding nothing) points nowhere near the cause.
+    #
+    # Every module logger in this repo is a silent casualty of the default, including the WARN line
+    # that is the readiness prober's ONLY notification mechanism -- see
+    # `packages/shellbox-app/src/shellbox_app/ready.py`. Deployed, `make migrate` runs in its own
+    # process so nothing is at risk today; the hazard is any future caller that migrates in-process.
+    # `tests/registry/test_migrations.py` asserts the flag's effect rather than its presence.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

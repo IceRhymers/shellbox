@@ -22,20 +22,25 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import fields
 from pathlib import Path
 
 import anyio
 import pytest
+from appfakes import POLL_INTERVAL, FakeSocket, controls, hello_of
 from shellbox_app.server import (
     CONTROL_SEQ,
     DEFAULT_PORT,
     REFUSED_CLOSE_CODE,
+    WS_PING_INTERVAL_SECONDS,
+    WS_PING_TIMEOUT_SECONDS,
     Attachment,
     Relay,
     build_app,
     health_payload,
+    main,
     resolve_port,
     serve_publisher,
     serve_subscriber,
@@ -47,106 +52,16 @@ from shellbox_transport.codec import (
     FIELD_CODE,
     FIELD_SESSION_ID,
     FIELD_VIEWER_EMAIL,
-    ControlMessage,
-    decode_control,
     decode_frame,
 )
-from starlette.websockets import WebSocketState
+
+# `FakeSocket`, `controls` and `hello_of` moved to `tests/unit/appfakes.py` when
+# `tests/unit/test_app_database.py` needed the same socket double. One definition, so the two
+# files cannot disagree about what a dead socket does.
 
 # Long enough to absorb scheduling noise, short enough that a handler which never binds fails
 # one test instead of hanging the suite.
 _BIND_TIMEOUT = 5.0
-_POLL_INTERVAL = 0.001
-
-
-@dataclass
-class FakeSocket:
-    """A ``WebSocket`` stand-in that records what was sent and can be held open.
-
-    ``hold`` is the mechanism the concurrency assertions turn on. With it set, ``receive`` waits
-    for ``hang_up()`` instead of reporting a disconnect, so a handler stays suspended inside its
-    relay loop and the registry can be inspected while a publisher is genuinely live. Without it
-    a handler runs to completion immediately, which is what the single-socket assertions want.
-    """
-
-    headers: dict[str, str] = field(default_factory=dict)
-    hold: bool = False
-    client_state: WebSocketState = WebSocketState.CONNECTED
-
-    def __post_init__(self) -> None:
-        self.accepted = False
-        self.sent: list[bytes] = []
-        self.closed: int | None = None
-        self._inbox: list[dict[str, object]] = []
-        self._hung_up = False
-
-    # -- the surface the handlers use ---------------------------------------------------
-
-    async def accept(self) -> None:
-        self.accepted = True
-
-    async def send_bytes(self, data: bytes) -> None:
-        if self.client_state is not WebSocketState.CONNECTED:
-            raise RuntimeError("cannot send on a closed socket")
-        self.sent.append(data)
-
-    async def receive(self) -> dict[str, object]:
-        """The next queued message, or a disconnect.
-
-        WARNING: This POLLS the inbox rather than waiting on an event, and the difference is not
-        a style choice. A test queues messages *after* the handler is already suspended here --
-        that is the only way to assert on a socket whose peer bound later. An implementation that
-        waited on a single event would return the disconnect on release and silently never
-        deliver anything queued in the meantime, so the relay assertions would pass by never
-        running.
-        """
-        while True:
-            if self._inbox:
-                return self._inbox.pop(0)
-            if not self.hold or self._hung_up:
-                return {"type": "websocket.disconnect", "code": 1006}
-            await anyio.sleep(_POLL_INTERVAL)
-
-    async def close(self, code: int = 1000) -> None:
-        self.closed = code
-        self.client_state = WebSocketState.DISCONNECTED
-
-    # -- test-side controls ------------------------------------------------------------
-
-    def queue_bytes(self, *payloads: bytes) -> None:
-        self._inbox += [{"type": "websocket.receive", "bytes": payload} for payload in payloads]
-
-    def queue_text(self, text: str) -> None:
-        """A protocol violation on purpose: the frame protocol is binary."""
-        self._inbox.append({"type": "websocket.receive", "text": text})
-
-    def hang_up(self) -> None:
-        """Report a disconnect once the inbox drains, as an edge kill would."""
-        self._hung_up = True
-
-    def die(self) -> None:
-        """Make every later send fail, without reporting a disconnect to this socket's handler.
-
-        The shape of a peer dying: the *other* handler's send is what discovers it.
-        """
-        self.client_state = WebSocketState.DISCONNECTED
-
-
-def controls(socket: FakeSocket) -> list[ControlMessage]:
-    """Every control message the server originated on ``socket``, decoded through the codec.
-
-    Decoded rather than compared as bytes on purpose: this asserts the server's frames are
-    readable by the same codec the client half uses, so a header change on either side fails
-    here rather than at the first live reconnect.
-    """
-    return [decode_control(decode_frame(raw).data) for raw in socket.sent]
-
-
-def hello_of(socket: FakeSocket) -> ControlMessage:
-    """The ``hello`` message, asserting exactly one was sent."""
-    found = [message for message in controls(socket) if message.kind == CONTROL_HELLO]
-    assert len(found) == 1, f"expected exactly one hello, got {found!r}"
-    return found[0]
 
 
 async def until(predicate: Callable[[], bool], what: str) -> None:
@@ -159,7 +74,7 @@ async def until(predicate: Callable[[], bool], what: str) -> None:
     try:
         with anyio.fail_after(_BIND_TIMEOUT):
             while not predicate():
-                await anyio.sleep(_POLL_INTERVAL)
+                await anyio.sleep(POLL_INTERVAL)
     except TimeoutError as exc:
         raise AssertionError(f"timed out after {_BIND_TIMEOUT}s waiting for {what}") from exc
 
@@ -403,15 +318,20 @@ def test_a_stale_handler_cannot_detach_its_successor() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# T-APP-SUBSCRIBER-CONFLICT -- fan-out is Phase 4's
+# T-APP-SUBSCRIBER-CONFLICT -- one subscriber, by decision
 # --------------------------------------------------------------------------------------
 
 
 def test_a_second_subscriber_is_refused() -> None:
-    """T-APP-SUBSCRIBER-CONFLICT. One subscriber, by scope.
+    """T-APP-SUBSCRIBER-CONFLICT. One subscriber, by decision rather than by scope.
 
-    Multi-subscriber fan-out is a Phase 4 product behavior (D6), and refusing the second socket
-    is how that boundary is visible at runtime rather than only in a docstring.
+    CORRECTED: this docstring said fan-out was Phase 4's work. Phase 4 decided the opposite.
+    The reason is backpressure, and it is stated in full in the module docstring of
+    `packages/shellbox-app/src/shellbox_app/server.py` -- fan-out needs bounded per-subscriber
+    queues plus a resync request path the protocol does not have.
+
+    Asserted on the CODE and never on the message text, so the refusal's wording can carry the
+    corrected reason without this test having an opinion about prose.
     """
     relay = Relay()
     first = FakeSocket(hold=True)
@@ -694,7 +614,7 @@ def test_resolve_port_refuses_a_value_it_cannot_serve(raw: str) -> None:
 
 def test_build_app_exposes_the_health_route_and_both_socket_routes() -> None:
     paths = {getattr(route, "path", None) for route in build_app().routes}
-    assert {"/", "/publish/{session_id}", "/subscribe/{session_id}"} <= paths
+    assert {"/", "/ready", "/publish/{session_id}", "/subscribe/{session_id}"} <= paths
 
 
 def test_two_apps_in_one_interpreter_share_no_relay() -> None:
@@ -705,3 +625,87 @@ def test_two_apps_in_one_interpreter_share_no_relay() -> None:
     state passes a process-level check and fails this one.
     """
     assert build_app().state.relay is not build_app().state.relay
+
+
+# --------------------------------------------------------------------------------------
+# The entrypoint: logging, and the WebSocket keepalive
+# --------------------------------------------------------------------------------------
+
+
+def _run_main(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Run ``main`` with ``uvicorn.run`` replaced, and return the keyword arguments it got.
+
+    ``main`` imports uvicorn inside the function and calls the module attribute, so patching
+    the attribute is enough and no server is started.
+    """
+    import uvicorn
+
+    seen: dict[str, object] = {}
+
+    def fake_run(application: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+        seen["app"] = application
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    main()
+    return seen
+
+
+def test_main_passes_both_websocket_ping_settings_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Principle 5, applied to the two values the browser's retry bound is derived from.
+
+    This app has no reaper of its own: uvicorn's failed ping is what releases a silently-dead
+    subscriber's slot. A bound derived from a library default nobody wrote down moves on a
+    dependency bump, and the browser then reports a conflict that was about to clear.
+    """
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        seen = _run_main(monkeypatch)
+    finally:
+        for handler in list(root.handlers):
+            if handler not in before:
+                root.removeHandler(handler)
+
+    assert seen["ws_ping_interval"] == WS_PING_INTERVAL_SECONDS
+    assert seen["ws_ping_timeout"] == WS_PING_TIMEOUT_SECONDS
+
+
+def test_main_configures_logging_before_it_serves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prober's only notification is a WARN line, and this is what gives it a destination.
+
+    Measured against the live `dev` deploy on 2026-08-03: with no handler on the root logger,
+    ``databricks apps logs`` carried neither the App's INFO lines nor its WARNINGs. See
+    `packages/shellbox-app/src/shellbox_app/logs.py`.
+    """
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        _run_main(monkeypatch)
+        added = [handler for handler in root.handlers if handler not in before]
+        assert added, "main served without configuring logging"
+        assert root.level <= logging.INFO, f"root logger is at {root.level}, which drops INFO"
+    finally:
+        for handler in list(root.handlers):
+            if handler not in before:
+                root.removeHandler(handler)
+
+
+def test_uvicorns_own_ping_defaults_have_not_drifted_from_the_recorded_values() -> None:
+    """A drift detector, and the reason the constants above can be called MEASURED.
+
+    Read from the installed uvicorn rather than hardcoded a second time, the same habit
+    `tests/unit/test_lakebase.py` uses for SQLAlchemy's ``pool_timeout`` default. The App
+    passes these values explicitly, so a drift changes nothing about how it runs -- it changes
+    whether the comment claiming "these are uvicorn's defaults" is still true.
+
+    A deliberate change to the App's own values makes this fail, which is correct: read the
+    WARNING on the constants first. Shortening them reaches into the sandbox's autostop timer.
+    """
+    import uvicorn
+
+    signature = inspect.signature(uvicorn.run)
+    assert signature.parameters["ws_ping_interval"].default == WS_PING_INTERVAL_SECONDS
+    assert signature.parameters["ws_ping_timeout"].default == WS_PING_TIMEOUT_SECONDS

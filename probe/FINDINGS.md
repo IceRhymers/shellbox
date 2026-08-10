@@ -154,6 +154,78 @@ the design must assume:
 6. **Validate content, not status.** An auth failure returns HTTP 200 with an HTML
    login body (see the PAT section).
 
+### CONTRADICTED, twice: two holds totalling 133 minutes saw NO kill at all
+
+`W38`'s live acceptance run (`scripts/live_acceptance.py`) held a real publisher and a
+real subscriber against the deployed `shellbox-dev` App. Two independent runs:
+
+| run | date | held | sockets | resyncs | publisher error |
+|---|---|---|---|---|---|
+| first | 2026-08-04 | **44.0 min** | 1 | 1 | none |
+| second | 2026-08-06 | **89.0 min** | 1 | 1 | none |
+
+Neither socket was ever torn down. The 89-minute run recorded 94 events across its
+whole span and finished with `sockets=1`.
+
+**89 minutes is 5.1× the longest lifetime measured above** (17.51 min) and 4.6× the
+longest observed interval between kill events (19 m 18 s). Across six holds the Phase 1
+probe never saw a socket survive 18 minutes.
+
+**This is an observation, not a conclusion — but it is no longer a single window.** Two
+runs on different days, from different shells, against two different deployments of the
+App, neither of which saw the event. The honest statement is: *the
+every-10-to-18-minute premise does not hold against this App as of 2026-08-06.* What
+these runs still cannot distinguish is WHY — the edge's behaviour changed, the event
+became conditional on something these runs do not do, or two windows were lucky where
+six earlier holds were not. Nothing here identifies which.
+
+**What it costs.** The reconnect-and-resume design is the largest thing Phase 3 and
+Phase 4 built, and its justification is the measurement above. That design is not
+wrong — a severed socket recovers correctly, verified below — but the claim "this is
+the steady state, roughly four times an hour" is now contradicted by 133 minutes of
+held socket time. Anyone sizing a ring buffer, a backoff cap, or a retry bound against
+"every 10–18 minutes" should re-measure first.
+
+WARNING: **do not read this as licence to delete the reconnect path.** Two negative
+windows cannot prove an absence, the teardown is a platform behaviour outside this
+repo's control and can return without notice, and a socket still dies for every
+ordinary reason — a deploy, a suspend, a network change. What the runs undermine is the
+FREQUENCY, which is a sizing input, not the existence of the failure.
+
+**What the 89-minute hold DID verify**, unconditionally and over a long span rather than
+a two-minute one: the data path carried real bytes end to end (typed into a real pty,
+echoed by a real shell, relayed through the real edge, rendered by the real client); the
+initial resync was applied as a RESET and never appended; no `subscriber_conflict`
+outlived ADR-20's bound; and **no undeclared `seq` gap was seen in 89 minutes** — which
+is the assertion that most benefits from a long window, since it is what a sequencing
+bug would eventually trip.
+
+The two reconnect clauses reported `NOT OBSERVED` rather than `PASS`, and the run exited
+**2** for inconclusive. That distinction is deliberate: see `_report` in
+`scripts/live_acceptance.py`. Reporting them as failures would point a reader at working
+code.
+
+**What WAS verified live, by severing the socket deliberately** (`--sever-after`,
+because the harness cannot cause the platform's event):
+
+| Check | Result |
+|---|---|
+| The subscriber outlasted a teardown and rebound | 2 sockets, back in **1.6 s** |
+| The reconnect took ADR-11's **byte-exact continuity** branch | no resync on rebind |
+| Bytes typed AFTER the teardown made the round trip | `W38-RECOVERED-OK` rendered |
+| A resync is applied as a RESET, never appended | 31-byte repaint, D7 |
+| No undeclared `seq` gap | `notices=[]` |
+
+The continuity branch being taken on the one observed reconnect is itself worth
+recording: `seq.py`'s WARNING says the ring and the floor check should be deleted
+if that branch is taken in under 20% of reconnects. One sample is not 20% of
+anything, but it is not zero either.
+
+NOTE: a deliberate sever is **not** the same event. The edge kills *every* open
+socket simultaneously, so a real kill also takes the publisher down and makes both
+ends re-dial into each other. Severing one connection tests recovery; it does not
+test the reconnect storm.
+
 ## SSE is capped at exactly 300 s — it fails the >5 min bar
 
 The edge advertises its own limit in a request header to the app:

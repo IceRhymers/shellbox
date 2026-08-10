@@ -143,3 +143,55 @@ jobs:
             echo "::error::registry tests SKIPPED in CI -- the Postgres service or the DSN is misconfigured."
             exit 1
           fi
+
+  # The lockfile lane. `uv.lock` is NOT committed, so this job EMITS one and asserts on the
+  # artifact it emitted. Read the comment above `uv.lock` in `.gitignore` and the header of
+  # `scripts/check_lockfile.py` for why the file stays ignored -- both directions of committing
+  # it are measured, and both break a real contributor.
+  #
+  # Emitting is what makes the assertions possible without committing the file: the lockfile
+  # exists in the CI workspace either way. This runner configures no package index, so `uv lock`
+  # here resolves against the public index by construction -- and the host allowlist below
+  # measures that rather than assuming it.
+  #
+  # Every step is in ONE job on purpose. Emitting in one job and asserting in another would mean
+  # passing the lockfile between them as an artifact, and the assertions would then be about
+  # whatever was uploaded rather than about what `uv lock` produced.
+  lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Before the emit, and it is a check rather than a precondition. If `uv.lock` ever becomes
+      # committed, `uv lock` below can be a no-op and every later step then passes against the
+      # committed file instead of an emitted one. Nothing else in this job would notice, and the
+      # decision to keep the file ignored would be undone with everything still green.
+      - name: The lockfile is not committed
+        run: python3 scripts/check_lockfile.py --assert-absent uv.lock
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      # The emit runs HERE, in CI, and not only on a contributor's machine.
+      - name: Emit the lockfile
+        run: uv lock
+
+      # An allowlist of one host, not a blocklist of internal mirror names, plus a floor on how
+      # many URLs the file must hold so a broken emit cannot pass by producing nothing. Both
+      # live in `scripts/check_lockfile.py`, which is where the floor's measurement is written
+      # down and where a mutation test in `tests/unit/test_check_lockfile.py` proves each
+      # assertion fails on a broken artifact.
+      - name: Every artifact URL is on files.pythonhosted.org, and there are enough of them
+        run: python3 scripts/check_lockfile.py --assert-hosts uv.lock
+
+      # `--locked` validates the recorded hashes against the real index at install time, so a
+      # lockfile naming a missing or mismatched artifact fails loudly here.
+      #
+      # Deliberately NOT a from-scratch `uv lock` re-resolve compared against the recorded sha256
+      # set. This workspace's upper bounds are wide -- `pytest>=8.3,<9`, `ruff>=0.6,<1`,
+      # `websockets>=14,<16`, plus transitives -- so a re-resolve picks newest-satisfying, and any
+      # upstream release would then redden a pull request that changed nothing. `--locked`
+      # installs the pinned set rather than re-resolving, so it cannot flake that way.
+      - name: Install from the emitted lockfile
+        run: uv sync --locked

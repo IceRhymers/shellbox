@@ -1,6 +1,10 @@
 .omc/
 .claude/settings.local.json
 
+# `databricks bundle` writes per-target deployment state and sync snapshots here. It is local
+# machine state, and `.databricks/sync-snapshots/` in particular changes on every sync.
+.databricks/
+
 # Python / uv workspace
 .venv/
 __pycache__/
@@ -19,4 +23,13 @@ build/
 # internal mirror publishes that hostname and breaks CI for everyone outside that network.
 # It happened. Until there is a single agreed index that every contributor and CI resolve
 # through, the lockfile is a local artifact.
+#
+# NOTE: this pattern has no leading slash, so it matches at ANY depth. That deliberately covers
+# `packages/shellbox-app/src/uv.lock`, the DEPLOY root's lockfile, which `make app-lock`
+# regenerates on every deploy for the reason above plus one more -- it is rewritten to public
+# package hosts after it is generated, so the committed and the local copy could never agree.
 uv.lock
+
+# The pre-rewrite copy `make app-lock`'s `sed -i.bak` leaves behind. That target removes it once
+# both lock checks pass, so a file here means a check failed and the bytes are kept for reading.
+uv.lock.bak

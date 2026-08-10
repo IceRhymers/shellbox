@@ -1,0 +1,129 @@
+/* The renderer's own styling. xterm's stylesheet handles the terminal itself; this is the page
+   around it. Deliberately small and dependency-free -- there is no build step and no framework,
+   for the same reason ADR-23 declines a JavaScript toolchain. */
+
+:root {
+  --bg: #0b0e13;
+  --panel: #11151c;
+  --line: #222834;
+  --text: #d7dde5;
+  --muted: #8b95a6;
+  --accent: #7aa2f7;
+  --warn: #e0af68;
+  --error: #f7768e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.home {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.session {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.viewer {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+main {
+  padding: 16px;
+}
+
+/* The banner carries `R51`'s "no publisher attached" state, among others. It is deliberately
+   loud: the failure it names renders otherwise as a blank but apparently healthy terminal. */
+.banner {
+  margin: 0;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.banner.info {
+  color: var(--muted);
+}
+
+.banner.warn {
+  color: var(--warn);
+  background: rgb(224 175 104 / 10%);
+}
+
+.banner.error {
+  color: var(--error);
+  background: rgb(247 118 142 / 10%);
+}
+
+.note {
+  margin: 0 0 12px;
+  color: var(--warn);
+  font-size: 13px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+
+th {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+td {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+td a {
+  color: var(--accent);
+}
+
+td.empty {
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: center;
+}
+
+#terminal {
+  height: calc(100vh - 120px);
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}

@@ -1,4 +1,82 @@
+# The App's runtime configuration. This file is the TEMPLATE, and it is not what the App gets.
+#
+# `scripts/deploy-app.sh` copies this file verbatim into the staged deploy root and then APPENDS
+# generated ITEMS to the `env:` sequence at the bottom of the copy. So the `command` below is
+# exactly what starts the deployed App -- byte for byte, because nothing re-serializes it -- and
+# so is `UV_LINK_MODE`, while the three Lakebase values are stamped per deploy.
+#
+# CRITICAL: the `env:` key belongs to THIS file and the script appends only list items under it.
+# It used to write the whole `env:` block, which is no longer possible: `UV_LINK_MODE` has to be
+# set on every deploy including `--no-database`, and two `env:` keys in one document is not
+# valid YAML. The script asserts this file still declares `env:` before it appends, because
+# without that key the generated items become a top-level sequence.
+#
+# WHY THE ENV IS STAMPED AND NOT WRITTEN HERE. Two reasons, and each one is sufficient:
+#
+#   1. The `dev` and `prod` targets use DIFFERENT Lakebase projects, deliberately. That is
+#      `R49`'s mitigation: the branch and endpoint carry `replace_existing: true`, so two
+#      targets sharing a project would mean a `dev` deploy adopting and reconfiguring the
+#      production database. One static file cannot serve two projects.
+#   2. The endpoint's resource path is `projects/<project>/branches/<branch>/endpoints/
+#      <endpoint>`. Writing one out here is a hardcoded project name, which `make lint`'s
+#      no-literal-project check rejects -- see `scripts/check_bundle_statics.py`.
+#
+# The bundle's own inline `config:` is not the answer either. Bundle variables are NOT resolved
+# in an app's `config` env values; they arrive literally, or the deploy fails with "Must
+# specify environment variable source". So the deploy stamps the file instead.
+#
+# WHAT GETS STAMPED, and `packages/shellbox-app/src/shellbox_app/config.py` is the authority on
+# what each one is for:
+#
+#   SHELLBOX_PG_RESOURCE   the endpoint resource path. It mints OAuth tokens.
+#   SHELLBOX_PG_HOST       what psycopg dials. A DIFFERENT string, resolved at deploy time.
+#   SHELLBOX_PG_DB         the Postgres database name.
+#
+# NOTE: the Postgres ROLE is not stamped. The Apps runtime injects `DATABRICKS_CLIENT_ID`, and
+# that is the App's service principal client id, which is the role name Lakebase maps it onto.
+# Resolving it here, or with `current_user.me()`, would be wrong -- config.py's module
+# docstring argues that in full.
+#
+# Running `scripts/deploy-app.sh` with no database, and therefore with no `env:` block at all,
+# is possible and must be asked for: pass `--no-database`. Absent both that flag and a
+# resource path, the deploy fails rather than shipping an App that serves an empty inventory
+# while `GET /` stays green.
+
+# UNDER `uv run`, and that is what puts the App on Python 3.12.
+#
+# Databricks Apps selects the uv dependency path because the deploy root ships `pyproject.toml`
+# and `uv.lock` and NO `requirements.txt`. Only that path honors `requires-python` and provisions
+# the interpreter it names; the pip path is Python 3.11 and ignores it. `pyproject.toml` beside
+# this file carries the measurement and the doc links.
+#
+# `--frozen` and NOT `--locked`: the Apps build already installed from `uv.lock` before this
+# command runs, so there is nothing to verify here and re-resolving at start is the one thing
+# this must not do. `--frozen` uses the lockfile as written.
+#
+# STILL `python -m shellbox_app`, and still the EXEC-ARRAY form. Both were argued before uv
+# entered the picture and neither reason changed:
+#
+#   * `shellbox_app/__main__.py` resolves `DATABRICKS_APP_PORT` in `os.environ`, because whether
+#     the Apps runtime expands `${VAR}` inside `command` is NOT verified by this repo.
+#     `test_resolve_port_reads_the_runtime_variable` in
+#     `tests/unit/test_app_server.py` is that resolution's test.
+#   * So no shell form is needed, and an array cannot be misread by a shell. The donor project
+#     needs `["bash", "-c", ...]` only because it passes the port to `uvicorn --port`, which takes
+#     a literal.
 command:
+  - "uv"
+  - "run"
+  - "--frozen"
   - "python"
   - "-m"
   - "shellbox_app"
+
+# The `env:` sequence. `scripts/deploy-app.sh` APPENDS the three Lakebase values below this line;
+# see the CRITICAL note at the top of this file for why the key lives here and not there.
+env:
+  # uv hardlinks from its cache into the venv by default, and warns or fails with a cross-device
+  # link error when the two sit on different mounts, as they do in the Apps sandbox. Copy mode is
+  # the documented remedy. It is set HERE and not stamped because it is a constant of the
+  # runtime, not of the deploy -- and a `--no-database` deploy needs it just as much.
+  - name: UV_LINK_MODE
+    value: "copy"

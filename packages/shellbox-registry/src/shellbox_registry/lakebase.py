@@ -62,14 +62,27 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_DATABASE",
     "Credential",
     "LakebaseCredentials",
     "LakebaseEndpoint",
     "TokenMinter",
     "create_lakebase_engine",
+    "is_service_principal_role",
     "lakebase_registry",
+    "resolve_lakebase_endpoint",
     "sdk_token_minter",
 ]
+
+# The Postgres database a Lakebase project auto-provisions, and therefore the one every
+# caller reaches unless it says otherwise.
+#
+# It restates the `pg_database` variable's default in `databricks.yml`, which is the
+# authority. Both are the UNDERSCORED name used to CONNECT -- the database RESOURCE id is
+# the hyphenated `databricks-postgres` and appears only in the App binding path in
+# `resources/app.yml`. Measured 2026-08-03: `list-databases` reports
+# `database_id: databricks-postgres` and `postgres_database: databricks_postgres`.
+DEFAULT_DATABASE = "databricks_postgres"
 
 # How long before stated expiry a token is treated as spent.
 #
@@ -100,6 +113,17 @@ POOL_RECYCLE_SECONDS = 1800
 # What the API documents as the shortest `ttl` it will honour. Referenced so the
 # relationship between recycling and token lifetime is checkable rather than folklore.
 API_MIN_TTL_SECONDS = 300
+
+# SQLAlchemy's OWN default for `pool_timeout`, restated so the default below is visibly
+# inherited rather than chosen. Named because the two readings differ: a value this module
+# picked would be a claim about Lakebase, and this one is not. It is here so adding the
+# parameter changes no existing caller's behaviour.
+#
+# SQLAlchemy declares it as `30.0` on `QueuePool.__init__`; the int compares equal, and
+# `tests/unit/test_lakebase.py` reads the library's signature so a change there fails
+# loudly instead of quietly moving every caller. See `create_lakebase_engine` for why the
+# App overrides it, and for the arithmetic that makes 30s the wrong value there.
+SQLALCHEMY_DEFAULT_POOL_TIMEOUT_SECONDS = 30
 
 # Backoff after a failed mint, so a control-plane outage does not become a hot loop against
 # it. Bounded rather than unbounded: the point is to stop hammering, not to give up.
@@ -150,6 +174,107 @@ class LakebaseEndpoint:
             f"postgresql+psycopg://{quote_plus(self.user)}{secret}"
             f"@{self.host}:{self.port}/{self.database}?sslmode=require"
         )
+
+
+# The canonical dashed 8-4-4-4-12 uuid, and deliberately only that form.
+#
+# `uuid.UUID` also accepts 32 undashed hex characters, which would classify a role legitimately
+# named for a hex digest as a service principal. Refusing a real migration is the expensive
+# direction of a wrong answer, so this matches the shape the CLI actually emits.
+_UUID_SEGMENTS = (8, 4, 4, 4, 12)
+
+
+def is_service_principal_role(user: str) -> bool:
+    """True when ``user`` has the shape of a Lakebase service-principal role name.
+
+    Lakebase names a role for its OAuth principal, so a service principal's role name IS its
+    client id, which is a uuid -- ``databricks postgres create-role --help`` (CLI v1.8.0)
+    documents the spec as ``{"identity_type": "SERVICE_PRINCIPAL", "postgres_role":
+    "<SP_CLIENT_ID>"}``. A workspace user's role name is their email, which never matches.
+
+    ``scripts/check_deploy_principal.py`` carries a second copy of this rule, and it has to:
+    that guard runs under a bare ``python3`` on a checkout with nothing synced, so it cannot
+    import this package. ``tests/unit/test_deploy_principal.py`` asserts the two agree, which
+    is what keeps the copy from drifting into a different rule.
+    """
+    parts = user.split("-")
+    if len(parts) != len(_UUID_SEGMENTS):
+        return False
+    return all(
+        len(part) == width and all(c in "0123456789abcdefABCDEF" for c in part)
+        for part, width in zip(parts, _UUID_SEGMENTS, strict=True)
+    )
+
+
+def resolve_lakebase_endpoint(
+    resource_name: str,
+    *,
+    database: str = DEFAULT_DATABASE,
+    user: str | None = None,
+    client: Any | None = None,
+) -> LakebaseEndpoint:
+    """Turn an endpoint resource name into a complete `LakebaseEndpoint`.
+
+    Only the resource name is ever written down. `scripts/bundle-vars.sh` constructs it from
+    the three ids the bundle declares and prints it as ``SHELLBOX_PG_RESOURCE``; this function
+    supplies the rest from the workspace. That is the difference between a deploy-time command
+    taking ONE value and an operator exporting six.
+
+    ``host`` comes from ``get_endpoint(resource_name).status.hosts.host``. It is a DIFFERENT
+    string from ``resource_name`` -- the resource name mints tokens, the host is what psycopg
+    dials -- and section 6 of ``docs/lakebase-handoff.md`` records that JSON shape.
+
+    **CRITICAL: deriving the user is a safety property, not a convenience.** Omitted, ``user``
+    is ``current_user.me().user_name``, so the connection authenticates as whoever ran the
+    command. A migration therefore runs as the DEPLOYING PRINCIPAL by construction, and it
+    cannot silently run as the App's service principal -- which holds ``SELECT`` on two tables,
+    fails a migration on a permission error, and whose tempting fix is a wider grant.
+    ``scripts/check_deploy_principal.py`` makes that argument in full. Pass ``user`` only to
+    override the derivation deliberately.
+
+    ``client`` is the same testability seam `sdk_token_minter` offers, and the SDK import is
+    lazy for the same reason: `shellbox-registry` is SDK-free at import time and must stay so.
+    """
+    if client is None:
+        try:
+            from databricks.sdk import WorkspaceClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "resolving a Lakebase endpoint needs the databricks-sdk; install "
+                "shellbox-registry[lakebase]"
+            ) from exc
+        client = WorkspaceClient()
+
+    # Each hop is guarded on its own. The SDK returns dataclasses whose fields are all
+    # Optional, so an endpoint that exists but is not reporting a host yet gives `None` at any
+    # of three levels -- and a `None` that reached `LakebaseEndpoint` would surface much later
+    # as a psycopg error naming no host.
+    endpoint = client.postgres.get_endpoint(resource_name)
+    status = getattr(endpoint, "status", None)
+    hosts = getattr(status, "hosts", None) if status is not None else None
+    host = getattr(hosts, "host", None) if hosts is not None else None
+    if not host:
+        raise RuntimeError(
+            f"Lakebase reported no host for {resource_name!r}. The endpoint may not be "
+            f"provisioned yet: run `databricks bundle deploy` for this target first, then "
+            f"`databricks postgres get-endpoint {resource_name}` to see what it reports."
+        )
+
+    resolved_user = user
+    if not resolved_user:
+        resolved_user = getattr(client.current_user.me(), "user_name", None)
+    if not resolved_user:
+        raise RuntimeError(
+            "could not resolve a Postgres role: the workspace reported no user_name for the "
+            "current principal. Pass user=... to name the role explicitly."
+        )
+
+    return LakebaseEndpoint(
+        resource_name=resource_name,
+        host=host,
+        database=database,
+        user=resolved_user,
+    )
 
 
 def sdk_token_minter(
@@ -385,17 +510,34 @@ def create_lakebase_engine(
     max_overflow: int = 5,
     pool_recycle: int = POOL_RECYCLE_SECONDS,
     connect_timeout: int = PostgresRegistry.CONNECT_TIMEOUT_SECONDS,
+    pool_timeout: int = SQLALCHEMY_DEFAULT_POOL_TIMEOUT_SECONDS,
 ) -> Engine:
     """An engine that injects a fresh token as the password on every new connection.
 
-    Three settings, each for a measured reason rather than by convention:
+    Four settings, each for a measured reason rather than by convention:
 
     * ``pool_pre_ping`` — Lakebase **scales to zero**, which kills pooled connections. A
       checkout of a dead connection would otherwise surface as an error on whatever query
-      happened to be next.
+      happened to be next. **Hardcoded ``True``, deliberately not a parameter.** A caller
+      cannot weaken it by passing a value; only an edit to that line can. Do not make one.
     * ``pool_recycle`` — see fact 3 in the module docstring; refresh does not cover this.
     * ``connect_timeout`` — inherited from `PostgresRegistry`, where an unbounded connect
       was measured to hang a tool call for 63 seconds.
+    * ``pool_timeout`` — how long a checkout waits for a **free connection from the pool**.
+      Not `connect_timeout`, which bounds the TCP connect instead; the comment on
+      `PostgresRegistry.__init__` draws that line. The default here is SQLAlchemy's own
+      30 s, so adding this parameter changed no caller.
+
+      **The App passes 5**, and raises ``max_overflow`` to 10 from the 5 defaulted here.
+      Those 15 connections sit behind Starlette's 40-thread threadpool. A synchronized edge
+      kill reconnects every browser at once, which parks up to 25 requests. At 30 s each
+      that includes ``/ready`` — the only automatic detector of a database problem, queuing
+      behind the storm it exists to diagnose. 5 s clears the **measured** 1.4 s first
+      connect to an ``IDLE`` endpoint (`docs/lakebase-handoff.md` section 2) and stays far
+      under 30 s.
+
+      The App is the only caller with a threadpool in front of this pool. `shellbox-mcp` is
+      not, which is why the wider default stays wide.
 
     ``do_connect`` rather than a DSN password: the token changes and the URL does not, so
     baking it in would pin the first token for the engine's life and leak it into every
@@ -407,6 +549,7 @@ def create_lakebase_engine(
         max_overflow=max_overflow,
         pool_pre_ping=True,
         pool_recycle=pool_recycle,
+        pool_timeout=pool_timeout,
         connect_args={"connect_timeout": connect_timeout},
     )
 

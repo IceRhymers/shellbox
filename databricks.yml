@@ -1,0 +1,122 @@
+# The shellbox bundle. It provisions Lakebase and declares the App RESOURCE. It does NOT
+# deploy the App's code.
+#
+# That split is the reason `make deploy` runs two commands instead of one. `bundle deploy`
+# reconciles resources and uploads `sync.paths`, but it does not create an app deployment --
+# the Databricks docs state it verbatim: "Deploying a bundle doesn't automatically deploy the
+# app to compute." The code deployment is a separate API call, and `scripts/deploy-app.sh`
+# issues it after flattening the two uv workspace packages into one importable root.
+#
+# So this bundle owns the Lakebase project, branch, endpoint and database, plus the App
+# resource and its database binding. `scripts/deploy-app.sh` owns the App's code root. See
+# `resources/app.yml` for the single field that keeps those two mechanisms from reverting each
+# other, and `docs/deploy.md` for the one-time prerequisite before the first deploy.
+
+bundle:
+  name: shellbox
+
+# Every value the deploy path needs is declared ONCE, here, and read back out of
+# `databricks bundle validate -t <target> -o json` by `scripts/bundle-vars.sh`. Nothing
+# downstream hardcodes a project name, a branch name or an app name.
+#
+# CRITICAL: the Lakebase endpoint's resource path is CONSTRUCTED from these ids. It is never
+# resolved from the bundle. `${resources.postgres_projects.pg_project.id}` stays LITERAL and
+# unresolved in `bundle validate -o json`, in `bundle summary -o json` and in
+# `bundle plan -o json` -- those are deploy-time outputs, and nothing before a deploy fills
+# them in. Measured against Databricks CLI v1.8.0. `scripts/bundle-vars.sh` builds
+# `projects/<project>/branches/<branch>/endpoints/<endpoint>` from the three ids below, which
+# is deterministic and needs no workspace round trip.
+variables:
+  app_name:
+    description: >-
+      The Databricks App name. It MUST differ per target -- see the note on the targets below.
+  pg_project_id:
+    description: >-
+      The Lakebase project id. It becomes the last segment of the project's resource path, and
+      it MUST differ per target for the same reason app_name does.
+  pg_project_display_name:
+    description: The Lakebase project's user-visible name in the workspace UI.
+  pg_branch_id:
+    description: >-
+      The Lakebase branch id. Creating a project auto-provisions a branch called `production`,
+      which is why this default is not an arbitrary choice.
+    default: production
+  pg_endpoint_id:
+    description: >-
+      The Lakebase compute endpoint id, under the branch. Creating a project auto-provisions a
+      read-write endpoint called `primary`.
+    default: primary
+  pg_database:
+    description: >-
+      The Postgres database `alembic upgrade head` migrates and the App reads. It matches
+      SHELLBOX_PG_DB, which `dsn_from_env` in
+      packages/shellbox-registry/src/shellbox_registry/dsn.py assembles a DSN from.
+
+      CAREFUL: this is the Postgres database NAME used to CONNECT, which is the UNDERSCORED
+      `databricks_postgres`. It is NOT the database RESOURCE id, which is the hyphenated
+      `databricks-postgres` and appears only in the app binding path in resources/app.yml.
+      Measured 2026-08-03: `list-databases` reports `database_id: databricks-postgres` and
+      `postgres_database: databricks_postgres`. Using the hyphenated form here produces a DSN
+      that connects to nothing.
+
+      Lakebase auto-provisions this database when the project is created; nothing declares it.
+      See resources/lakebase.yml for why declaring one is both unnecessary and a hazard.
+    default: databricks_postgres
+
+include:
+  - resources/*.yml
+
+# The bundle uploads NO code, and this empty list is what makes that true.
+#
+# It matters for two reasons. First, `bundle deploy` rewrites a RELATIVE `source_code_path` to
+# point at whatever it uploaded to `${workspace.file_path}`; with nothing uploaded and an
+# absolute path declared, there is nothing to rewrite and the path passes through untouched.
+# Second, DAB sync honours `.gitignore` -- syncing from an ignored directory reports "Initial
+# Sync Complete" with zero uploads and exit 0, which is a silent no-op rather than an error.
+# An empty `paths` removes that failure mode instead of relying on nothing being ignored.
+sync:
+  paths: []
+
+# CRITICAL: `mode: development` does NOT prefix app names.
+#
+# The `name_prefix` preset applies to jobs and pipelines. A dev-target validate keeps the app
+# name verbatim, so two targets sharing one app name means `make deploy TARGET=dev` reconciles
+# the PRODUCTION app -- and nothing errors, because from the bundle's point of view it did
+# exactly what it was told. The same hole exists for the Lakebase project, whose branch and
+# endpoint carry `replace_existing: true` and would therefore be adopted rather than refused.
+#
+# So both names are declared explicitly per target, and `make lint` asserts they differ.
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      # Pinned rather than inherited from the profile. There is a second, differently named
+      # workspace in this account, and a bundle that silently follows whatever profile the
+      # caller happened to pass is one typo away from deploying into it. A host mismatch
+      # against `--profile` is an error, which is the point.
+      host: https://fevm-tanner-west.cloud.databricks.com
+    variables:
+      app_name: shellbox-dev
+      pg_project_id: shellbox-pg-dev
+      pg_project_display_name: shellbox (dev)
+
+  prod:
+    mode: production
+    workspace:
+      host: https://fevm-tanner-west.cloud.databricks.com
+      # Written out rather than left to the default, and NOT under /Workspace/Shared.
+      #
+      # `mode: production` refuses the `~` shorthand, so the default path is not available. The
+      # obvious replacement, /Workspace/Shared/.bundle/..., fails `bundle validate --strict`:
+      # it is writable by every workspace user, and the CLI raises that as a warning that
+      # strict mode then rejects. Silencing it means granting `group_name: users` CAN_MANAGE
+      # over the deployment, which is worse than the problem. An explicit user path is the
+      # remaining option, and it means prod is redeployable by its owner only. Revisit this
+      # when a service principal deploys prod, which is the shape that actually wants a shared
+      # root.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      app_name: shellbox
+      pg_project_id: shellbox-pg
+      pg_project_display_name: shellbox

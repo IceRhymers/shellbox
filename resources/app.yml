@@ -1,0 +1,85 @@
+# The App resource, and its binding to the Lakebase database.
+#
+# The resource key `shellbox_app` is part of an operator-facing command and is not free to
+# rename: the one-time adoption step in docs/deploy.md is
+# `databricks bundle deployment bind shellbox_app <app>`.
+
+resources:
+  apps:
+    shellbox_app:
+      name: ${var.app_name}
+      description: >-
+        shellbox: a browser terminal onto tmux sessions running outside the workspace.
+
+      # An ABSOLUTE workspace path, deliberately.
+      #
+      # `bundle deploy` rewrites a RELATIVE `source_code_path` to point at whatever it uploaded
+      # under `${workspace.file_path}`. This bundle uploads nothing (`sync: paths: []` in
+      # databricks.yml), so a relative path would resolve to an empty directory. An absolute
+      # `/Workspace/...` path passes through unrewritten instead.
+      #
+      # This is also the ONE declaration of the code root. `scripts/bundle-vars.sh` reads the
+      # resolved value back out of `bundle validate -o json` -- it is one of the few fields that
+      # DOES resolve pre-deploy -- and hands it to `scripts/deploy-app.sh`, which syncs the
+      # staged root there. Two mechanisms, one path, declared here.
+      source_code_path: /Workspace/Users/${workspace.current_user.userName}/${var.app_name}-app
+
+      # CRITICAL, and this is the single line the whole two-mechanism arrangement rests on:
+      # this resource declares NO `lifecycle` and NO `started`. Do not add either one.
+      #
+      # `make deploy` runs `bundle deploy` and then `scripts/deploy-app.sh`. Which of those two
+      # actually deploys the code is decided entirely by this absent field:
+      #
+      #   lifecycle/started omitted  ->  `bundle deploy` creates no app deployment at all. It
+      #                                  CANNOT revert the script. This is the arrangement.
+      #   started: true              ->  every `bundle deploy` unconditionally re-deploys from
+      #                                  the bundle's own source_code_path, clobbering whatever
+      #                                  the script deployed.
+      #
+      # `started: true` is the natural thing to reach for when an app will not start, and it is
+      # the wrong lever: the app not starting is a compute or a code problem, and this field
+      # converts two mechanisms that coexist into one that silently reverts the other on every
+      # deploy. `make lint` asserts the absence, because a comment alone would not have stopped
+      # it.
+      #
+      # The cost of omitting it, stated because it is not free and was measured wrong here
+      # once: NOTHING starts the compute. `bundle deploy` creates the App resource in state
+      # STOPPED, and this comment used to claim "an app deployment starts the compute" -- it
+      # does not. The dependency runs the OTHER WAY, and the platform says so in both
+      # directions (measured 2026-08-03, CLI v1.8.0):
+      #
+      #     apps deploy -> "Cannot deploy app ... as it is not in RUNNING state.
+      #                     Please start the app first."
+      #     apps get    -> "Start the app compute to deploy the app."
+      #
+      # So `scripts/deploy-app.sh` runs `databricks apps start` before it deploys. That is a
+      # CLI call and not a bundle field, so it starts the app without handing the bundle the
+      # ability to revert this script -- which is the whole point of the absent field above.
+      #
+      # Worth knowing while you are here: the bundle DOES see the script's deploys as drift. It
+      # reads remote state from the active deployment specifically to detect out-of-band
+      # redeploys. It simply does not act on that drift without `started`.
+
+      resources:
+        - name: registry
+          description: >-
+            The Lakebase database holding the hosts and sessions registry. The App reads it;
+            the shellbox-mcp processes write it as the real user.
+          postgres:
+            # `branch` and `database` are resource-path STRINGS built from the project's `.id`
+            # reference rather than written as a literal `projects/<name>/...` path. Building
+            # them this way creates the DABs dependency edge, so the project exists before the
+            # App binds to it -- and it keeps a project name out of this file, which
+            # `make lint`'s no-literal-project check requires.
+            #
+            # Both objects are AUTO-PROVISIONED with the project; nothing here declares them.
+            # See `lakebase.yml` for why declaring them would be a data-loss hazard.
+            branch: ${resources.postgres_projects.pg_project.id}/branches/${var.pg_branch_id}
+            # CAREFUL: the database RESOURCE id is the hyphenated `databricks-postgres`, and it
+            # is NOT the Postgres database NAME used to connect, which is the underscored
+            # `databricks_postgres`. Measured 2026-08-03 -- `list-databases` reports
+            # `database_id: databricks-postgres` and `postgres_database: databricks_postgres`.
+            # `var.pg_database` carries the connection name and feeds SHELLBOX_PG_DB; the
+            # hyphenated form appears only in this path.
+            database: ${resources.postgres_projects.pg_project.id}/branches/${var.pg_branch_id}/databases/databricks-postgres
+            permission: CAN_CONNECT_AND_CREATE

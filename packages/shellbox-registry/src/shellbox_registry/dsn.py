@@ -15,6 +15,22 @@ from urllib.parse import quote
 _PLAIN_SCHEME = "postgresql://"
 _PSYCOPG3_SCHEME = "postgresql+psycopg://"
 
+# CRITICAL: these defaults serve LOCAL DEVELOPMENT AND CI, and nothing else. They are a
+# coherent set describing one machine -- a Postgres on localhost with a throwaway credential --
+# and `"shellbox"` is the right database name there. The ``registry`` job in
+# `.github/workflows/ci.yml` runs against a `postgres:16-alpine` service and sets
+# ``SHELLBOX_PG_DB: shellbox`` explicitly, and `docs/registration.md` documents this table.
+#
+# They are NOT the deployed default, and `"DB"` here is deliberately NOT the same string as
+# `DEFAULT_DATABASE` in `lakebase.py`. That constant is `databricks_postgres`, the database a
+# Lakebase project auto-provisions, and it is pinned to the bundle's `pg_database` variable by
+# `test_the_default_database_is_the_one_the_bundle_declares` in `tests/unit/test_lakebase.py`.
+#
+# The two never meet. `dsn_from_env` is reached only when no ``SHELLBOX_PG_RESOURCE`` is set --
+# a configured endpoint WINS, which `tests/unit/test_migration_target.py` asserts by which host
+# was dialled. So a caller is on exactly one of the two paths, and each path's default names
+# the database that path actually reaches. Making these agree would break every local run to
+# tidy a value no deployed caller reads.
 _COMPONENT_DEFAULTS = {
     "USER": "shellbox",
     "PASSWORD": "shellbox",

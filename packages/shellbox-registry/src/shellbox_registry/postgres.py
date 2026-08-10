@@ -187,3 +187,41 @@ class PostgresRegistry(Registry):
                 .all()
             )
         return [_session_to_record(row) for row in rows]
+
+    # -- inventory reads -------------------------------------------------------------------
+    #
+    # CRITICAL: `owner_email` is a DISPLAY FILTER on both methods below, never an
+    # authorization decision. See `base.py` for why that distinction is written down rather
+    # than assumed. Nothing here checks a permission, and nothing here should learn to.
+
+    def list_hosts(self, owner_email: str | None = None) -> list[HostRecord]:
+        """Every `hosts` row, newest heartbeat first, optionally narrowed to one owner.
+
+        CRITICAL: ``owner_email`` FILTERS A DISPLAY. It is NEVER an authorization
+        decision. See `Registry.list_hosts` in `base.py`.
+        """
+        stmt = select(Host).order_by(Host.last_seen_at.desc())
+        if owner_email is not None:
+            # `hosts_owner_email_idx` (models.py) covers this predicate.
+            stmt = stmt.where(Host.owner_email == owner_email)
+        with OrmSession(self._engine) as sess:
+            rows = sess.execute(stmt).scalars().all()
+        return [_host_to_record(row) for row in rows]
+
+    def list_sessions(self, owner_email: str | None = None) -> list[SessionRecord]:
+        """Every `sessions` row, most recent activity first, optionally narrowed to one owner.
+
+        CRITICAL: ``owner_email`` FILTERS A DISPLAY. It is NEVER an authorization
+        decision. See `Registry.list_hosts` in `base.py`.
+
+        Note this is a **flat** list across every host, which is what an inventory display
+        renders. `list_sessions_for_host` stays the per-host primitive; neither replaces
+        the other.
+        """
+        stmt = select(SessionModel).order_by(SessionModel.last_activity_at.desc())
+        if owner_email is not None:
+            # `sessions_owner_email_idx` (models.py) covers this predicate.
+            stmt = stmt.where(SessionModel.owner_email == owner_email)
+        with OrmSession(self._engine) as sess:
+            rows = sess.execute(stmt).scalars().all()
+        return [_session_to_record(row) for row in rows]

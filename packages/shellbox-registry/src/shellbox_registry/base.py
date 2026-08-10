@@ -93,3 +93,48 @@ class Registry(Protocol):
     def list_sessions_for_host(self, host_id: str) -> list[SessionRecord]:
         """Return every `sessions` row for a host, in no particular order."""
         ...
+
+    # -- inventory reads -------------------------------------------------------------------
+    #
+    # CRITICAL: `owner_email` on both primitives below is a DISPLAY FILTER, never an
+    # authorization decision. The rule is stated on each method too, because a reader who
+    # meets one of them without the other must still get the warning.
+
+    def list_hosts(self, owner_email: str | None = None) -> list[HostRecord]:
+        """Return `hosts` rows, newest heartbeat first. All of them when ``owner_email``
+        is ``None``.
+
+        CRITICAL: ``owner_email`` FILTERS A DISPLAY. It is NEVER an authorization
+        decision. That is decision D5 of the epic,
+        https://github.com/IceRhymers/shellbox/issues/9, and ``docs/architecture.dot``
+        labels the same edge "display only (D5)".
+        A caller that omits the filter gets every host, and that is correct. The App is
+        open to every workspace user by design, so the inventory is not a per-viewer
+        secret. The parameter exists so a UI can offer "mine" next to "all".
+
+        The rule is spelled out because an email parameter on a query looks like an access
+        control. A caller that reads it as one then builds a permission check on a value
+        the viewer's own proxy header supplies.
+
+        Ordering is by ``last_seen_at`` descending, and it is part of the contract. A
+        display refreshes repeatedly. An unordered query lets Postgres return rows in
+        whatever physical order it likes, which reshuffles the list on every refresh.
+        """
+        ...
+
+    def list_sessions(self, owner_email: str | None = None) -> list[SessionRecord]:
+        """Return `sessions` rows, most recent activity first. All of them when
+        ``owner_email`` is ``None``.
+
+        CRITICAL: ``owner_email`` FILTERS A DISPLAY. It is NEVER an authorization
+        decision. See `list_hosts` for the full reasoning; it applies here unchanged.
+
+        The filter reads ``sessions.owner_email``, which is its own column: a session's
+        owner and its host's owner can differ.
+
+        Ordering is by ``last_activity_at`` descending, for the same reason `list_hosts`
+        orders by ``last_seen_at``. It is ``last_activity_at`` and NOT ``last_read_at``.
+        Sorting on reads would let the act of displaying a session reorder the display, if
+        a viewer's read ever advanced that column.
+        """
+        ...

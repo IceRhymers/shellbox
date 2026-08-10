@@ -17,7 +17,7 @@ from shellbox_registry.dsn import normalize_postgres_dsn
 from shellbox_registry.models import Host, Session
 from sqlalchemy import create_engine, inspect, text
 
-from .conftest import _test_dsn
+from .conftest import static_dsn_or_skip
 
 pytestmark = pytest.mark.registry
 
@@ -30,7 +30,12 @@ def alembic_config(_pg_engine_or_skip) -> Config:
     # _pg_engine_or_skip fixture already proved the target is reachable. Reuse
     # conftest's _test_dsn rather than repeating a default here -- two copies of a
     # connection string drift, and the literal form trips credential scanners.
-    os.environ["SHELLBOX_DATABASE_URL"] = _test_dsn()
+    # `static_dsn_or_skip` SKIPS on the Lakebase path. alembic's own env.py does support
+    # SHELLBOX_PG_RESOURCE (and it wins over a DSN), so migrating a branch works -- but this
+    # file also DROPS `alembic_version` and both tables to force a clean slate, and it verifies
+    # through an engine of its own. Pointing that at Lakebase needs the same passthrough
+    # `test_pool_resilience.py` needs; until then, skipping is honest and a fallback is not.
+    os.environ["SHELLBOX_DATABASE_URL"] = static_dsn_or_skip()
     cfg = Config(str(REPO_ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(REPO_ROOT / cfg.get_main_option("script_location")))
     return cfg

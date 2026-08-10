@@ -43,6 +43,24 @@ def test_null_registry_accepts_every_call_and_does_nothing() -> None:
     assert reg.list_sessions_for_host("h1") == []
 
 
+def test_null_registry_list_primitives_return_empty_and_never_raise() -> None:
+    """`W28`'s two read primitives, held to the same contract as the rest of the class.
+
+    The App runs on `NullRegistry` whenever no endpoint is configured, so "the inventory is
+    empty" has to be a valid answer that renders. An exception here would take down a page
+    that is meant to degrade to "terminals work, inventory is stale" (ADR-3).
+
+    Both the filtered and the unfiltered call, because the filter is the parameter a caller
+    is most likely to be exercising when the database turns out not to exist.
+    """
+    reg = NullRegistry()
+
+    assert reg.list_hosts() == []
+    assert reg.list_hosts("a@example.com") == []
+    assert reg.list_sessions() == []
+    assert reg.list_sessions("a@example.com") == []
+
+
 def test_create_registry_unset_dsn_returns_null_registry() -> None:
     assert isinstance(create_registry(None), NullRegistry)
     assert isinstance(create_registry(""), NullRegistry)

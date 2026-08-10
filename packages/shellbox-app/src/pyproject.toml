@@ -1,0 +1,114 @@
+# The deployed App's dependency manifest. This file is what selects the Apps runtime's PYTHON,
+# and that is the whole reason it exists.
+#
+# WHY uv AND NOT `requirements.txt`. Databricks Apps has two dependency paths, and it picks one
+# from the files it finds in the deploy root:
+#
+#   * pip, when the root ships `requirements.txt`. MEASURED 2026-08-04 from a deploy log: this
+#     path installs into `./.venv/lib/python3.11/site-packages` and downloads `cp311` wheels. It
+#     is PYTHON 3.11, and it does not read `requires-python` at all.
+#   * uv, when the root ships `pyproject.toml` and `uv.lock` and NO `requirements.txt`. Only this
+#     path honors `requires-python`, and it PROVISIONS the interpreter that line names.
+#
+# CRITICAL: `requirements.txt` always takes precedence. One file left in the deploy root sends
+# the App back to pip and 3.11 with nothing reporting it. `scripts/deploy-app.sh` therefore
+# stages this file INSTEAD of that one, and asserts the absence rather than trusting it.
+#
+# WHAT THAT REMOVES. Every `pyproject.toml` in this workspace declares
+# `requires-python = ">=3.12"`, and local development and CI both run 3.12. On the pip path that
+# declaration was true of the workspace and FALSE of the deployed artifact, so `make lint` and
+# `make test` passed on syntax the App could not import. It happened:
+# `shellbox_app/inventory.py` shipped a PEP 695 type-parameter list, which is 3.12 only.
+# `tests/unit/test_runtime_python.py` is that failure turned into a test.
+#
+# NOTE ON THIS FILE'S LOCATION. It sits inside `packages/shellbox-app/src/`, which is inside the
+# uv WORKSPACE rooted at the repository's own `pyproject.toml`. That workspace's members glob is
+# `packages/*`, which does not match this directory, and MEASURED 2026-08-04 on uv 0.10.9: `uv
+# lock` here resolves 36 packages standalone, writes only `packages/shellbox-app/src/uv.lock`,
+# leaves the workspace `uv.lock` untouched, and adds no workspace member to either file. It is
+# here rather than in a directory of its own because the deploy root is `app.yaml` plus this
+# manifest plus the packages, and splitting the manifest away from `app.yaml` would put the two
+# halves of one artifact in two places.
+#
+# Refs:
+#   https://docs.databricks.com/aws/en/dev-tools/databricks-apps/system-env
+#   https://docs.databricks.com/aws/en/dev-tools/databricks-apps/dependencies
+
+[project]
+# Deliberately NOT `shellbox-app`, which is the workspace package in
+# ../pyproject.toml. Two projects sharing a name in one tree is a way to read a resolution error
+# and blame the wrong file. This one is the deploy ROOT, and the suffix says so.
+name = "shellbox-app-deploy"
+version = "0.1.0"
+
+# THE UPPER BOUND IS REQUIRED, and it is not tidiness. With only a lower bound the Apps build's
+# `uv sync --locked` grabs the NEWEST interpreter uv can fetch -- CPython 3.14.3, observed on the
+# donor project `databricks-code-search`, whose `webui/pyproject.toml` carries the same bound for
+# the same reason. That interpreter both lacks the binary wheels this dependency set needs and
+# re-resolves to a set that no longer matches `uv.lock`, so `--locked` fails with "lockfile needs
+# to be updated". The bound forces uv to a 3.12 interpreter, which is the exact minor the lock is
+# resolved against -- see `.python-version` beside this file.
+requires-python = ">=3.12,<3.13"
+
+# CRITICAL: these are the same pins, at the same versions, as `requirements.txt` beside this
+# file. That file is what the pip path read, and it no longer reaches the deployed artifact --
+# read its header before changing either one. A version that differs between the two files means
+# the deployed App and every claim `requirements.txt` still carries describe different software.
+dependencies = [
+    # `websockets` is NOT preinstalled on the Apps runtime, and uvicorn needs it to serve the
+    # WebSocket handshake at all. Without it the upgrade fails inside the App, and a caller reads
+    # that as the edge blocking WebSockets. The Phase 1 probe avoided that misdiagnosis by
+    # declaring it, and so does this.
+    "websockets==15.0.1",
+    # fastapi and uvicorn ARE preinstalled on the Apps runtime, and they are declared anyway, so
+    # the deployed App runs the versions the test lanes exercised rather than whatever the
+    # runtime happens to ship.
+    "fastapi==0.140.7",
+    "uvicorn==0.51.0",
+    # --- what the registry needs ---
+    #
+    # `shellbox_app.database` imports `shellbox_registry` at module scope, so these are not
+    # optional extras: without them the App boots into `ModuleNotFoundError` behind a green
+    # deploy. The list is `shellbox-registry`'s own `[project] dependencies` in
+    # ../../shellbox-registry/pyproject.toml, plus its `lakebase` extra, pinned.
+    "sqlalchemy==2.0.51",
+    # The `[binary]` extra is load-bearing rather than a preference: it ships a prebuilt wheel.
+    # Plain `psycopg` builds against libpq at install time, and the Apps runtime is not a build
+    # environment.
+    "psycopg[binary]==3.3.4",
+    # alembic is a `shellbox-registry` dependency because that package carries the migrations.
+    # The App never migrates -- `scripts/deploy.sh` step 3 does, as the deploying principal --
+    # but the staged root holds the whole package, `shellbox_registry/alembic/` included, and a
+    # partial copy of a package is a worse thing to deploy than an unused import.
+    "alembic==1.18.5",
+    # The `lakebase` extra of `shellbox-registry`, written out because this is a flat list.
+    # `lakebase.py` mints an OAuth token to use as the Postgres password, and that needs the SDK.
+    #
+    # WARNING: no import check can verify this line. `lakebase.py` imports the SDK LAZILY by
+    # design, so `import shellbox_registry.lakebase` succeeds on a runtime with no SDK at all.
+    # `scripts/deploy-app.sh` says the same thing where its check is written. The first thing
+    # that actually needs the SDK is minting a token against the live endpoint.
+    "databricks-sdk==0.123.0",
+]
+
+# CRITICAL: `shellbox_transport` and `shellbox_registry` are workspace packages, and NOTHING here
+# can resolve either one -- there is no `[tool.uv.sources]` and there must not be, because a
+# workspace source cannot be resolved from a deploy root that ships no workspace. They arrive by
+# being COPIED to the deploy root as top-level siblings:
+#
+#     <root>/app.yaml  pyproject.toml  uv.lock  .python-version
+#            shellbox_app/  shellbox_transport/  shellbox_registry/
+#
+# `python -m shellbox_app` puts that root on `sys.path`, so a sibling top-level package resolves
+# as an ordinary import. `scripts/deploy-app.sh` owns the copy and checks the result.
+#
+# MEASURED 2026-08-04 that this still holds under `uv run`, which is what `app.yaml` now invokes:
+# in a temp directory holding only the three package copies and the four files above, `uv run
+# --frozen python -m shellbox_app` started uvicorn on CPython 3.12.8 and imported all three
+# packages from that directory. `uv run` does not change the working directory, so the mechanism
+# is unchanged from the pip path -- it is the interpreter and the venv that moved.
+
+# Not a distributable package -- just the App's entrypoint, run by `app.yaml`'s `command`.
+# Without this, uv tries to BUILD `shellbox-app-deploy`, which declares no build backend.
+[tool.uv]
+package = false

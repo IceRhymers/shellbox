@@ -27,6 +27,16 @@ transport.
   or restarted publisher mints a new epoch, and an unfamiliar epoch already means "distrust
   everything, repaint" to a subscriber. Adding a second, server-originated signal for the same
   event would give a subscriber two sources of truth for one fact.
+* **It serves one subscriber per session, and that is a decision rather than a stub.** The
+  reason is backpressure: a slow subscriber applies it to the publisher through an ``await``
+  in ``_pump``, which stalls the pane's reader. That is acceptable at one subscriber and not
+  at several. Fixing it needs bounded per-subscriber queues plus a drop policy, and a drop
+  policy on a terminal stream means a subscriber that falls behind must be RESYNCED -- which
+  needs a resync request path from the App to the publisher that no version of this protocol
+  has. Fan-out is therefore a protocol addition, not a loop change, and no phase of this
+  project has scheduled it. A refusal is transient rather than terminal for the session: see
+  ``WS_PING_INTERVAL_SECONDS``, whose sum with the timeout bounds how long a silently-dead
+  subscriber holds the slot.
 * **It holds no capability over any sandbox.** See this package's ``__init__.py``. The header
   ``X-Forwarded-Email`` is identity DISPLAY only, never authorization.
 
@@ -77,17 +87,55 @@ this repo has evidence for, and a reason carried in a close frame does not.
 
 ``GET /`` returns how many sessions are bound, not which. Any workspace user the edge lets
 through reaches this route, and a session name is not theirs to enumerate.
+
+``GET /`` also touches NO database, and that is a rule rather than an accident of what it
+happens to report. It is the target of the deploy's own smoke step, so a database call here
+would put a Lakebase wake on the path of the one check that must answer when Lakebase is the
+thing that is broken. The inventory routes are separate, and a reader adding a row count to
+this payload should add a route instead.
+
+``GET /ready`` is the peer that DOES read the database, and it is a separate route for exactly
+that reason. See `packages/shellbox-app/src/shellbox_app/ready.py`, which also owns the
+30-minute prober this app starts in its lifespan handler.
+
+``GET /api/hosts`` and ``GET /api/sessions`` DO return identifiers, and that is not a
+contradiction. They are the product rather than a liveness check: under decision D6 the App is
+open to every workspace user, so the host list is not a per-viewer secret. See
+`packages/shellbox-app/src/shellbox_app/inventory.py`, which states all five rules those two
+routes obey.
+
+## The database, and the two rules that keep it away from the relay
+
+The registry lives on ``app.state.database``, opened once per app by
+``shellbox_app.database.open_registry``. Two rules govern every route built on it, and both
+exist because the event loop of this process is what relays every attached terminal:
+
+1. **Every database-touching route is a sync ``def``, never ``async def``.** The rule covers
+   every route under ``/api/`` and ``/ready``, and ``tests/unit/test_app_database.py`` asserts
+   it against that list. ``PostgresRegistry`` is synchronous SQLAlchemy. FastAPI runs a sync
+   ``def`` in a threadpool and an ``async def`` on the event loop, so one blocking query in a
+   coroutine route stalls every attached terminal at once. The WebSocket routes below are
+   correctly ``async def``, which is a different case: they suspend on socket I/O and never
+   touch the database.
+2. **Opening the registry is never fatal.** See the module docstring of
+   `packages/shellbox-app/src/shellbox_app/database.py`. A Lakebase outage means the inventory
+   goes stale. It never means a browser cannot attach, and
+   `tests/unit/test_app_database.py` asserts that with a registry that raises on every call.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Annotated
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from shellbox_transport.codec import (
     UNORDERED_SEQ,
     ControlMessage,
@@ -98,12 +146,20 @@ from shellbox_transport.codec import (
 )
 from starlette.websockets import WebSocketState
 
+from shellbox_app.database import AppDatabase, open_registry
+from shellbox_app.inventory import hosts_payload, sessions_payload
+from shellbox_app.logs import configure_logging
+from shellbox_app.ready import probe_forever, ready_payload
+from shellbox_app.ui import UI_PATH, mount_ui
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "CONTROL_SEQ",
     "DEFAULT_PORT",
     "REFUSED_CLOSE_CODE",
+    "WS_PING_INTERVAL_SECONDS",
+    "WS_PING_TIMEOUT_SECONDS",
     "Attachment",
     "Relay",
     "app",
@@ -130,6 +186,34 @@ CONTROL_SEQ = UNORDERED_SEQ
 # socket was well-formed and the server declines to serve it. The reason a client branches on
 # is the `control` frame sent before the close, never this number.
 REFUSED_CLOSE_CODE = 1008
+
+# The WebSocket keepalive, passed to uvicorn explicitly rather than inherited.
+#
+# WHAT THIS CONTROLS, and it is not the keepalive itself. This app has NO reaper of its own.
+# When a subscriber's socket dies silently, `_pump`'s `await source.receive()` never returns,
+# so `Relay.release` never runs and the session's one subscriber slot stays held. What frees
+# the slot is uvicorn failing its own ping: it sends one every `ws_ping_interval` and closes
+# the connection when no pong arrives within `ws_ping_timeout`. So the sum below is the
+# worst-case time a dead subscriber holds a slot, and a browser retrying `subscriber_conflict`
+# has to outlast it or it reports a conflict that was about to clear itself.
+#
+# MEASURED, not inferred. Read out of the installed uvicorn 0.51.0 on 2026-08-03:
+# `uvicorn.config.Config.__init__` and `uvicorn.run` both declare `ws_ping_interval=20.0` and
+# `ws_ping_timeout=20.0`, as floats. The values below restate those defaults, so passing them
+# changes nothing about how the App runs today. That is the point: principle 5 says a value the
+# design depends on is declared, and a browser retry bound derived from a library default that
+# nobody wrote down is a bound that silently moves on a dependency bump.
+# `tests/unit/test_app_server.py` asserts both that `main` passes them and that uvicorn's own
+# defaults have not drifted away from them.
+#
+# WARNING: **these apply to the PUBLISHER socket too, not only the browser's.** At the values
+# below that is a no-op versus today. But SHORTENING them to tighten the reaper window makes
+# the App ping the sandbox more often, and
+# `packages/shellbox-mcp/src/shellbox_mcp/transport.py` flags exactly that traffic as an input
+# to the sandbox's autostop timer, which is Phase 5's variable. Shortening this is therefore
+# not a local decision. Lengthening it is safe here and must move the browser's retry bound.
+WS_PING_INTERVAL_SECONDS = 20.0
+WS_PING_TIMEOUT_SECONDS = 20.0
 
 
 @dataclass
@@ -245,9 +329,16 @@ def resolve_port(environ: dict[str, str] | None = None) -> int:
 
 
 def health_payload(relay: Relay) -> dict[str, object]:
-    """What ``GET /`` returns. Counts only, never identifiers -- see this module's docstring."""
+    """What ``GET /`` returns. Counts only, never identifiers -- see this module's docstring.
+
+    ``ui`` is a constant, not a count, and it is here because this route is what a human reaches
+    by opening the App's URL. The renderer cannot live at ``/`` -- this payload is the deploy's
+    smoke target and must stay JSON -- so the alternative to naming the path is a person seeing
+    this object and having nowhere to go. See `packages/shellbox-app/src/shellbox_app/ui.py`.
+    """
     return {
         "service": "shellbox-app",
+        "ui": f"{UI_PATH}/",
         "sessions": len(relay.attachments),
         "publishers": sum(1 for held in relay.attachments.values() if held.publisher is not None),
         "subscribers": sum(1 for held in relay.attachments.values() if held.subscriber is not None),
@@ -285,16 +376,20 @@ async def serve_subscriber(relay: Relay, websocket: WebSocket, session_id: str) 
     await websocket.accept()
     attachment = relay.bind_subscriber(session_id, websocket)
     if attachment is None:
+        # CORRECTED. This line said "fan-out is Phase 4's", and Phase 4 decided the opposite:
+        # fan-out is a protocol addition and is out of its scope. See `_refuse` below, and
+        # `_pump`'s WARNING, which carries the reason.
         logger.warning(
-            "refused a second subscriber for session %s: fan-out is Phase 4's", session_id
+            "refused a second subscriber for session %s: one subscriber per session, by design",
+            session_id,
         )
         await _refuse(
             websocket,
             session_id,
             code="subscriber_conflict",
             message=(
-                "a subscriber is already bound to this session; multi-subscriber fan-out is "
-                "not implemented"
+                "a subscriber is already bound to this session; one subscriber per session "
+                "is a design decision, so retry and expect the slot to clear"
             ),
         )
         return
@@ -307,8 +402,8 @@ async def serve_subscriber(relay: Relay, websocket: WebSocket, session_id: str) 
         logger.info("released subscriber for session %s", session_id)
 
 
-def build_app(relay: Relay | None = None) -> FastAPI:
-    """A FastAPI app over its own ``Relay``.
+def build_app(relay: Relay | None = None, database: AppDatabase | None = None) -> FastAPI:
+    """A FastAPI app over its own ``Relay`` and its own registry.
 
     A factory rather than a module-level app over module-level state, mirroring
     ``shellbox_mcp.server.build_server``. Two apps in one interpreter then share nothing, so the
@@ -318,14 +413,82 @@ def build_app(relay: Relay | None = None) -> FastAPI:
     split is what lets the unit lane drive the accept path with a fake socket instead of reaching
     into ``FastAPI``'s route table for a closure -- the behavior under test is the binding rule,
     and it should not need a running server to assert.
+
+    ``database`` defaults to whatever the environment resolves to, which is a `NullRegistry`
+    when nothing is configured. Passing one is how a test supplies a fake minter, or a registry
+    that raises on every call. Building the app opens the registry and starts NO thread: the
+    refresher belongs to the lifespan handler below, because this function runs at import.
     """
-    api = FastAPI()
     sessions = Relay() if relay is None else relay
+    store = open_registry() if database is None else database
+
+    @asynccontextmanager
+    async def lifespan(api: FastAPI) -> AsyncIterator[None]:
+        """Start the credential refresher and the prober, serve, then stop both.
+
+        The App is long-lived and is the case the background refresher exists for -- see the
+        module docstring of `packages/shellbox-app/src/shellbox_app/database.py`. ``stop()`` is
+        in the unwind path so a reload or a failed startup elsewhere still joins the thread.
+
+        The prober is a task rather than a thread, and it is started here rather than in
+        `build_app` for the reason the refresher is: this function runs at import, and a module
+        a test suite imports must not start background work. See
+        `packages/shellbox-app/src/shellbox_app/ready.py` for what it does and why it runs
+        inside the App at all.
+        """
+        store.start()
+        # Kept on `state` rather than in a local, so a test has a handle on it and an operator
+        # reading this file can see that the App owns exactly one background task.
+        api.state.prober = prober = asyncio.create_task(probe_forever(store))
+        try:
+            yield
+        finally:
+            # Cancel and await, in that order. Dropping the reference instead leaves the task
+            # to be cancelled at loop teardown, which surfaces as an unretrieved exception
+            # after the App has otherwise shut down cleanly.
+            prober.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await prober
+            store.stop()
+
+    api = FastAPI(lifespan=lifespan)
     api.state.relay = sessions
+    api.state.database = store
 
     @api.get("/")
     def health() -> dict[str, object]:
+        """CRITICAL: zero database. See this module's docstring -- the rule, not the payload."""
         return health_payload(sessions)
+
+    @api.get("/ready")
+    def ready() -> dict[str, object]:
+        """The database diagnostic. CRITICAL: a sync ``def``, and the body is generic.
+
+        Both rules, and the reason this route is separate from ``GET /`` at all, are in
+        `packages/shellbox-app/src/shellbox_app/ready.py`.
+        """
+        return ready_payload(store)
+
+    @api.get("/api/hosts")
+    def api_hosts(
+        x_forwarded_email: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """The host inventory. CRITICAL: a sync ``def``, and the header is DISPLAY only.
+
+        The header binds through FastAPI rather than being read off a ``Request``, so the one
+        name this route trusts is visible in its signature. Every rule it obeys is in
+        `packages/shellbox-app/src/shellbox_app/inventory.py`.
+
+        CRITICAL: the header selects NO rows. It decides only which rows carry ``mine``.
+        """
+        return hosts_payload(store, x_forwarded_email)
+
+    @api.get("/api/sessions")
+    def api_sessions(
+        x_forwarded_email: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        """The session inventory. The same two rules as ``/api/hosts``, unchanged."""
+        return sessions_payload(store, x_forwarded_email)
 
     @api.websocket("/publish/{session_id}")
     async def publish(websocket: WebSocket, session_id: str) -> None:
@@ -334,6 +497,12 @@ def build_app(relay: Relay | None = None) -> FastAPI:
     @api.websocket("/subscribe/{session_id}")
     async def subscribe(websocket: WebSocket, session_id: str) -> None:
         await serve_subscriber(sessions, websocket, session_id)
+
+    # LAST, and after every route above. A mount matches by prefix, so one registered earlier
+    # would shadow anything sharing it. Nothing shares `/ui` today; the ordering is what keeps
+    # that true when someone adds a route later. See
+    # `packages/shellbox-app/src/shellbox_app/ui.py` for why the page is not at `/`.
+    mount_ui(api)
 
     return api
 
@@ -420,8 +589,9 @@ async def _pump(source: WebSocket, peer: Callable[[], WebSocket | None], peer_ro
       agent's publisher.
 
     WARNING: A slow subscriber applies backpressure to the publisher through this ``await``,
-    which would stall the pane's reader. Acceptable at one subscriber and not at several, so
-    whoever implements fan-out owns bounding it.
+    which would stall the pane's reader. Acceptable at one subscriber and not at several, and
+    it is the reason ``serve_subscriber`` refuses the second one. Whoever implements fan-out
+    owns bounding it, plus the resync path this module's docstring names.
     """
     while True:
         message = await source.receive()
@@ -453,7 +623,25 @@ def main() -> None:
     """Serve ``app`` on the port the Apps runtime chose. The ``app.yaml`` entrypoint."""
     import uvicorn
 
+    # FIRST, and before anything that might log. The App configured no logging until this call
+    # existed, which dropped every INFO line and left every WARNING to the standard library's
+    # last-resort handler -- measured against the live `dev` deploy. The prober's only
+    # notification mechanism is a WARN line, so it does not work without this. See
+    # `packages/shellbox-app/src/shellbox_app/logs.py`.
+    configure_logging()
+
     # 0.0.0.0 because the edge terminates outside the container and proxies in -- the probe
     # measured the App seeing `host: localhost:8000`, so binding the loopback alone would be
     # reachable, but the runtime does not promise that and the probe's shape is what is measured.
-    uvicorn.run(app, host="0.0.0.0", port=resolve_port())  # noqa: S104 -- see above
+    #
+    # The two ping settings are uvicorn's own current defaults, passed rather than inherited.
+    # They are what reaps a silently-dead subscriber's slot, and the browser's retry bound is
+    # derived from their sum. See the constants above, including the WARNING about the
+    # publisher socket.
+    uvicorn.run(
+        app,
+        host="0.0.0.0",  # noqa: S104 -- see above
+        port=resolve_port(),
+        ws_ping_interval=WS_PING_INTERVAL_SECONDS,
+        ws_ping_timeout=WS_PING_TIMEOUT_SECONDS,
+    )

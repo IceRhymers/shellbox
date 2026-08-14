@@ -665,8 +665,8 @@ def build_server(
         exists. tmux never truncates a capture, so there is no `truncated` field to trust.
 
         This tool records the read. A session neither read nor sent to for long enough can
-        be reaped -- 25 minutes at the default, which an operator can change -- so read a
-        long unattended job at least that often.
+        be reaped -- 30 minutes at the default, which an operator can change -- so read a
+        long unattended job at least every 25 minutes to stay safely inside that window.
 
         Errors: not_found | invalid_name | invalid_dimensions | tmux_unavailable |
         tmux_error.

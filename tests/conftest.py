@@ -554,8 +554,18 @@ def await_output_timeout_elapsed(
     `sleep()`. The wall-clock delay this incurs is a side effect of the poll succeeding, not
     of this function sleeping for a duration and then asserting.
     """
+    def _aged_past(seconds: float) -> bool:
+        activity = adapter.window_activity_max(name)
+        # `None` is missing evidence, never epoch (ADR-36) -- folding it to 0 here would make
+        # `time.time() - 0` enormous and the poll would succeed instantly on a signal that
+        # never actually aged, masking a real regression in `window_activity_max` instead of
+        # timing out and failing the test by name.
+        if activity is None:
+            return False
+        return (time.time() - activity) > seconds
+
     await_condition(
-        lambda: (time.time() - (adapter.window_activity_max(name) or 0)) > seconds,
+        lambda: _aged_past(seconds),
         timeout=timeout if timeout is not None else seconds + 15,
         what=f"{name!r}'s window_activity_max to read more than {seconds}s old",
     )

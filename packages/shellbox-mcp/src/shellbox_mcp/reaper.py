@@ -304,7 +304,24 @@ class Reaper:
         # `ADR-26`) -- so THIS reaper did not end it and must not claim it did (table row 20).
         if not adapter.kill(record.tmux_name):
             return False
-        self.registry.upsert_session(_reaped_row(row, self.host_id))
+        # The kill already happened -- this session IS gone from tmux regardless of what
+        # happens next. A failure here is caught locally (not by `_sweep`'s per-session
+        # guard) so the log line says what actually occurred: killed, but not recorded as
+        # `reaped`. `_sweep`'s "sparing it this sweep" wording would be wrong for this case,
+        # since nothing was spared -- `reconcile_orphans` will see the row as `orphaned` on
+        # the next pass, matching what genuinely happened.
+        try:
+            self.registry.upsert_session(_reaped_row(row, self.host_id))
+        except Exception:  # noqa: BLE001 -- see comment above; this is not a spare
+            logger.warning(
+                "reaper: killed session %s (tmux_name=%r) on host %s but failed to record "
+                "it as reaped; the row will read orphaned on the next reconciliation pass",
+                row.session_id,
+                record.tmux_name,
+                self.host_id,
+                exc_info=True,
+            )
+            return True
         logger.info(
             "reaper: reaped session %s (tmux_name=%r) on host %s: idle past the %ss timeout",
             row.session_id,

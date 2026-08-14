@@ -30,7 +30,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from shellbox_mcp.publisher import Claim, claim_is_live
@@ -549,10 +549,20 @@ def await_output_timeout_elapsed(
 ) -> None:
     """Poll ``name``'s real `window_activity_max` until it reads more than ``seconds`` old.
 
-    Section 3.7's mechanism, in one place: every tmux-lane reaper criterion injects a tiny
-    `Reaper(timeout=...)` and then waits for a REAL tmux timestamp to cross it -- never a
-    `sleep()`. The wall-clock delay this incurs is a side effect of the poll succeeding, not
-    of this function sleeping for a duration and then asserting.
+    Section 3.7's mechanism, in one place: a tmux-lane reaper criterion injects a tiny
+    `Reaper(timeout=...)` and then waits for a REAL signal to cross it -- never a `sleep()`. The
+    wall-clock delay this incurs is a side effect of the poll succeeding, not of this function
+    sleeping for a duration and then asserting.
+
+    Use this ONLY for a criterion that rests on the OUTPUT-timeout clause -- one whose row carries
+    a genuinely old `last_activity_at` (planted with `_old_row_time()`), so the tmux-side
+    `window_activity` is the term that actually decides the reap. A criterion whose row is written
+    at ~now by the real `shell_create` tool must NOT wait on this: `window_activity` is a Unix
+    epoch INTEGER, floored to the whole second, so it reads up to ~1s OLDER than the
+    full-precision `last_activity_at` clause 1 gates on. Waiting on it there fires while the row
+    is still inside the timeout, the reaper correctly SPARES the session, and the "must be reaped"
+    assertion fails on a fast host (the tmux-3.4 CI container) while passing on a slower one.
+    That criterion waits on `await_reap_clocks_elapsed` instead, which crosses both clocks.
     """
     def _aged_past(seconds: float) -> bool:
         activity = adapter.window_activity_max(name)
@@ -568,4 +578,52 @@ def await_output_timeout_elapsed(
         lambda: _aged_past(seconds),
         timeout=timeout if timeout is not None else seconds + 15,
         what=f"{name!r}'s window_activity_max to read more than {seconds}s old",
+    )
+
+
+def await_reap_clocks_elapsed(
+    adapter: TmuxAdapter,
+    registry: PlantedRegistry,
+    name: str,
+    seconds: float,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Wait until BOTH idle clocks the reaper reads are older than ``seconds``.
+
+    A reap needs clause 1 (the registry's `last_activity_at`) AND clause 3 (tmux's
+    `window_activity`) both aged past the timeout (`reaper.py`). For a criterion driven through
+    the real `shell_create` tool -- whose row is written at ~now (`server.py`'s `session_row`) --
+    the two clocks are BOTH near creation, and they DIVERGE IN OPPOSITE DIRECTIONS across hosts,
+    so neither alone is a safe proxy for the other:
+
+    * tmux floors `window_activity` to the whole second, so it can read up to ~1s OLDER than the
+      full-precision `last_activity_at` (measured on the tmux-3.4 CI container);
+    * an interactive shell's startup output bumps `window_activity` AFTER creation, so it can
+      instead read NEWER than `last_activity_at` (measured on macOS).
+
+    Waiting on either clock alone therefore leaves the other possibly still inside the timeout at
+    sweep time -- the reaper correctly SPARES on the young clause and the "must be reaped"
+    assertion fails on one host while passing on the other. This waits on both. `last_activity_at`
+    is fixed at creation and `window_activity` only advances, so once the pane goes quiet both
+    cross and the poll terminates.
+    """
+    def _aged_past(seconds: float) -> bool:
+        row = registry.rows.get(name)
+        # A missing row / missing signal is "no evidence it aged", not "infinitely old" -- the
+        # same MISSING-EVIDENCE-SPARES direction the reaper takes, so it times the poll out and
+        # fails the test by name rather than passing on a session that never aged.
+        if row is None:
+            return False
+        if (datetime.now(UTC) - row.last_activity_at).total_seconds() <= seconds:
+            return False
+        activity = adapter.window_activity_max(name)
+        if activity is None:
+            return False
+        return (time.time() - activity) > seconds
+
+    await_condition(
+        lambda: _aged_past(seconds),
+        timeout=timeout if timeout is not None else seconds + 15,
+        what=f"{name!r}'s last_activity_at AND window_activity to both read >{seconds}s old",
     )

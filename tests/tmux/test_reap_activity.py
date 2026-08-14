@@ -18,6 +18,7 @@ from conftest import (
     await_condition,
     await_file,
     await_output_timeout_elapsed,
+    await_reap_clocks_elapsed,
     requires_tmux,
 )
 from mcp import ClientSession
@@ -186,8 +187,13 @@ def test_an_adopted_session_survives_while_an_identically_aged_control_is_reaped
             await _shell_create(client, adopted, str(tmp_path))
             await _shell_create(client, control, str(tmp_path))
 
-            await_output_timeout_elapsed(raw_adapter, adopted, TIMEOUT)
-            await_output_timeout_elapsed(raw_adapter, control, TIMEOUT)
+            # Age BOTH reaper clocks (registry `last_activity_at` and tmux `window_activity`) past
+            # the timeout: each row was written at ~now by the real `shell_create`, and the two
+            # clocks diverge in opposite directions across hosts, so both must cross before the
+            # sweep would reap. This must complete BEFORE the re-adopt below refreshes `adopted`'s
+            # `last_activity_at` back to ~now -- which is exactly what then spares it.
+            await_reap_clocks_elapsed(raw_adapter, registry, adopted, TIMEOUT)
+            await_reap_clocks_elapsed(raw_adapter, registry, control, TIMEOUT)
 
             # The real adopt: same name, same cwd -> `created=False`
             # (`tmux.py:624-632`/`server.py:557-561`'s unconditional projection).
@@ -232,7 +238,11 @@ def test_a_fresh_never_used_session_is_not_reaped_by_the_immediately_following_s
     async def main() -> None:
         async with create_connected_server_and_client_session(server) as client:
             await _shell_create(client, control, str(tmp_path))
-            await_output_timeout_elapsed(raw_adapter, control, TIMEOUT)
+            # Age BOTH reaper clocks past the timeout. The control's row is written at ~now by the
+            # real `shell_create`, and `last_activity_at` and `window_activity` diverge in
+            # opposite directions across hosts, so waiting on either alone leaves the other young
+            # at sweep time -- both must cross for the control to be genuinely reap-eligible.
+            await_reap_clocks_elapsed(raw_adapter, registry, control, TIMEOUT)
             # Created AFTER the control has already aged, so its own registry row is written
             # near `now` -- the sparing term this criterion rests on.
             await _shell_create(client, fresh, str(tmp_path))

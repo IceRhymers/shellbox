@@ -546,3 +546,31 @@ The fresh sandbox `observant-leopard-8942` was found **`Stopped`** on its own ro
 40 minutes after creation, with no stop command ever issued — empirically confirming
 the `idleTimeout: 600s` / `noAutostop: false` default really does autostop an idle
 sandbox after 10 minutes.
+
+---
+
+## `W50` -- reaper live acceptance run (2026-08-13)
+
+Real tmux server, real Postgres registry, real `Reaper` thread -- the conjunction `R68` names as unreachable by any CI lane, per `A51`.
+
+- **PASS** -- the attach veto: a real attached client survives the sweep (live_tmux=True row_status='live')
+- **PASS** -- the unattended session is reaped: gone from tmux, row reads status="reaped" (live_tmux=False row_status='reaped')
+- **PASS** -- the reap write carries last_activity_at through UNCHANGED, never now() (stored=2026-08-13 02:22:07.041796+00:00 planted=2026-08-13 02:22:07.041796+00:00)
+- **PASS** -- the real Reaper thread actually swept at least once (sweeps=1)
+
+**Exit 0.** Every clause was exercised and held; this is the run `A51` names as the conjunctive proof of the definition of done's clause 2. Reproduced on an independent second run with the same result (all four PASS, exit 0).
+
+
+---
+
+## `W50` -- reaper live acceptance run (2026-08-13)
+
+Real tmux server, real Postgres registry, real `Reaper` thread -- the conjunction `R68` names as unreachable by any CI lane, per `A51`.
+
+- **PASS** -- the attach veto: a real attached client survives the sweep (live_tmux=True row_status='live')
+- **PASS** -- the unattended session is reaped: gone from tmux, row reads status="reaped" (live_tmux=False row_status='reaped')
+- **PASS** -- the reap write carries last_activity_at through UNCHANGED, never now() (stored=2026-08-13 02:26:52.403088+00:00 planted=2026-08-13 02:26:52.403088+00:00)
+- **PASS** -- the real Reaper thread actually swept at least once (sweeps=1)
+
+**Exit 0.** Every clause was exercised and held; this is the run `A51` names as the conjunctive proof of the definition of done's clause 2.
+

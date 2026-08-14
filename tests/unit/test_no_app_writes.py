@@ -26,9 +26,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 APP_PACKAGE = REPO / "packages" / "shellbox-app" / "src" / "shellbox_app"
 
-# The registry's two writers, named in `shellbox_registry.base.Registry`. The read primitives
+# The registry's writers, named in `shellbox_registry.base.Registry`. The read primitives
 # (`list_hosts`, `list_sessions`, `get_host`, ...) are what the App is for and are not listed here.
-WRITERS = ("upsert_host", "upsert_session")
+# `touch_read` (W39) is a writer too -- an UPDATE, not an upsert, but still a write the App SP's
+# SELECT-only grant does not permit.
+WRITERS = ("upsert_host", "upsert_session", "touch_read")
 
 
 def writer_references(source: str) -> list[str]:
@@ -93,10 +95,17 @@ def test_the_scan_sees_a_planted_write() -> None:
             "    registry.upsert_host(record)",
             "    writer = getattr(registry, 'upsert_session')",
             "    writer(record)",
+            "    registry.touch_read(record.session_id, now)",
         )
     )
     hits = writer_references(planted)
-    assert [hit.split(":")[0] for hit in hits] == ["upsert_host", "upsert_session"], hits
+    # `writer_references` returns `sorted(found)`, so the order is alphabetical by name, not
+    # by appearance -- "touch_read" sorts before "upsert_host"/"upsert_session".
+    assert [hit.split(":")[0] for hit in hits] == [
+        "touch_read",
+        "upsert_host",
+        "upsert_session",
+    ], hits
 
 
 def test_the_scan_ignores_the_reads_the_app_exists_for() -> None:

@@ -44,6 +44,12 @@ class Host(Base):
     tmux_socket: Mapped[str | None] = mapped_column(default=None)
 
     __table_args__ = (
+        # ADR-30: `status` does not track heartbeat staleness. The App holds only SELECT on
+        # this table (`scripts/grant_app_sp.py:99-104`) and cannot write `'stale'` here even
+        # for a host whose heartbeat has gone quiet -- `status` keeps reading `'active'` on a
+        # dead host, and that is a documented property, not a bug. `heartbeat_stale` in the
+        # App's inventory payload (`shellbox_app/inventory.py`'s `host_payload`) is what
+        # answers "is this heartbeat old", derived at read time rather than stored here.
         CheckConstraint("status IN ('active','stale','stopped')", name="hosts_status_chk"),
         Index("hosts_owner_email_idx", "owner_email"),
     )

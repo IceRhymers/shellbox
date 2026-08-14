@@ -89,6 +89,38 @@ def test_a_malformed_integer_refuses_to_start(key: str, value: str) -> None:
         Settings.from_env({key: value})
 
 
+# --------------------------------------------------------------- bounded integer keys
+@pytest.mark.parametrize("key", ["SHELLBOX_IDLE_TIMEOUT_SECONDS", "SHELLBOX_REAP_INTERVAL_SECONDS"])
+@pytest.mark.parametrize("value", ["not-a-number", "0", "-1", "1.5"])
+def test_a_malformed_bounded_integer_refuses_to_start(key: str, value: str) -> None:
+    """The two reaper-config keys raise, not revert to a default, on a malformed value --
+    same house style as the plain integer keys above."""
+    with pytest.raises(ConfigError, match=key):
+        Settings.from_env({key: value})
+
+
+@pytest.mark.parametrize(
+    "key, out_of_range",
+    [
+        ("SHELLBOX_IDLE_TIMEOUT_SECONDS", "59"),
+        ("SHELLBOX_IDLE_TIMEOUT_SECONDS", "86401"),
+        ("SHELLBOX_REAP_INTERVAL_SECONDS", "9"),
+        ("SHELLBOX_REAP_INTERVAL_SECONDS", "3601"),
+    ],
+)
+def test_an_out_of_range_bounded_integer_refuses_to_start(key: str, out_of_range: str) -> None:
+    """Out-of-range is a `ConfigError`, never a clamp -- a clamped value is a correctness
+    boundary the operator believes they moved, same as a malformed one."""
+    with pytest.raises(ConfigError, match=key):
+        Settings.from_env({key: out_of_range})
+
+
+def test_the_reaper_config_defaults_are_ss_table() -> None:
+    settings = Settings.from_env({})
+    assert settings.idle_timeout_seconds == DEFAULTS["SHELLBOX_IDLE_TIMEOUT_SECONDS"]
+    assert settings.reap_interval_seconds == DEFAULTS["SHELLBOX_REAP_INTERVAL_SECONDS"]
+
+
 def test_an_unrecognised_log_level_warns_and_uses_info() -> None:
     """The one setting that must NOT refuse to start: stderr is the only diagnostic channel, so
     starting at INFO beats an opaque handshake failure."""

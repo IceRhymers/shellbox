@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 
 from shellbox_registry import HostRecord, NullRegistry, Registry, SessionRecord
 
@@ -71,6 +71,7 @@ from shellbox_app.ready import REASON_NO_DATABASE, REASON_QUERY_FAILED
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "HEARTBEAT_STALE_SECONDS",
     "NOT_BOOTSTRAPPED_LABEL",
     "host_payload",
     "hosts_payload",
@@ -79,6 +80,19 @@ __all__ = [
     "sessions_payload",
     "viewer_owns",
 ]
+
+# ADR-30: host staleness is derived at read time and never stored. The App holds only SELECT
+# on the registry (`scripts/grant_app_sp.py:99-104`), so it cannot write a stale ``hosts.status``
+# even if it wanted to -- ``status`` keeps reading ``active`` on a dead host, by design. This
+# constant is instead the threshold `host_payload` uses to derive ``heartbeat_stale`` from
+# ``last_seen_at`` at read time: five heartbeat intervals (`HEARTBEAT_SECONDS = 60.0`,
+# `enroll.py:67`), not one, so a modest clock skew between the host and the App cannot flip
+# the answer.
+#
+# NOT an environment variable. `shellbox_app/config.py` defines ``DatabaseSettings`` only, with
+# no generic ``from_env`` and no settings path for a display threshold. An operator who wants a
+# different value edits this line.
+HEARTBEAT_STALE_SECONDS = 300
 
 # What a ``hosts`` row with no ``sandbox_id`` renders as. A Tier 1 string: short, lowercase,
 # and stable, because the browser client branches on the row rather than on this text and a
@@ -116,7 +130,11 @@ def viewer_owns(owner_email: str, viewer_email: str | None) -> bool:
     return owner_email.strip().casefold() == viewer_email.strip().casefold()
 
 
-def host_payload(record: HostRecord, viewer_email: str | None) -> dict[str, object]:
+def host_payload(
+    record: HostRecord,
+    viewer_email: str | None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> dict[str, object]:
     """One ``hosts`` row as the browser reads it. A display subset, not a mirror of the row.
 
     Three columns are deliberately absent, and the reasons differ:
@@ -131,6 +149,13 @@ def host_payload(record: HostRecord, viewer_email: str | None) -> dict[str, obje
 
     A field is added here when something renders it, and `tests/unit/test_app_inventory.py`
     holds the assertion, because the tempting way to build this is to reflect every column.
+
+    ``heartbeat_stale`` (ADR-30) is per-host and derived, never stored: ``record.status`` keeps
+    reading ``active`` on a dead host because the App cannot write it, so this field is the
+    App's own answer to "is this heartbeat old", computed against ``HEARTBEAT_STALE_SECONDS``.
+    It is deliberately NOT named ``stale`` -- this payload's top-level ``stale`` key already
+    means "the App could not read the registry at all" (see ``hosts_payload`` and ``_read``),
+    and the two must not collide under one word.
     """
     return {
         "host_id": record.host_id,
@@ -143,6 +168,8 @@ def host_payload(record: HostRecord, viewer_email: str | None) -> dict[str, obje
         "mine": viewer_owns(record.owner_email, viewer_email),
         "status": record.status,
         "last_seen_at": _stamp(record.last_seen_at),
+        "heartbeat_stale": (now() - record.last_seen_at).total_seconds()
+        > HEARTBEAT_STALE_SECONDS,
     }
 
 

@@ -29,11 +29,13 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 
 import pytest
 from shellbox_mcp.publisher import Claim, claim_is_live
 from shellbox_mcp.tmux import CommandResult, Runner, SubprocessRunner, TmuxAdapter, TmuxConfig
+from shellbox_registry.base import SessionRecord as RegistrySessionRecord
 
 TMUX_BIN = os.environ.get("SHELLBOX_TMUX_BIN") or shutil.which("tmux")
 
@@ -491,3 +493,69 @@ def fail_verb(verb: str, stderr: str) -> Callable[[tuple[str, ...]], CommandResu
         return result(rc=1, stderr=stderr) if verb in argv else None
 
     return fault
+
+
+# --------------------------------------------------------------------------------------
+# W41 -- the reaper's tmux-lane fixtures. Shared across `tests/tmux/test_reap_*.py`.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class PlantedRegistry:
+    """A minimal fake `Registry`: only the two primitives `Reaper` actually calls.
+
+    For the tmux-lane reaper criteria (A25, A28, A35, A42, A43, A46, A48), which need a row
+    "under this host's current host_id" (`ADR-36`) to make a session a candidate at all, but
+    must not need a real Postgres to prove the tmux-SIDE half of the predicate -- the write
+    itself, against `GREATEST` and `sessions_status_chk`, is
+    `tests/registry/test_reaper_registry.py`'s job, against real Postgres.
+    """
+
+    host_id: str
+    rows: dict[str, RegistrySessionRecord] = field(default_factory=dict)
+    written: list[RegistrySessionRecord] = field(default_factory=list)
+
+    def plant(
+        self,
+        tmux_name: str,
+        *,
+        last_activity_at: datetime,
+        last_read_at: datetime | None = None,
+        owner_email: str = "reaper-test@example.com",
+    ) -> None:
+        """Add (or replace) a row for ``tmux_name``, as if it had been written by a tool call."""
+        self.rows[tmux_name] = RegistrySessionRecord(
+            session_id=f"{self.host_id}:{tmux_name}",
+            host_id=self.host_id,
+            tmux_name=tmux_name,
+            owner_email=owner_email,
+            last_activity_at=last_activity_at,
+            last_read_at=last_read_at,
+            status="live",
+        )
+
+    def list_sessions_for_host(self, host_id: str) -> list[RegistrySessionRecord]:
+        if host_id != self.host_id:
+            return []
+        return list(self.rows.values())
+
+    def upsert_session(self, record: RegistrySessionRecord) -> None:
+        self.rows[record.tmux_name] = record
+        self.written.append(record)
+
+
+def await_output_timeout_elapsed(
+    adapter: TmuxAdapter, name: str, seconds: float, *, timeout: float | None = None
+) -> None:
+    """Poll ``name``'s real `window_activity_max` until it reads more than ``seconds`` old.
+
+    Section 3.7's mechanism, in one place: every tmux-lane reaper criterion injects a tiny
+    `Reaper(timeout=...)` and then waits for a REAL tmux timestamp to cross it -- never a
+    `sleep()`. The wall-clock delay this incurs is a side effect of the poll succeeding, not
+    of this function sleeping for a duration and then asserting.
+    """
+    await_condition(
+        lambda: (time.time() - (adapter.window_activity_max(name) or 0)) > seconds,
+        timeout=timeout if timeout is not None else seconds + 15,
+        what=f"{name!r}'s window_activity_max to read more than {seconds}s old",
+    )

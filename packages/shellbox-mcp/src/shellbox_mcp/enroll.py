@@ -44,6 +44,7 @@ from datetime import UTC, datetime
 from shellbox_registry import HostRecord, Registry, SessionRecord
 
 from shellbox_mcp import identity, naming
+from shellbox_mcp.reaper import Reaper
 from shellbox_mcp.tmux import TmuxAdapter
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,12 @@ __all__ = [
 
 STATUS_ACTIVE = "active"
 STATUS_ORPHANED = "orphaned"
+# `W48`: matches the bare literal `shell_kill` (`server.py:722`) and the reaper (`reaper.py`,
+# `W41`) both already write. Named here, beside `STATUS_ORPHANED`, purely so this module's own
+# guard below can compare against a name instead of a repeated literal -- `server.py` and
+# `reaper.py` keep writing the bare string, which crosses no module boundary and changes no
+# behaviour (`R72`).
+STATUS_REAPED = "reaped"
 
 # E7. Short enough that Phase 5's staleness sweep sees a live host as live, long enough that
 # 32 processes heartbeating do not become a write load of their own.
@@ -304,7 +311,11 @@ def reconcile_orphans(
 
     orphaned = 0
     for row in rows:
-        if row.status == STATUS_ORPHANED or row.tmux_name in live:
+        # `W48`: `reaped` is TERMINAL, exactly like `orphaned` already is here. Without this,
+        # the pass right after a reap finds the row absent from `live` (the session is gone --
+        # the reaper just killed it) and rewrites it `orphaned`, erasing the one fact the row
+        # was carrying: shellbox ended this session ON PURPOSE (`R72`, `A26`).
+        if row.status in (STATUS_ORPHANED, STATUS_REAPED) or row.tmux_name in live:
             continue
         try:
             registry.upsert_session(
@@ -581,6 +592,9 @@ def start_enrollment(
     gateway_host: str | None = None,
     env_email: str | None = None,
     heartbeat: bool = True,
+    reap_timeout_seconds: float | None = None,
+    reap_interval_seconds: float | None = None,
+    reaper_adapter_factory: Callable[[], TmuxAdapter] | None = None,
 ) -> threading.Thread:
     """Run enrollment on a daemon thread and start the heartbeat if it succeeded.
 
@@ -591,6 +605,18 @@ def start_enrollment(
     failed handshake, with no indication that the cause was an inventory write.
 
     Returns the thread so a test can join it. Nothing on the tool path ever does.
+
+    ``reap_timeout_seconds``/``reap_interval_seconds`` are the ONE call site (`W41`) that turns
+    `Settings.idle_timeout_seconds`/`reap_interval_seconds` into `Reaper`'s constructor
+    parameters -- `caller` (`server.py`) resolves them from the environment once, and this
+    function only ever sees plain values, never `Settings` itself. Leaving either `None` (the
+    default, and every existing caller's behaviour) starts no `Reaper` at all, which is what
+    lets tests that construct `start_enrollment` for `Heartbeat` alone keep working unchanged.
+
+    ``reaper_adapter_factory`` is separate from ``adapter_factory`` because the reaper's own
+    tmux calls must be bounded (`ADR-37`/`R69`) while every other adapter this module builds
+    stays unbounded -- `adapter_factory` is reused as a fallback only when the caller has no
+    reason to tell the two apart (e.g. a test).
     """
 
     def run() -> None:
@@ -620,6 +646,17 @@ def start_enrollment(
             sandbox_id=sandbox_id,
             gateway_host=gateway_host,
         ).start()
+        # `W41`: same guard as `Heartbeat`, above -- accepted coupling, not renamed. No clock-2
+        # election (`ADR-26`): every enrolled process on this host runs its own `Reaper`, and
+        # `ADR-28`'s "what absorbs the concurrent-reap race" section is why that is safe.
+        if reap_timeout_seconds is not None and reap_interval_seconds is not None:
+            Reaper(
+                registry,
+                reaper_adapter_factory or adapter_factory,
+                host_id=host_id,
+                timeout=reap_timeout_seconds,
+                interval=reap_interval_seconds,
+            ).start()
 
     thread = threading.Thread(target=run, name="shellbox-enroll", daemon=True)
     thread.start()

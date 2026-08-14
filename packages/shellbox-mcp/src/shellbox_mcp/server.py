@@ -53,6 +53,7 @@ from shellbox_mcp.errors import (
     TmuxUnavailable,
     public_code,
 )
+from shellbox_mcp.reaper import TMUX_CALL_TIMEOUT_SECONDS
 from shellbox_mcp.tmux import SessionRecord, TmuxAdapter
 
 logger = logging.getLogger(__name__)
@@ -499,6 +500,24 @@ def build_server(
             )
         return None
 
+    def record_read(name: str) -> None:
+        """W39: mark that `name`'s pane was just read, via `Registry.touch_read`.
+
+        Same non-fatal shape as `project`: never raises, a failure is a log line, and the
+        result is discarded rather than surfaced -- `ReadResult` gets no new field, matching
+        how `SendResult` already ignores `project()`'s return value at the `shell_send` call
+        site. Registry failure may never break a tool call (`base.py`).
+        """
+        try:
+            store.touch_read(session_id(name), datetime.now(UTC))
+        except Exception as exc:  # noqa: BLE001 -- see the docstring: this may not raise
+            logger.warning(
+                "registry touch_read failed for session %s: %s",
+                session_id(name),
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+
     def session_row(
         tmux_name: str,
         status: str,
@@ -605,6 +624,8 @@ def build_server(
         discipline would drop such a line on macOS and would TRUNCATE it on Linux. A
         truncated command is a different command, and it still runs.
 
+        A send counts as activity, so a session you are already driving needs no extra reads.
+
         Errors: not_found | no_payload | invalid_key | too_large | line_too_long |
         invalid_name | tmux_unavailable | tmux_error.
         """
@@ -643,11 +664,16 @@ def build_server(
         `lines: N` and `scrollback_lines` is less than N, you received everything that
         exists. tmux never truncates a capture, so there is no `truncated` field to trust.
 
+        This tool records the read. A session neither read nor sent to for long enough can
+        be reaped -- 25 minutes at the default, which an operator can change -- so read a
+        long unattended job at least that often.
+
         Errors: not_found | invalid_name | invalid_dimensions | tmux_unavailable |
         tmux_error.
         """
         name = tmux_name_of(session)
         result = adapter().read(name, lines=lines)
+        record_read(name)
         return ReadResult(
             session=session_id(result.tmux_name),
             tmux_name=result.tmux_name,
@@ -806,6 +832,14 @@ def serve(settings: Settings | None = None) -> None:
             sandbox_id=identified.sandbox_id,
             gateway_host=identified.gateway_host,
             env_email=resolved.owner_email,
+            # `W41`: the one call site that turns `Settings` into `Reaper`'s constructor
+            # parameters. The reaper's adapter is bounded (`ADR-37`/`R69`); every other
+            # adapter this process builds, including `adapter_factory` above, is not.
+            reap_timeout_seconds=resolved.idle_timeout_seconds,
+            reap_interval_seconds=resolved.reap_interval_seconds,
+            reaper_adapter_factory=lambda: TmuxAdapter(
+                resolved.tmux_config(timeout=TMUX_CALL_TIMEOUT_SECONDS)
+            ),
         )
 
     server.run()

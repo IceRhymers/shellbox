@@ -7,7 +7,9 @@ which is out of scope here. This module only ever receives a DSN and connects.
 
 from __future__ import annotations
 
-from sqlalchemy import create_engine, func, select
+from datetime import datetime
+
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session as OrmSession
@@ -161,6 +163,23 @@ class PostgresRegistry(Registry):
                 ),
                 "status": stmt.excluded.status,
             },
+        )
+        with self._engine.begin() as conn:
+            conn.execute(stmt)
+
+    def touch_read(self, session_id: str, when: datetime) -> None:
+        # CRITICAL: an UPDATE, never an upsert/insert-shaped call. `session_id` may name no
+        # existing row (a session with no registry row, e.g. an unresolved owner_email or a
+        # NullRegistry-era session), and matching zero rows must be a silent no-op -- see the
+        # protocol docstring in `base.py` for why an insert here would be a safety regression.
+        #
+        # GREATEST is doing the same two jobs it does in `upsert_session`, and the comment there
+        # (`upsert_session`, above) covers both: it cannot move the timestamp backwards, and it
+        # ignores a NULL `last_read_at` so the first read stores `when` rather than NULL.
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.session_id == session_id)
+            .values(last_read_at=func.greatest(when, SessionModel.last_read_at))
         )
         with self._engine.begin() as conn:
             conn.execute(stmt)

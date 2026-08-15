@@ -47,6 +47,62 @@ from the App container to the sandbox gateway fails with `[Errno 113] No route t
 host` in 1 ms. Every design where the App reaches in is dead, which is why the
 sandbox dials out and why `App→SSH→tmux attach` is excluded twice over.
 
+## ADR-39: the registry is the trust boundary, and it cannot be subdivided
+
+**A registry is one trust domain.** Every host, agent, and viewer that shares one can reach
+every session in it. So run **one registry per trust domain**, and enable shellbox only where
+all of them are mutually trusted.
+
+Nothing here is new behaviour. Three decisions already recorded separately compose into a
+consequence none of them states on its own, and this ADR is that consequence.
+
+| Already recorded | What it says |
+|---|---|
+| `D5` | `X-Forwarded-Email` is identity **display**, never authorization. Both inventory routes return the same rows whatever the header says. |
+| `D6` | Access is **default-open**: the App is reachable by every workspace user, and the inventory is the product rather than a per-viewer secret. |
+| `R6` | `owner_email` is **forgeable**. It is stamped by the host from a credential that authenticates as the sandbox's *creator* — a confused deputy that, on the measured sandbox, belongs to a workspace admin. |
+
+The consequence: **any workspace user the edge admits can attach to any session by id and type
+into it.** `serve_subscriber` in
+[`server.py`](../packages/shellbox-app/src/shellbox_app/server.py) relays the subscriber's input
+to the publisher, and the only refusals on that path are `publisher_conflict` and
+`subscriber_conflict` — concurrency, not authorization. The `owner_email` label that might let a
+viewer self-select is itself `R6`-forgeable, so it cannot be hardened into a filter either.
+
+`viewer_owns` in [`inventory.py`](../packages/shellbox-app/src/shellbox_app/inventory.py) exists
+for the `mine` label "and nothing else", and the query layer's `list_hosts(owner_email=...)`
+filter is deliberately left unused by the App. Both are `D6` working as designed, not gaps.
+
+### Why this is forced rather than deferred out of laziness
+
+`shellbox_app/__init__.py` records the reason: **an authorization rule here needs a credential
+from outside the App.** Without an on-behalf-of token, `current_user.me()` returns the App's own
+service principal, so the App cannot distinguish one workspace user from another by any means
+the Apps runtime provides. The edge-injected header is all there is, and a header the App cannot
+verify is not a permission check. That is the same shape as the impossibility above: a platform
+constraint, measured, not a design preference.
+
+What *is* enforced today, so this ADR does not overclaim in the other direction: the App's
+service principal is **SELECT-only** on the registry (`A15`), asserted by
+[`test_grant_scope.py`](../tests/unit/test_grant_scope.py),
+[`test_no_app_writes.py`](../tests/unit/test_no_app_writes.py), and
+[`test_grant_enforcement.py`](../tests/registry/test_grant_enforcement.py). The gap is
+specifically **authorization between hosts**, not authentication in general — the edge still
+authenticates every request that reaches the App.
+
+### Consequences
+
+- **shellbox stays optional in every integration.** A tool that needs no infra must not acquire
+  a dependency on infra plus a trust precondition. This is what shapes the Buzz work: `ADR-38`
+  in [`registration.md`](registration.md) records that buzz-lakebox gains only generic,
+  content-blind extension points and never learns what shellbox is.
+- **Do not point two trust domains at one registry.** Merging them is structural, and no
+  configuration undoes it.
+- **Superseded by [#7](https://github.com/IceRhymers/shellbox/issues/7)** (ACL enforcement and
+  per-host enrollment tokens). Per `R6` that work must replace the host-side `owner_email` stamp
+  with a per-host enrollment token; hardening the read path alone would authorize against a
+  value the host can forge.
+
 ## What each remaining phase must do differently
 
 ### Phase 2 — session plane

@@ -94,7 +94,7 @@ Cite these freely. Their authority is committed.
 | `E1`-`E7` | A step of the enrollment sequence | The module docstring of [`enroll.py`](../packages/shellbox-mcp/src/shellbox_mcp/enroll.py), which lists all seven |
 | `N1` | The tmux-stderr classification table | `STDERR_SIGNATURES` in [`errors.py`](../packages/shellbox-mcp/src/shellbox_mcp/errors.py) |
 | `T-RESTART`, `T-CONC-1`-`T-CONC-3` | A named acceptance test | [`tests/integration/`](../tests/integration/) |
-| `D1`-`D10` | A design decision from the epic | [Issue #9](https://github.com/IceRhymers/shellbox/issues/9) |
+| `D1`-`D10` | A design decision from the epic. Six are cited in committed code: `D1` reserves a path for provisioning, `D4` resolves `owner_email` from the sandbox's baked creator credential, `D5` makes `X-Forwarded-Email` display-only and never authorization, `D6` leaves access default-open to every workspace user, `D7` makes resume live-stream-only with no frame log, `D10` makes vendoring a static tmux binary optional | [Issue #9](https://github.com/IceRhymers/shellbox/issues/9). `D5` and `D6` compose with `R6` into `ADR-39`, the trust boundary — see [`docs/architecture.md`](architecture.md), which is committed |
 
 WARNING: `F1`, `F12`, and `F13` are also tmux function-key names in the send allowlist. In
 [`keys.py`](../packages/shellbox-mcp/src/shellbox_mcp/keys.py) and
@@ -213,11 +213,15 @@ so the committed authority below is the whole record rather than a pointer into 
 work lands mostly in `IceRhymers/buzz-lakebox`, a different repository, which is why this range
 is short and why its authority is a doc rather than a module.
 
+`ADR-39` is in this range because the Buzz work surfaced it, not because it is about Buzz. It
+states a property of shellbox itself, and it is what makes shellbox optional in any integration.
+
 The **never renumbered, never reused** rule from Phase 5 applies here too.
 
 | Family | Means | Nearest committed authority |
 |---|---|---|
 | `ADR-38` | The single-MCP-slot decision is **per-runtime, not global**: displace the slot on the `claude` runtime, which leaves it empty; proxy on `buzz-agent` and `codex`, where displacing strips the agent's only tool path. Also records the three constraints that bind any such deployment — `inference_auth: "env"`, an absolute path in `BUZZ_ACP_MCP_COMMAND`, and the whole-environment inheritance that makes installing an MCP server a credential-scope decision. The env hop differs per runtime: inherited whole on `claude` (the one measured claim), cleared to an allowlist on `buzz-agent`, which is why that runtime needs a wrapper script rather than a change to `shellbox-mcp` | The `ADR-38` section of [`docs/registration.md`](registration.md) |
+| `ADR-39` | **A registry is one trust domain, and it cannot be subdivided.** Any workspace user the App's edge admits can attach to any session in that registry and type into it; the `owner_email` beside it is a forgeable label, not a boundary. Records that this follows from `D5` (display-only identity), `D6` (default-open access), and `R6` (a forgeable owner stamp) rather than being new, that the App cannot close it alone because an authorization rule needs a credential the Apps runtime does not provide, and that what *is* enforced is the renderer's SELECT-only grant (`A15`). Run one registry per trust domain; this is why shellbox stays optional in every integration. Superseded by [#7](https://github.com/IceRhymers/shellbox/issues/7) | The `ADR-39` section of [`docs/architecture.md`](architecture.md), with the operator-facing half in [`README.md`](../README.md) |
 
 ## Writing a new reference
 

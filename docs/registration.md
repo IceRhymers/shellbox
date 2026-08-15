@@ -282,29 +282,68 @@ also the default. It takes **no flags** — `config.py` reads every setting from
 environment (plan §5). This is deliberate, not an oversight, and the reason is a
 different harness entirely: **Buzz**.
 
-`buzz-acp`'s `build_mcp_servers` returns **at most one** `McpServer` for the
-`buzz-agent` runtime, constructed with `args: vec![]`. There is no way to hand it
-additional CLI arguments. `BUZZ_ACP_MCP_COMMAND` is also a reserved configuration
-key. For that runtime, `buzz-dev-mcp` already occupies the single MCP server slot.
-Consequently:
+`buzz-acp`'s `build_mcp_servers` returns **at most one** `McpServer`, constructed with
+`args: vec![]`. There is no way to hand it additional CLI arguments. So any design for
+`shellbox-mcp` that required a CLI flag could **never** register under Buzz, regardless
+of how that flag was spelled. The slot does not exist to put it in.
 
-- Any design for `shellbox-mcp` that required a CLI flag to configure could **never**
-  register under Buzz, regardless of how that flag was spelled. The slot doesn't
-  exist to put it in.
-- Even with a zero-args design, `shellbox-mcp` **cannot occupy that one slot today**,
-  because `buzz-dev-mcp` already does. Getting shellbox-mcp running under
-  `buzz-agent` is **out of scope here and deferred to
-  [issue #6](https://github.com/IceRhymers/shellbox/issues/6)**. It needs a change on
-  the Buzz side — either a second slot, or composing multiple MCP servers behind one
-  process. `shellbox-mcp` cannot make that change unilaterally.
-- The env-only design is what keeps that a Buzz-side problem instead of a shellbox
-  problem: `{"command": "shellbox-mcp", "args": []}` is already exactly the shape
-  `buzz-acp` can express. The day Buzz can offer shellbox-mcp a slot, no changes are
-  needed here — only environment variables need to be threaded through.
+That constraint holds. Two claims that followed from it did not, and `ADR-38` records
+what replaced them.
 
-No Buzz installation was available to test against directly. The constraint above is
-sourced from `buzz-acp`'s own source (`crates/buzz-acp/src/lib.rs`, per the plan §4).
-It is documented rather than exercised.
+### ADR-38: the slot decision is per-runtime, not global
+
+An earlier revision of this section said `shellbox-mcp` **cannot occupy that one slot
+today**, and that a change on the Buzz side had to land first. Both claims read
+`buzz-acp` alone. Reading the deployment vehicle corrects them —
+`IceRhymers/buzz-lakebox` at `89f1945e`:
+
+- **buzz-lakebox can override `BUZZ_ACP_MCP_COMMAND`.** The provider renders
+  `agent.env_vars` after every variable it emits, and `internal/nest/nest.go` names that
+  override as a supported escape hatch. The later line wins.
+- **buzz-lakebox drives three runtimes, and one leaves the slot empty.** The shape table
+  in `internal/payload/runtime.go` gives `RuntimeClaude` no `StdioMCPCommand`, so the
+  provider emits no `BUZZ_ACP_MCP_COMMAND` for that runtime.
+
+The decision therefore splits by runtime:
+
+| Runtime | Slot today | Decision |
+|---|---|---|
+| `claude` | Empty | Displace. No conflict exists. |
+| `buzz-agent` | `buzz-dev-mcp` | Proxy. Displacing breaks the agent. |
+| `codex` | `buzz-dev-mcp` | Proxy, for a different cause. |
+
+Displacing on `buzz-agent` is not a tradeoff. `nest.go` records that an agent with
+`mcpServers:[]` has no tools and no `buzz messages send` path. It looks alive and stays
+permanently silent. Codex fails the same way for a different cause: its tool calls run
+under a sandbox with `networkAccess:false`, so only the MCP subprocess reaches the relay.
+
+Two constraints bind any shellbox deployment under Buzz:
+
+- **The credential posture is fixed.** `BUZZ_ACP_MCP_COMMAND` sits in
+  `ownerPATForbiddenEnvKeys` (`internal/payload/payload.go`). buzz-lakebox refuses the
+  key whenever the sandbox holds a workspace-owner credential, because the key decides
+  what code runs beside that credential. A shellbox deployment must therefore run
+  `inference_auth: "env"` and supply its own `DATABRICKS_HOST` and `DATABRICKS_TOKEN`.
+- **Pass an absolute path.** `PATH` sits on the same forbidden list, and `buzz-acp`
+  derives the MCP server's name from the command's file stem.
+
+The env-only design is what keeps the first runtime cheap. `{"command": "shellbox-mcp",
+"args": []}` is already exactly the shape `buzz-acp` can express, so the `claude` path
+needs no shellbox code — only `agent.env_vars` wiring in buzz-lakebox. That same map
+carries `SHELLBOX_DATABASE_URL` and `SHELLBOX_OWNER_EMAIL`, which `buzz-acp`'s own env
+allowlist cannot.
+
+No Buzz installation was available to test against directly. Every claim here comes from
+reading source at two commits — `buzz-lakebox` at `89f1945e` and `block/buzz` at
+`82f7ed15` — so none of it is measured end to end. buzz-lakebox reports a live check of
+the empty `claude` slot in `nest.go`; that check is its own, not this repo's. Only `main`
+is indexed for `block/buzz`, so upstream branches stayed out of view.
+
+The proxy for `buzz-agent` and `codex` carries further contract constraints, around tool
+naming, the `_Stop` and `_PostCompact` hook tools, and forwarding `buzz-acp`'s injected
+env to the `buzz-dev-mcp` child. This revision did not verify them. They need their own
+pass before anyone writes the wrapper. Tracking:
+[issue #6](https://github.com/IceRhymers/shellbox/issues/6).
 
 ## Configuration reference
 

@@ -206,6 +206,19 @@ old review can resolve it here instead of guessing it was a typo.
 | `R61` | Withdrawn | "`W48` recreates a session that was reaped on purpose" — `W48`'s recreation part is cut, so no code path recreates a session from any row. The fact it protected survives as `R72`. |
 | `R53b` | Retired token | The letter-suffixed form is banned. Its content moved verbatim to `R65`, a new number, rather than being lost. |
 
+### Phase 6 families — Buzz integration
+
+Phase 6 makes `shellbox-mcp` reachable from Buzz. It has no gitignored plan document behind it,
+so the committed authority below is the whole record rather than a pointer into one. The phase's
+work lands mostly in `IceRhymers/buzz-lakebox`, a different repository, which is why this range
+is short and why its authority is a doc rather than a module.
+
+The **never renumbered, never reused** rule from Phase 5 applies here too.
+
+| Family | Means | Nearest committed authority |
+|---|---|---|
+| `ADR-38` | The single-MCP-slot decision is **per-runtime, not global**: displace the slot on the `claude` runtime, which leaves it empty; proxy on `buzz-agent` and `codex`, where displacing strips the agent's only tool path. Also records the two constraints that bind any such deployment — `inference_auth: "env"`, and an absolute path in `BUZZ_ACP_MCP_COMMAND` | The `ADR-38` section of [`docs/registration.md`](registration.md) |
+
 ## Writing a new reference
 
 - Prefer a repo-relative path and a symbol over an identifier.

@@ -63,6 +63,36 @@ job ([#5](https://github.com/IceRhymers/shellbox/issues/5)). Phase 2 records the
 at enrolment and warns when autostop is enabled, so the condition is visible rather than
 mysterious.
 
+## Who can reach a session
+
+The second thing to understand before relying on shellbox, and the one that decides where you may
+deploy it.
+
+**A registry is one trust domain.** Any workspace user the App's edge admits can attach to **any**
+session in that registry and type into it. Not only see it — attach and drive it. There is no
+per-host or per-owner rule on that path.
+
+The `owner_email` shown beside a session is a **label, not a boundary**. It is stamped by the host
+itself, from a credential that authenticates as the sandbox's creator, so an agent can forge it.
+
+So:
+
+- **Run one registry per trust domain.** Do not share one across teams or tenants. Merging two is
+  structural, and no configuration undoes it.
+- **Enable shellbox only where every host, agent, and viewer sharing that registry is mutually
+  trusted.** That is what makes shellbox optional wherever it is integrated.
+
+This is deliberate and recorded, not an oversight — see `ADR-39` in
+[`docs/architecture.md`](docs/architecture.md) for how it follows from three earlier decisions, and
+why the App cannot fix it alone: an authorization rule needs a credential the Apps runtime does not
+give it. Closing the gap is
+[#7](https://github.com/IceRhymers/shellbox/issues/7), which must replace the forgeable
+host-side stamp with a per-host enrollment token rather than filtering on it.
+
+What *is* enforced: the App's service principal is SELECT-only on the registry, so the renderer
+cannot write to it. The gap is authorization **between hosts**, not authentication — the edge still
+authenticates every request.
+
 ## Corrections to issue #2
 
 Someone wrote [issue #2](https://github.com/IceRhymers/shellbox/issues/2) before the Phase 1

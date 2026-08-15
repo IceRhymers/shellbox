@@ -317,7 +317,7 @@ Displacing on `buzz-agent` is not a tradeoff. `nest.go` records that an agent wi
 permanently silent. Codex fails the same way for a different cause: its tool calls run
 under a sandbox with `networkAccess:false`, so only the MCP subprocess reaches the relay.
 
-Two constraints bind any shellbox deployment under Buzz:
+Three constraints bind any shellbox deployment under Buzz:
 
 - **The credential posture is fixed.** `BUZZ_ACP_MCP_COMMAND` sits in
   `ownerPATForbiddenEnvKeys` (`internal/payload/payload.go`). buzz-lakebox refuses the
@@ -326,23 +326,101 @@ Two constraints bind any shellbox deployment under Buzz:
   `inference_auth: "env"` and supply its own `DATABRICKS_HOST` and `DATABRICKS_TOKEN`.
 - **Pass an absolute path.** `PATH` sits on the same forbidden list, and `buzz-acp`
   derives the MCP server's name from the command's file stem.
+- **The MCP server sees the whole parent environment on the `claude` runtime.** That is
+  how `SHELLBOX_*` arrives, and it also means `shellbox-mcp` sees the agent's inference
+  credentials and relay tokens. Installing an MCP server here is a credential-scope
+  decision, not only a tooling one.
 
 The env-only design is what keeps the first runtime cheap. `{"command": "shellbox-mcp",
 "args": []}` is already exactly the shape `buzz-acp` can express, so the `claude` path
 needs no shellbox code — only `agent.env_vars` wiring in buzz-lakebox. That same map
-carries `SHELLBOX_DATABASE_URL` and `SHELLBOX_OWNER_EMAIL`, which `buzz-acp`'s own env
-allowlist cannot.
+carries `SHELLBOX_DATABASE_URL` and `SHELLBOX_OWNER_EMAIL`.
 
-No Buzz installation was available to test against directly. Every claim here comes from
+### The env hop, per runtime
+
+`agent.env_vars` puts a variable in the sandbox's env file, and `launch.sh` sources it
+before it starts `buzz-acp`. Whether the variable survives the last hop into
+`shellbox-mcp` depends on **who spawns the MCP child**, and the three runtimes differ:
+
+| Runtime | Spawns the MCP child | Ambient environment |
+|---|---|---|
+| `claude` | `claude-agent-acp` → the Claude Agent SDK | Inherited whole (measured) |
+| `buzz-agent` | `McpRegistry::spawn_all` | `env_clear()`, then a hardcoded allowlist |
+| `codex` | `codex-acp` | Not tested |
+
+`buzz-agent` calls `env_clear()` and re-adds only a compile-time `PASSTHROUGH_ENV` const
+(`crates/buzz-agent/src/mcp.rs`). It has no wildcard and no widening knob, so **no
+`SHELLBOX_*` variable reaches an MCP child on that runtime.** `HOME` does pass through,
+so `SHELLBOX_STATE_DIR` still defaults to `~/.shellbox` and the shell tools still work.
+What breaks is enrollment: without `SHELLBOX_DATABASE_URL` the host never registers, and
+`shellbox-app` renders none of its sessions. Registry failure is non-fatal by design
+(`R7`), so this degrades rather than fails.
+
+The fix for that runtime is a **wrapper script**, not a change to `shellbox-mcp`.
+`BUZZ_ACP_MCP_COMMAND` is a path, so a script at that path can read an env file under
+`$HOME` and `exec` the real binary. This keeps the env-only interface exactly as described
+above; something else populates the environment. Teaching `shellbox-mcp` to read a config
+file was considered and rejected, because it would add a second configuration surface and
+contradict plan §5.
+
+### Constraints on the proxy
+
+These bind the `buzz-agent` and `codex` wrapper, and each one was read from
+`crates/buzz-agent`. The first two are the surprises:
+
+- **`__` is banned in a bare tool name**, and in a server name. It is a hard error that
+  fails the whole `session/new`, not a skipped tool. So the conventional MCP-proxy naming
+  scheme, `child__tool`, is illegal. Disambiguate with a single underscore or a hyphen.
+- **A qualified name is capped at 64 bytes**, counted including the `{server}__` prefix.
+  A long proxy binary name therefore spends budget from every tool it re-exports.
+- **The tool catalog freezes at spawn.** `tools/list_changed` is not honoured, so the
+  proxy must hold both children's catalogs complete before it answers `tools/list`. A
+  late-arriving tool stays invisible for the session.
+- **A tool schema over 4096 bytes is silently replaced with `{}`.**
+- **`buzz-dev-mcp`'s `shell` tool must keep that exact bare name.** The reply guard
+  matches the suffix `__shell` on the qualified name, so the server component may change
+  freely. Renaming the bare tool costs up to two spurious nag rounds; it does not drop the
+  reply.
+- **Re-export `_Stop` and `_PostCompact` under those exact names.** Hook dispatch gates on
+  the *server* name, and buzz-lakebox emits `MCP_HOOK_SERVERS="*"`, which matches any
+  server name. Two consecutive hook timeouts kill the whole process group.
+- **Forward the injected environment down to the child.** `buzz-acp` declares only
+  `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`, and `BUZZ_ACP_DISPLAY_NAME`, and
+  `buzz-dev-mcp` reads them from its own process environment.
+
+`initialize` and `tools/list` each get their own 30-second budget, so spawning two
+children serially is unlikely to trip either.
+
+### What was measured, and what was only read
+
+No Buzz installation was available to test against. Almost every claim above comes from
 reading source at two commits — `buzz-lakebox` at `89f1945e` and `block/buzz` at
-`82f7ed15` — so none of it is measured end to end. buzz-lakebox reports a live check of
-the empty `claude` slot in `nest.go`; that check is its own, not this repo's. Only `main`
-is indexed for `block/buzz`, so upstream branches stayed out of view.
+`82f7ed15`. Only `main` is indexed for `block/buzz`, so upstream branches stayed out of
+view. buzz-lakebox reports its own live check of the empty `claude` slot in `nest.go`;
+that check is its, not this repo's.
 
-The proxy for `buzz-agent` and `codex` carries further contract constraints, around tool
-naming, the `_Stop` and `_PostCompact` hook tools, and forwarding `buzz-acp`'s injected
-env to the `buzz-dev-mcp` child. This revision did not verify them. They need their own
-pass before anyone writes the wrapper. Tracking:
+**One claim is measured.** The `claude` row of the env table was tested on this repo's
+development machine, because the whole `claude` decision rests on it:
+
+- A stdio MCP server that dumps its own environment was registered with Claude Code
+  2.1.233, through `--mcp-config` and `--strict-mcp-config`.
+- A variable set only in the parent shell appeared in the child's environment, alongside
+  67 others. The dump carried `CLAUDE_CODE_ENTRYPOINT=sdk-cli`, which is the Agent SDK
+  path that `claude-agent-acp` uses.
+- Conclusion: Claude Code inherits the parent environment whole for a stdio MCP child. It
+  does **not** apply the MCP TypeScript SDK's default env allowlist.
+
+Two gaps in that chain remain open, and neither is closed by inference:
+
+- The test used Claude Code directly, not `@agentclientprotocol/claude-agent-acp` 0.63.0,
+  the version buzz-lakebox pins (`internal/install/adapter.go`). That adapter's own
+  handling is a pass-through — it forwards the ACP spec as `{type, command, args, env}`
+  with `env` unset when ACP supplies none — so only the SDK build it wraps is unverified.
+- The hop from `buzz-acp` into the adapter was not measured. buzz-lakebox's own
+  `ANTHROPIC_BASE_URL` mechanism depends on that hop inheriting, which is good evidence
+  and not a test.
+
+The `codex` row is untested. Tracking:
 [issue #6](https://github.com/IceRhymers/shellbox/issues/6).
 
 ## Configuration reference

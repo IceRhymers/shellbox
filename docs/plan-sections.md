@@ -217,7 +217,7 @@ The **never renumbered, never reused** rule from Phase 5 applies here too.
 
 | Family | Means | Nearest committed authority |
 |---|---|---|
-| `ADR-38` | The single-MCP-slot decision is **per-runtime, not global**: displace the slot on the `claude` runtime, which leaves it empty; proxy on `buzz-agent` and `codex`, where displacing strips the agent's only tool path. Also records the two constraints that bind any such deployment — `inference_auth: "env"`, and an absolute path in `BUZZ_ACP_MCP_COMMAND` | The `ADR-38` section of [`docs/registration.md`](registration.md) |
+| `ADR-38` | The single-MCP-slot decision is **per-runtime, not global**: displace the slot on the `claude` runtime, which leaves it empty; proxy on `buzz-agent` and `codex`, where displacing strips the agent's only tool path. Also records the three constraints that bind any such deployment — `inference_auth: "env"`, an absolute path in `BUZZ_ACP_MCP_COMMAND`, and the whole-environment inheritance that makes installing an MCP server a credential-scope decision. The env hop differs per runtime: inherited whole on `claude` (the one measured claim), cleared to an allowlist on `buzz-agent`, which is why that runtime needs a wrapper script rather than a change to `shellbox-mcp` | The `ADR-38` section of [`docs/registration.md`](registration.md) |
 
 ## Writing a new reference
 

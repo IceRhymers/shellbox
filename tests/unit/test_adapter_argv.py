@@ -796,3 +796,64 @@ def test_read_refuses_a_session_with_an_empty_incarnation() -> None:
     # would pass this test for the wrong reason and fail it for another.
     verbs_run = [argv for argv in runner.argvs if "capture-pane" in argv]
     assert verbs_run == [], f"read captured a pane it had refused: {verbs_run}"
+
+
+# --------------------------------------------------------------------------------------
+# window_activity_max (W52) -- the return contract, most of which is a defect avoided
+# --------------------------------------------------------------------------------------
+
+
+def test_window_activity_max_uses_list_windows_with_the_anchored_target() -> None:
+    """A brand new verb, not a ``LIST_FIELDS`` entry -- see ``tmux.py`` for why."""
+    runner = RecordingRunner(results=[result(rc=0, stdout="12345\n")])
+    adapter(runner).window_activity_max("build")
+    argv = _after_verb(runner.sub_argv("list-windows"), "list-windows")
+    assert argv[argv.index("-t") + 1] == "=build:"
+    assert argv[argv.index("-F") + 1] == "#{window_activity}"
+
+
+def test_window_activity_max_returns_the_maximum_across_windows() -> None:
+    runner = RecordingRunner(results=[result(rc=0, stdout="100\n300\n200\n")])
+    assert adapter(runner).window_activity_max("build") == 300
+
+
+def test_window_activity_max_empty_list_windows_returns_none_not_zero() -> None:
+    """CRITICAL: The defect this contract exists to prevent.
+
+    ``max(int(l) for l in lines)`` would raise on empty; the natural "fix",
+    ``max(..., default=0)``, returns 0 -- the Unix epoch, which reads as "infinitely idle" and
+    would authorise a kill on missing evidence (``ADR-36``). The return VALUE itself must be
+    ``None``, not merely some downstream "not reaped" outcome.
+    """
+    runner = RecordingRunner(results=[result(rc=0, stdout="")])
+    assert adapter(runner).window_activity_max("build") is None
+
+
+def test_window_activity_max_an_unparseable_line_returns_none() -> None:
+    """An unparseable answer is not an answer -- never a partial max over the parseable rest."""
+    runner = RecordingRunner(results=[result(rc=0, stdout="100\nnot-a-number\n200\n")])
+    assert adapter(runner).window_activity_max("build") is None
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "can't find session: build",
+        "no server running on /tmp/sbx",
+        "error connecting to /tmp/sbx (No such file or directory)",
+    ],
+)
+def test_window_activity_max_session_not_found_returns_none(stderr: str) -> None:
+    """Mirrors ``exists``: a classifiable not_found/no_server stderr is ``None``, not a raise."""
+    runner = RecordingRunner(default=result(rc=1, stderr=stderr))
+    assert adapter(runner).window_activity_max("build") is None
+
+
+def test_window_activity_max_unclassified_stderr_raises() -> None:
+    """The unmeasured assumption's safe direction: an unexpected failure must not be swallowed
+    into a silent 'no evidence' -- it must raise, so the per-session guard catches it and the
+    session is not reaped on the strength of an error shellbox misread as an empty answer.
+    """
+    runner = RecordingRunner(default=result(rc=1, stderr="some unknown tmux failure"))
+    with pytest.raises(TmuxError):
+        adapter(runner).window_activity_max("build")

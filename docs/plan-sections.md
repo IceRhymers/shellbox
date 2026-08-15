@@ -143,6 +143,69 @@ to pip and Python 3.11. [`deploy-app.sh`](../scripts/deploy-app.sh) asserts the 
 section 1 of [`docs/deploy.md`](deploy.md) is the current description. The ADR's *conclusion* — the
 deployed artifact needs its own assertion, separate from the lockfile lane — still holds.
 
+### Phase 5 families — the idle reaper and host staleness
+
+These point into `.omc/plans/phase-5-lifecycle-r5.md`, which is gitignored like the Phase 2 plans
+above. The number ranges do not overlap any earlier phase's on purpose: a bare `W49` or `R65` is
+unambiguous across the whole repo, so a reader who finds one in a module docstring needs only this
+table.
+
+Phase 5, like Phase 4, uses **no `§` numbering at all** — it is organised by these families instead.
+
+**Identifiers are never renumbered or reused.** A withdrawn item stays withdrawn, with a reason, and
+a withdrawn number is never reissued. Each range below is declared in full — live members and
+withdrawn ones together — so a reader who finds a withdrawn identifier cited in an old branch or an
+old review can resolve it here instead of guessing it was a typo.
+
+| Family | Means | Nearest committed authority |
+|---|---|---|
+| `W39`-`W53` | A unit of Phase 5 work. **Live (10):** `W39` is `Registry.touch_read` and the `shell_read`/`shell_send` docstring update. `W41` is the `Reaper` thread and `sweep()` — clock 1. `W45` is clock 3, `heartbeat_stale` in `host_payload`. `W46` is the two config keys and their bounded resolver. `W48` makes `reaped` terminal against reconciliation. `W49` is this section. `W50` is the live acceptance run. `W51` re-measures the tmux activity signal and gates `W41`. `W52` is `window_activity_max`, a new `TmuxAdapter` method. `W53` is the observability start line and per-sweep logging. `W40` is not in this graph in either direction: it survives outside it as an optional measurement that scopes a future phase and gates nothing. **Withdrawn (4):** `W42`, `W43`, `W44`, `W47` — see the table below | The module each one produced. `W41` is [`reaper.py`](../packages/shellbox-mcp/src/shellbox_mcp/reaper.py); `W39` and `W48` are [`enroll.py`](../packages/shellbox-mcp/src/shellbox_mcp/enroll.py); `W45` and `W53` (its App half) are `host_payload` in [`inventory.py`](../packages/shellbox-app/src/shellbox_app/inventory.py); `W46` is [`config.py`](../packages/shellbox-mcp/src/shellbox_mcp/config.py); `W52` is [`tmux.py`](../packages/shellbox-mcp/src/shellbox_mcp/tmux.py); `W50` is [`live_acceptance_reaper.py`](../scripts/live_acceptance_reaper.py), a sibling of Phase 4's [`live_acceptance.py`](../scripts/live_acceptance.py) |
+| `ADR-26`-`ADR-37` | An architecture decision for the reaper and host staleness. **Live (8):** `ADR-26`, `ADR-28` (the predicate's clause order — registry timeout → attach veto → output timeout → re-check), `ADR-29`, `ADR-30` (names the derived field `heartbeat_stale`, not `stale`), `ADR-31`, `ADR-35` (the activity signal is `MAX(#{window_activity})` across windows), `ADR-36` (a host with no readable registry row makes the reaper inert), `ADR-37` (the re-check immediately before the kill). **Withdrawn (4):** `ADR-27`, `ADR-32`, `ADR-33`, `ADR-34` — see the table below | `ADR-28` and `ADR-37` are [`reaper.py`](../packages/shellbox-mcp/src/shellbox_mcp/reaper.py); `ADR-30` and `ADR-36` are [`inventory.py`](../packages/shellbox-app/src/shellbox_app/inventory.py) and [`reaper.py`](../packages/shellbox-mcp/src/shellbox_mcp/reaper.py) respectively; `ADR-35` is [`tmux.py`](../packages/shellbox-mcp/src/shellbox_mcp/tmux.py) |
+| `A21`-`A52` | A Phase 5 acceptance criterion. **Live (26):** `A21`, `A22`, `A25`, `A26`, `A27`, `A28`, `A33`, `A34`, `A35`, `A36`, `A37`, `A38`, `A39`, `A40`, `A41`, `A42`, `A43`, `A44`, `A45`, `A46`, `A47`, `A48`, `A49`, `A50`, `A51`, `A52`. `A25` is the attach veto against a real attached client. `A26` is the registry-half reap and, as its surviving half, the reaped-terminal rule. `A45` mechanises this section's own resolvability rule. **Withdrawn (6):** `A23`, `A24`, `A29`, `A30`, `A31`, `A32`. **Retired unrecovered (1):** `A33b` — see the table below | [`tests/unit/`](../tests/unit/), [`tests/registry/`](../tests/registry/), and [`tests/tmux/`](../tests/tmux/); `A45` is [`tests/unit/test_plan_sections.py`](../tests/unit/test_plan_sections.py) |
+| `R52`-`R73` | A risk from the Phase 5 table. **Live (17):** `R52`, `R53`, `R56`, `R57`, `R60`, `R62`, `R63`, `R64`, `R65`, `R66`, `R67`, `R68`, `R69`, `R70`, `R71`, `R72`, `R73`. `R52` is the reaper killing a session a human is watching — the primary failure mode. `R64` is a Phase 5 identifier shipping before this section names it, mitigated by `W49` landing first. `R72` is a reap being relabelled as a restart artifact, the surviving half of withdrawn `R61`. **Withdrawn (5):** `R54`, `R55`, `R58`, `R59`, `R61`. **Retired token (1):** `R53b` — see the table below | `R52`, `R57`, `R60`, `R69` are [`reaper.py`](../packages/shellbox-mcp/src/shellbox_mcp/reaper.py); `R62`, `R63`, `R70` are [`inventory.py`](../packages/shellbox-app/src/shellbox_app/inventory.py); `R65`, `R71` are [`enroll.py`](../packages/shellbox-mcp/src/shellbox_mcp/enroll.py); `R68` is [`live_acceptance_reaper.py`](../scripts/live_acceptance_reaper.py) |
+| `T-P5-<NAME>` | A named Phase 5 test, same convention as `T-P4-<NAME>` above: **not** numbered, and each one names the file that holds it. `T-P5-ATTACHED-VETO` and `T-P5-RECHECK-SKIP` are in [`tests/tmux/`](../tests/tmux/); `T-P5-REAP-UNATTENDED`, `T-P5-REAPED-TERMINAL`, and `T-P5-ORPHANED-ALIVE` are in [`tests/registry/`](../tests/registry/) | The test named in each docstring. These resolve from a clone already |
+
+**Withdrawn `W` items.**
+
+| `W` | Was | Reason withdrawn |
+|---|---|---|
+| `W42` | `autostop.py` — the `databricks sandbox config` shell-out that raised and restored the sandbox `idleTimeout` | Withdrawn with clock 2 (the sandbox keepalive), which this revision cuts. |
+| `W43` | The per-sweep host-level attach-state read that detected the transition clock 2 wrote on | Withdrawn with clock 2. |
+| `W44` | Clock 2's degradation path when `sandbox_id` is `None` on an un-bootstrapped host | Withdrawn with clock 2; there is no clock 2 left to degrade. |
+| `W47` | A test asserting the scope of `tests/unit/test_no_keepalive.py`'s guard | Withdrawn with clock 2; the reaper writes to no socket and makes no control-plane call, so the ambiguity the test guarded against no longer exists. |
+
+**Withdrawn `ADR` items.**
+
+| `ADR` | Was | Reason withdrawn |
+|---|---|---|
+| `ADR-27` | Call `databricks sandbox config` through the CLI, not the SDK | Existed only for clock 2's control-plane call, which `ADR-26` cuts; also refuted on its own terms. |
+| `ADR-32` | Clock 2 lives in `autostop.py`, outside `transport.py` | No `autostop.py` is written; there is no module to place. |
+| `ADR-33` | One reaper per host, elected through a `@shellbox_reaper` tmux option | Both of its reasons were clock 2's, and clock 2 is cut. |
+| `ADR-34` | `--idle-timeout 0` restores the default; restore waits for the last session | Wholly clock 2's flag semantics; withdrawn with clock 2. |
+
+**Withdrawn and retired `A` items.**
+
+| `A` | Status | Reason |
+|---|---|---|
+| `A23` | Withdrawn | `W40`'s measurement-shape test; `W40` is no longer a gate on this phase. |
+| `A24` | Withdrawn | Named no test and no lane, so by this file's own rule it was never a criterion; its content is `W40`'s deliverable, not an acceptance criterion. |
+| `A29` | Withdrawn | The CLI read-back warning; exists only inside clock 2, which is cut. |
+| `A30` | Withdrawn | The never-write-`--no-autostop` assertion; names a module clock 2 would have added. |
+| `A31` | Withdrawn | The transition-only write; clock 2 is cut. |
+| `A32` | Withdrawn | The `sandbox_id`-is-`None` degradation; with no clock 2 there is no `sandbox_id` read to degrade. |
+| `A33b` | Retired, unrecovered | Revision 2 cited the token and never defined it, and the defining range no longer exists. Nothing has been invented to fill it — distinct from "withdrawn", which names something that once existed. |
+
+**Withdrawn and retired `R` items.**
+
+| `R` | Status | Reason |
+|---|---|---|
+| `R54` | Withdrawn | The baked PAT cannot mutate a sandbox; only clock 2 mutates a sandbox. |
+| `R55` | Withdrawn | Clock 2's absence taking clocks 1 and 3 down; there is no clock 2 to be absent. |
+| `R58` | Withdrawn | A `databricks` CLI version bump changing flag behaviour; this phase makes no CLI call. |
+| `R59` | Withdrawn | `--no-autostop` cleared by a keepalive write; this phase writes no sandbox config. |
+| `R61` | Withdrawn | "`W48` recreates a session that was reaped on purpose" — `W48`'s recreation part is cut, so no code path recreates a session from any row. The fact it protected survives as `R72`. |
+| `R53b` | Retired token | The letter-suffixed form is banned. Its content moved verbatim to `R65`, a new number, rather than being lost. |
+
 ## Writing a new reference
 
 - Prefer a repo-relative path and a symbol over an identifier.

@@ -29,11 +29,13 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import pytest
 from shellbox_mcp.publisher import Claim, claim_is_live
 from shellbox_mcp.tmux import CommandResult, Runner, SubprocessRunner, TmuxAdapter, TmuxConfig
+from shellbox_registry.base import SessionRecord as RegistrySessionRecord
 
 TMUX_BIN = os.environ.get("SHELLBOX_TMUX_BIN") or shutil.which("tmux")
 
@@ -491,3 +493,137 @@ def fail_verb(verb: str, stderr: str) -> Callable[[tuple[str, ...]], CommandResu
         return result(rc=1, stderr=stderr) if verb in argv else None
 
     return fault
+
+
+# --------------------------------------------------------------------------------------
+# W41 -- the reaper's tmux-lane fixtures. Shared across `tests/tmux/test_reap_*.py`.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class PlantedRegistry:
+    """A minimal fake `Registry`: only the two primitives `Reaper` actually calls.
+
+    For the tmux-lane reaper criteria (A25, A28, A35, A42, A43, A46, A48), which need a row
+    "under this host's current host_id" (`ADR-36`) to make a session a candidate at all, but
+    must not need a real Postgres to prove the tmux-SIDE half of the predicate -- the write
+    itself, against `GREATEST` and `sessions_status_chk`, is
+    `tests/registry/test_reaper_registry.py`'s job, against real Postgres.
+    """
+
+    host_id: str
+    rows: dict[str, RegistrySessionRecord] = field(default_factory=dict)
+    written: list[RegistrySessionRecord] = field(default_factory=list)
+
+    def plant(
+        self,
+        tmux_name: str,
+        *,
+        last_activity_at: datetime,
+        last_read_at: datetime | None = None,
+        owner_email: str = "reaper-test@example.com",
+    ) -> None:
+        """Add (or replace) a row for ``tmux_name``, as if it had been written by a tool call."""
+        self.rows[tmux_name] = RegistrySessionRecord(
+            session_id=f"{self.host_id}:{tmux_name}",
+            host_id=self.host_id,
+            tmux_name=tmux_name,
+            owner_email=owner_email,
+            last_activity_at=last_activity_at,
+            last_read_at=last_read_at,
+            status="live",
+        )
+
+    def list_sessions_for_host(self, host_id: str) -> list[RegistrySessionRecord]:
+        if host_id != self.host_id:
+            return []
+        return list(self.rows.values())
+
+    def upsert_session(self, record: RegistrySessionRecord) -> None:
+        self.rows[record.tmux_name] = record
+        self.written.append(record)
+
+
+def await_output_timeout_elapsed(
+    adapter: TmuxAdapter, name: str, seconds: float, *, timeout: float | None = None
+) -> None:
+    """Poll ``name``'s real `window_activity_max` until it reads more than ``seconds`` old.
+
+    Section 3.7's mechanism, in one place: a tmux-lane reaper criterion injects a tiny
+    `Reaper(timeout=...)` and then waits for a REAL signal to cross it -- never a `sleep()`. The
+    wall-clock delay this incurs is a side effect of the poll succeeding, not of this function
+    sleeping for a duration and then asserting.
+
+    Use this ONLY for a criterion that rests on the OUTPUT-timeout clause -- one whose row carries
+    a genuinely old `last_activity_at` (planted with `_old_row_time()`), so the tmux-side
+    `window_activity` is the term that actually decides the reap. A criterion whose row is written
+    at ~now by the real `shell_create` tool must NOT wait on this: `window_activity` is a Unix
+    epoch INTEGER, floored to the whole second, so it reads up to ~1s OLDER than the
+    full-precision `last_activity_at` clause 1 gates on. Waiting on it there fires while the row
+    is still inside the timeout, the reaper correctly SPARES the session, and the "must be reaped"
+    assertion fails on a fast host (the tmux-3.4 CI container) while passing on a slower one.
+    That criterion waits on `await_reap_clocks_elapsed` instead, which crosses both clocks.
+    """
+    def _aged_past(seconds: float) -> bool:
+        activity = adapter.window_activity_max(name)
+        # `None` is missing evidence, never epoch (ADR-36) -- folding it to 0 here would make
+        # `time.time() - 0` enormous and the poll would succeed instantly on a signal that
+        # never actually aged, masking a real regression in `window_activity_max` instead of
+        # timing out and failing the test by name.
+        if activity is None:
+            return False
+        return (time.time() - activity) > seconds
+
+    await_condition(
+        lambda: _aged_past(seconds),
+        timeout=timeout if timeout is not None else seconds + 15,
+        what=f"{name!r}'s window_activity_max to read more than {seconds}s old",
+    )
+
+
+def await_reap_clocks_elapsed(
+    adapter: TmuxAdapter,
+    registry: PlantedRegistry,
+    name: str,
+    seconds: float,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Wait until BOTH idle clocks the reaper reads are older than ``seconds``.
+
+    A reap needs clause 1 (the registry's `last_activity_at`) AND clause 3 (tmux's
+    `window_activity`) both aged past the timeout (`reaper.py`). For a criterion driven through
+    the real `shell_create` tool -- whose row is written at ~now (`server.py`'s `session_row`) --
+    the two clocks are BOTH near creation, and they DIVERGE IN OPPOSITE DIRECTIONS across hosts,
+    so neither alone is a safe proxy for the other:
+
+    * tmux floors `window_activity` to the whole second, so it can read up to ~1s OLDER than the
+      full-precision `last_activity_at` (measured on the tmux-3.4 CI container);
+    * an interactive shell's startup output bumps `window_activity` AFTER creation, so it can
+      instead read NEWER than `last_activity_at` (measured on macOS).
+
+    Waiting on either clock alone therefore leaves the other possibly still inside the timeout at
+    sweep time -- the reaper correctly SPARES on the young clause and the "must be reaped"
+    assertion fails on one host while passing on the other. This waits on both. `last_activity_at`
+    is fixed at creation and `window_activity` only advances, so once the pane goes quiet both
+    cross and the poll terminates.
+    """
+    def _aged_past(seconds: float) -> bool:
+        row = registry.rows.get(name)
+        # A missing row / missing signal is "no evidence it aged", not "infinitely old" -- the
+        # same MISSING-EVIDENCE-SPARES direction the reaper takes, so it times the poll out and
+        # fails the test by name rather than passing on a session that never aged.
+        if row is None:
+            return False
+        if (datetime.now(UTC) - row.last_activity_at).total_seconds() <= seconds:
+            return False
+        activity = adapter.window_activity_max(name)
+        if activity is None:
+            return False
+        return (time.time() - activity) > seconds
+
+    await_condition(
+        lambda: _aged_past(seconds),
+        timeout=timeout if timeout is not None else seconds + 15,
+        what=f"{name!r}'s last_activity_at AND window_activity to both read >{seconds}s old",
+    )

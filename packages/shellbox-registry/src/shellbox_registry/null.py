@@ -8,6 +8,8 @@ stale" rather than "shells are down." No method here ever raises.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from shellbox_registry.base import HostRecord, Registry, SessionRecord
 
 
@@ -16,6 +18,9 @@ class NullRegistry(Registry):
         return None
 
     def upsert_session(self, record: SessionRecord) -> None:
+        return None
+
+    def touch_read(self, session_id: str, when: datetime) -> None:
         return None
 
     def get_host(self, host_id: str) -> HostRecord | None:

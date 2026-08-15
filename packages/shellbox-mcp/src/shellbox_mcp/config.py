@@ -56,6 +56,8 @@ DEFAULTS = {
     "SHELLBOX_DEFAULT_ROWS": 24,
     "SHELLBOX_MAX_SEND_BYTES": 1 << 20,
     "SHELLBOX_MAX_SEND_LINE_BYTES": 1000,
+    "SHELLBOX_IDLE_TIMEOUT_SECONDS": 1800,
+    "SHELLBOX_REAP_INTERVAL_SECONDS": 60,
 }
 
 _LOG_LEVELS: frozenset[str] = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -83,6 +85,8 @@ class Settings:
     default_rows: int
     max_send_bytes: int
     max_send_line_bytes: int
+    idle_timeout_seconds: int
+    reap_interval_seconds: int
     log_level: LogLevel
     database_dsn: str | None = None
     owner_email: str | None = None
@@ -117,6 +121,12 @@ class Settings:
             default_rows=_int_env(env, "SHELLBOX_DEFAULT_ROWS"),
             max_send_bytes=_int_env(env, "SHELLBOX_MAX_SEND_BYTES"),
             max_send_line_bytes=_int_env(env, "SHELLBOX_MAX_SEND_LINE_BYTES"),
+            idle_timeout_seconds=_bounded_int_env(
+                env, "SHELLBOX_IDLE_TIMEOUT_SECONDS", minimum=60, maximum=86400
+            ),
+            reap_interval_seconds=_bounded_int_env(
+                env, "SHELLBOX_REAP_INTERVAL_SECONDS", minimum=10, maximum=3600
+            ),
             log_level=log_level_from_env(env),
             # `dsn_from_env` reads the process environment itself (it also assembles a DSN
             # from SHELLBOX_PG_* parts), so it is used for the real environment only; an
@@ -126,8 +136,14 @@ class Settings:
             host_id_override=env.get("SHELLBOX_HOST_ID") or None,
         )
 
-    def tmux_config(self) -> TmuxConfig:
-        """The adapter's configuration. Constructed per call -- it is frozen and cheap."""
+    def tmux_config(self, *, timeout: float | None = None) -> TmuxConfig:
+        """The adapter's configuration. Constructed per call -- it is frozen and cheap.
+
+        ``timeout`` is ``None`` for every ordinary caller, which leaves ``TmuxConfig.timeout``
+        at its own default and every shipped verb byte-identical (`ADR-37`). The reaper
+        (`reaper.py`, `W41`) is the one caller that passes a concrete bound, so its own
+        subprocess calls cannot wedge a sweep forever.
+        """
         return TmuxConfig(
             socket_path=self.socket_path,
             tmux_bin=self.tmux_bin,
@@ -136,6 +152,7 @@ class Settings:
             default_rows=self.default_rows,
             max_send_bytes=self.max_send_bytes,
             max_send_line_bytes=self.max_send_line_bytes,
+            timeout=timeout,
         )
 
     def ensure_state_dir(self) -> None:
@@ -173,4 +190,18 @@ def _int_env(env: Mapping[str, str], key: str) -> int:
         raise ConfigError(f"{key}={raw!r} is not an integer") from exc
     if value <= 0:
         raise ConfigError(f"{key}={raw!r} must be positive")
+    return value
+
+
+def _bounded_int_env(env: Mapping[str, str], key: str, *, minimum: int, maximum: int) -> int:
+    """Like ``_int_env``, but also enforces ``[minimum, maximum]``.
+
+    Guards the environment-resolution path only -- see the module docstring's callers.
+    Out-of-range is a ``ConfigError``, never a clamp: a silently-clamped value is the same
+    "correctness boundary the operator believes they moved" that ``Settings.from_env``
+    refuses to cross for a malformed one.
+    """
+    value = _int_env(env, key)
+    if value < minimum or value > maximum:
+        raise ConfigError(f"{key}={value!r} must be between {minimum} and {maximum}")
     return value

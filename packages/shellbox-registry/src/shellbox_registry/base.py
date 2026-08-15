@@ -82,6 +82,24 @@ class Registry(Protocol):
         """
         ...
 
+    def touch_read(self, session_id: str, when: datetime) -> None:
+        """Record that a pane was *read* at ``when``, advancing ``sessions.last_read_at``.
+
+        This is an ``UPDATE ... WHERE session_id = :id``, never an upsert. A session with no
+        existing row matches zero rows and stays with **no row** afterward -- that silent
+        outcome is correct, not a bug to fix. ``ADR-36``'s rule is that a session with no
+        registry row is never reaped, which is what keeps the reaper inert on a laptop with no
+        database (`NullRegistry.list_sessions_for_host` always returns ``[]`` unconditionally).
+        If this method ever created the row it failed to find, every session an agent reads on
+        a no-database host would acquire one, and that safety rule would stop being reachable.
+
+        Like ``upsert_session``'s ``last_activity_at``, the stored value is
+        ``GREATEST(:when, last_read_at)``: a delayed call can never move the timestamp
+        backwards, and the first read of a session (``last_read_at`` currently ``NULL``) stores
+        ``:when`` rather than ``NULL`` -- Postgres's ``GREATEST`` ignores NULLs.
+        """
+        ...
+
     def get_host(self, host_id: str) -> HostRecord | None:
         """Return the current `hosts` row, or ``None`` if it does not exist."""
         ...

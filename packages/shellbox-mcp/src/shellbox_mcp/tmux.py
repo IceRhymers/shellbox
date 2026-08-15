@@ -247,6 +247,15 @@ class TmuxConfig:
     # is nothing to pass. It must be forced. `LC_CTYPE` rather than `LC_ALL` because forcing
     # `LC_ALL` would also override collation and messages inside the user's shell.
     locale_ctype: str = "C.UTF-8"
+    # `subprocess.run`'s `timeout=`, forwarded by `SubprocessRunner.__call__`. `None` (the
+    # default) leaves every one of the six shipped verbs -- create, send, read, list_sessions,
+    # resize, kill -- byte-identical to today: none of them set this field, so none of them
+    # gain a bound. `ADR-37`/`R69`: the reaper (`reaper.py`, `W41`) is the ONE caller that sets
+    # it, because a wedged tmux command on a background thread nobody is waiting on would hang
+    # a sweep forever with nothing raising -- unlike a tool call, where an agent sees the hang.
+    # Not an environment variable, for the same reason `default_terminal` and `locale_ctype`
+    # are not: it is a guard against a wedged subprocess, not an operator tuning knob.
+    timeout: float | None = None
 
 
 @dataclass(frozen=True)
@@ -358,13 +367,23 @@ class SubprocessRunner:
     def __call__(self, argv: Sequence[str], stdin: bytes | None = None) -> CommandResult:
         # argv LIST, shell=False, never a string. Shell metacharacters are thus a non-issue
         # at the process boundary; H1/H2 are *tmux argv* semantics, a distinct layer.
-        proc = subprocess.run(
-            list(argv),
-            input=stdin,
-            capture_output=True,
-            env=self.env,
-            shell=False,
-        )
+        try:
+            proc = subprocess.run(
+                list(argv),
+                input=stdin,
+                capture_output=True,
+                env=self.env,
+                shell=False,
+                timeout=self.config.timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # ADR-37/R69: translated at THIS boundary so a wedged command reaches the same
+            # per-session guard as every other tmux failure -- the reaper's caller never
+            # needs to know `subprocess.TimeoutExpired` exists. `self.config.timeout` is
+            # `None` for every shipped verb, so this branch is unreachable for them.
+            raise TmuxError(
+                f"tmux command timed out after {self.config.timeout}s: {list(argv)!r}"
+            ) from exc
         return CommandResult(
             argv=tuple(argv),
             rc=proc.returncode,
@@ -1035,6 +1054,74 @@ class TmuxAdapter:
         if metrics is None:
             return None
         return metrics[0] == "1"
+
+    def session_attached(self, name: str) -> bool | None:
+        """Whether any client is attached to this session (`ADR-28`'s clause 2). ``None``
+        means the session did not resolve -- MISSING EVIDENCE, not "not attached". The
+        reaper (`reaper.py`, `W41`) treats a ``None`` here exactly like ``True``: both spare
+        the session, per `ADR-36`.
+
+        A thin accessor over ``_display_numeric``, matching ``pane_dead``'s shape: this is
+        the same read as spike ``tmux_spike.py:1420``'s ``read_attached()``, promoted to a
+        production reader for the first time (`ADR-28`'s consequence 2). ``#{session_attached}``
+        is tmux's count of attached clients, so any non-``"0"`` value means at least one.
+
+        WARNING: This is the SAME per-session guard everything else on this path relies on --
+        it flows through ``_display_numeric``, which RAISES ``TmuxError`` on a field-count
+        mismatch rather than returning ``None`` (guard at ``tmux.py:446``). A caller that
+        wraps a whole sweep in one ``except Exception`` rather than guarding per session
+        would let one odd read stop reaping for every other session on the host.
+        """
+        naming.validate_session_name(name)
+        metrics = self._display_numeric(name, ("#{session_attached}",))
+        if metrics is None:
+            return None
+        return metrics[0] != "0"
+
+    def window_activity_max(self, name: str) -> int | None:
+        """The MAXIMUM ``#{window_activity}`` across every window in the session (`W52`).
+
+        A brand new tmux verb -- ``list-windows`` -- rather than a ninth ``LIST_FIELDS`` entry, for
+        two independent reasons. First, a per-window aggregate is not expressible as a
+        ``list-sessions`` field at all: a session-target ``#{window_activity}`` resolves to the
+        ACTIVE window only, so a background window's output is invisible to it (measured; this is
+        why ``MAX`` over windows is mandatory rather than an optimisation). Second, ``LIST_FIELDS``
+        is exactly 8 fields with ``_LIST_MAXSPLIT = FIELD_COUNT``, a load-bearing invariant of its
+        own (see the comment there and at ``HOST_ID_OPTION``): a ninth field would put a SECOND
+        possibly-empty field into a format whose whole safety argument is that there is one,
+        corrupting the parse for every session on the host.
+
+        The return contract, every case of it:
+
+        * The session does not resolve -- ``None``.
+        * ``list-windows`` reports NO windows -- ``None``. **NEVER** ``max(..., default=0)``: ``0``
+          is the Unix epoch and reads as "infinitely idle", which is exactly the defect ``ADR-36``
+          exists to prevent -- missing evidence must never authorise a kill downstream.
+        * Any line fails to parse as an integer -- ``None``. An unparseable answer is not an answer.
+        * One or more windows parse cleanly -- ``max(values)`` as an ``int``.
+
+        ``list-windows``'s rc/stderr behaviour on a MISSING session is not measured in this
+        codebase (unlike ``display-message``, which returns rc=0 for every nonexistent target --
+        see ``_display_tail``). This mirrors ``exists`` instead: classify the stderr, treat the
+        ``not_found`` and no-server signatures as ``None``, and raise on anything unclassified --
+        an unexpected failure must not be swallowed into a silent "no evidence".
+        """
+        naming.validate_session_name(name)
+        result = self._run("list-windows", "-t", target(name), "-F", "#{window_activity}")
+        if result.rc != 0:
+            if classify_stderr(result.stderr) in {"not_found", NO_SERVER}:
+                return None
+            raise tmux_failure(result.stderr, session=name, context="list-windows failed")
+        lines = [line for line in result.stdout_raw.split("\n") if line]
+        if not lines:
+            return None
+        values: list[int] = []
+        for line in lines:
+            try:
+                values.append(int(line))
+            except ValueError:
+                return None
+        return max(values)
 
     def kill(self, name: str) -> bool:
         """Kill a session. Returns ``False`` (and succeeds) when there was nothing to kill.

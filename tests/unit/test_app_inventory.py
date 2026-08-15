@@ -22,12 +22,13 @@ WITHOUT its context manager on purpose: entering it runs the lifespan handler, w
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from shellbox_app.database import AppDatabase
 from shellbox_app.inventory import (
+    HEARTBEAT_STALE_SECONDS,
     NOT_BOOTSTRAPPED_LABEL,
     host_payload,
     hosts_payload,
@@ -380,7 +381,83 @@ def test_the_host_payload_is_the_display_subset_and_not_the_whole_row() -> None:
         "mine",
         "status",
         "last_seen_at",
+        "heartbeat_stale",
     }
+
+
+# --------------------------------------------------------------------------------------
+# ADR-30 / `A33` -- `heartbeat_stale`, derived at read time from `last_seen_at`
+# --------------------------------------------------------------------------------------
+
+
+def test_a_heartbeat_older_than_the_threshold_is_reported_stale() -> None:
+    """A host whose last heartbeat landed more than `HEARTBEAT_STALE_SECONDS` ago."""
+    fixed_now = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+    record = HostRecord(
+        host_id=BOOTSTRAPPED.host_id,
+        kind=BOOTSTRAPPED.kind,
+        owner_email=OWNER,
+        last_seen_at=fixed_now - timedelta(seconds=HEARTBEAT_STALE_SECONDS + 1),
+        status="active",
+        sandbox_id="sbx-bootstrapped",
+    )
+
+    payload = host_payload(record, viewer_email=None, now=lambda: fixed_now)
+
+    assert payload["heartbeat_stale"] is True
+
+
+def test_a_heartbeat_exactly_at_the_threshold_is_not_yet_stale() -> None:
+    """The boundary. Exactly `HEARTBEAT_STALE_SECONDS` old is still within the window, not past
+    it -- `HEARTBEAT_STALE_SECONDS` itself must read as fresh, and only older reads as stale."""
+    fixed_now = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+    record = HostRecord(
+        host_id=BOOTSTRAPPED.host_id,
+        kind=BOOTSTRAPPED.kind,
+        owner_email=OWNER,
+        last_seen_at=fixed_now - timedelta(seconds=HEARTBEAT_STALE_SECONDS),
+        status="active",
+        sandbox_id="sbx-bootstrapped",
+    )
+
+    payload = host_payload(record, viewer_email=None, now=lambda: fixed_now)
+
+    assert payload["heartbeat_stale"] is False
+
+
+def test_a_fresh_heartbeat_is_not_stale() -> None:
+    """The negative control. Always-true would satisfy the first boundary test above."""
+    fixed_now = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+    record = HostRecord(
+        host_id=BOOTSTRAPPED.host_id,
+        kind=BOOTSTRAPPED.kind,
+        owner_email=OWNER,
+        last_seen_at=fixed_now - timedelta(seconds=1),
+        status="active",
+        sandbox_id="sbx-bootstrapped",
+    )
+
+    payload = host_payload(record, viewer_email=None, now=lambda: fixed_now)
+
+    assert payload["heartbeat_stale"] is False
+
+
+def test_heartbeat_stale_is_per_host_and_leaves_the_top_level_stale_key_alone() -> None:
+    """The two `stale`-shaped meanings must not collide. Top-level `stale` means "the App could
+    not read the registry at all" (`REASON_NO_DATABASE` / `REASON_QUERY_FAILED`); per-host
+    `heartbeat_stale` means "this host's heartbeat looks old". A successful read of a
+    long-dead host must report `heartbeat_stale: true` on that row while the payload's own
+    `stale` stays `False`, because the read itself succeeded.
+    """
+    registry, client = _stocked()
+
+    body = client.get("/api/hosts").json()
+
+    assert body["stale"] is False
+    assert all("heartbeat_stale" in row for row in body["hosts"])
+    # BOOTSTRAPPED and NEVER_BOOTSTRAPPED both carry the long-past fixture timestamp `SEEN`,
+    # so against the real clock both read as stale heartbeats -- while the fetch itself worked.
+    assert all(row["heartbeat_stale"] is True for row in body["hosts"])
 
 
 def test_the_session_payload_is_the_display_subset_too() -> None:

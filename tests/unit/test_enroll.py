@@ -23,6 +23,7 @@ from shellbox_mcp.enroll import (
     Heartbeat,
     reconcile_orphans,
     recover_host_id,
+    reproject_live_sessions,
     stamp_sessions,
 )
 from shellbox_mcp.enroll import (
@@ -83,18 +84,53 @@ class FakeRegistry:
         return [r for r in self.sessions.values() if r.host_id == host_id]
 
 
-class FakeAdapter:
-    """A tmux adapter that answers from a dict. `raises` makes every read blow up."""
+# Default epoch SECONDS for a live tmux session, mirroring `tmux.SessionRecord`'s unscaled
+# integer clocks. Distinct values so a conversion assertion catches a created/activity swap.
+_LIVE_CREATED_AT = 1_722_400_000  # 2024-07-31T04:26:40Z
+_LIVE_ACTIVITY_AT = 1_722_400_500  # 2024-07-31T04:35:00Z
 
-    def __init__(self, stamps: dict[str, str] | None = None, *, raises: bool = False) -> None:
+
+class FakeAdapter:
+    """A tmux adapter that answers from a dict. `raises` makes every read blow up.
+
+    ``list_sessions`` yields objects shaped like `tmux.SessionRecord` for E5b: they carry
+    ``created_at``/``last_activity_at`` (epoch ints), ``cols``/``rows``/``cwd`` and a ``foreign``
+    flag. ``foreign`` names mark sessions with an empty ``@shellbox_incarnation`` (E5b skips
+    them); everything else defaults to non-foreign so the pre-existing tests are unaffected.
+    """
+
+    def __init__(
+        self,
+        stamps: dict[str, str] | None = None,
+        *,
+        raises: bool = False,
+        foreign: set[str] | None = None,
+    ) -> None:
         self.stamps = dict(stamps or {})
         self.raises = raises
+        self.foreign = set(foreign or set())
         self.written: list[tuple[str, str]] = []
 
     def list_sessions(self) -> list[object]:
         if self.raises:
             raise RuntimeError("list-sessions failed")
-        return [type("S", (), {"tmux_name": name})() for name in self.stamps]
+        return [
+            type(
+                "S",
+                (),
+                {
+                    "tmux_name": name,
+                    "created_at": _LIVE_CREATED_AT,
+                    "last_activity_at": _LIVE_ACTIVITY_AT,
+                    "cols": 80,
+                    "rows": 24,
+                    "cwd": "/work",
+                    "incarnation": None if name in self.foreign else "inc-1",
+                    "foreign": name in self.foreign,
+                },
+            )()
+            for name in self.stamps
+        ]
 
     def read_host_stamp(self, name: str) -> str | None:
         return self.stamps.get(name) or None
@@ -397,6 +433,142 @@ def test_an_already_orphaned_row_is_not_rewritten(tmp_path: Path) -> None:
             host_id="h1",
             owner_email="o@example.com",
             expected_socket="/s.sock",
+        )
+        == 0
+    )
+
+
+# ------------------------------------------------------- E5b: re-projecting live sessions
+#
+# These tests prove E5b's BRANCH LOGIC only -- which live sessions it inserts and which it
+# leaves alone. They CANNOT reproduce issue #24's actual failure: `FakeRegistry` has no foreign
+# key, so a `sessions` INSERT never rejects a missing `hosts` row. That the real
+# `sessions_host_id_fkey` exists, and that E5b lands a row after the host row is written, is
+# proven against a live Postgres in `tests/registry/test_enroll_reprojection.py`.
+def test_a_live_session_with_no_row_is_reprojected_by_a_full_pass(tmp_path: Path) -> None:
+    """Mode (a). The create-path INSERT lost the race with the host row and was swallowed; E5b,
+    running after E4, re-projects the live session so the row comes back."""
+    registry = FakeRegistry()
+    result = _enroll(registry, FakeAdapter({"build": ""}), tmp_path)
+
+    assert result.enrolled and result.reprojected == 1
+    row = registry.sessions["h1:build"]
+    assert (row.status, row.owner_email, row.host_id) == ("live", "creator@example.com", "h1")
+
+
+def test_reprojection_inserts_a_missing_row_with_the_resolved_owner(tmp_path: Path) -> None:
+    """Mode (b). Called directly with the resolved host owner: the one session that had no row
+    is inserted under that owner, with tmux's real epoch clocks converted to UTC."""
+    registry = FakeRegistry()
+    _seed(registry)  # host row only, no session rows
+
+    count = reproject_live_sessions(
+        registry,
+        FakeAdapter({"build": "h1"}),
+        host_id="h1",
+        owner_email="o@example.com",
+    )
+
+    assert count == 1
+    row = registry.sessions["h1:build"]
+    assert (row.status, row.owner_email, row.host_id) == ("live", "o@example.com", "h1")
+    assert row.created_at == datetime.fromtimestamp(_LIVE_CREATED_AT, tz=UTC)
+    assert row.last_activity_at == datetime.fromtimestamp(_LIVE_ACTIVITY_AT, tz=UTC)
+    assert row.last_read_at is None
+
+
+def test_reprojection_never_resurrects_a_terminal_row(tmp_path: Path) -> None:
+    """A reaped or orphaned row still HAS a row, so E5b -- which detects missing by session_id
+    membership, not by status -- must skip it even when its tmux session is live again."""
+    registry = FakeRegistry()
+    _seed(registry, "reap", status="reaped")
+    _seed(registry, "orph", status="orphaned")
+
+    count = reproject_live_sessions(
+        registry,
+        FakeAdapter({"reap": "h1", "orph": "h1"}),
+        host_id="h1",
+        owner_email="o@example.com",
+    )
+
+    assert count == 0
+    assert registry.sessions["h1:reap"].status == "reaped"
+    assert registry.sessions["h1:orph"].status == "orphaned"
+
+
+def test_reprojection_does_not_clobber_an_existing_live_row(tmp_path: Path) -> None:
+    """A row already present is E5's business, never E5b's: its timestamps and status stand."""
+    registry = FakeRegistry()
+    _seed(registry, "build")  # a live row at T0
+
+    count = reproject_live_sessions(
+        registry,
+        FakeAdapter({"build": "h1"}),
+        host_id="h1",
+        owner_email="someone-else@example.com",
+    )
+
+    assert count == 0
+    row = registry.sessions["h1:build"]
+    assert (row.status, row.last_activity_at, row.owner_email) == ("live", T0, "o@example.com")
+
+
+def test_reprojection_excludes_a_foreign_session(tmp_path: Path) -> None:
+    """A live session with an empty `@shellbox_incarnation` is not one shellbox can prove it
+    owns, so E5b never projects a row for it."""
+    registry = FakeRegistry()
+    _seed(registry)  # host row only
+
+    count = reproject_live_sessions(
+        registry,
+        FakeAdapter({"ghost": "h1"}, foreign={"ghost"}),
+        host_id="h1",
+        owner_email="o@example.com",
+    )
+
+    assert count == 0
+    assert registry.sessions == {}
+
+
+def test_reprojection_survives_a_failing_upsert(tmp_path: Path) -> None:
+    """Best-effort: a failed `upsert_session` is logged and skipped, never raised into enroll."""
+    registry = FakeRegistry(fail={"upsert_session"})
+    _seed(registry)
+    count = reproject_live_sessions(
+        registry,
+        FakeAdapter({"build": "h1"}),
+        host_id="h1",
+        owner_email="o@example.com",
+    )
+    assert count == 0
+    assert "h1:build" not in registry.sessions
+
+
+def test_reprojection_survives_a_broken_tmux(tmp_path: Path) -> None:
+    """A tmux read that raises leaves the registry untouched rather than raising."""
+    registry = FakeRegistry()
+    _seed(registry)
+    assert (
+        reproject_live_sessions(
+            registry,
+            FakeAdapter(raises=True),
+            host_id="h1",
+            owner_email="o@example.com",
+        )
+        == 0
+    )
+
+
+def test_reprojection_survives_a_failing_row_list(tmp_path: Path) -> None:
+    """A failed `list_sessions_for_host` returns 0 rather than raising."""
+    registry = FakeRegistry(fail={"list_sessions_for_host"})
+    _seed(registry)
+    assert (
+        reproject_live_sessions(
+            registry,
+            FakeAdapter({"build": "h1"}),
+            host_id="h1",
+            owner_email="o@example.com",
         )
         == 0
     )

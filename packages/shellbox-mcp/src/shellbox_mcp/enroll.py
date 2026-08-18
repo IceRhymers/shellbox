@@ -55,6 +55,7 @@ __all__ = [
     "enroll",
     "recover_host_id",
     "reconcile_orphans",
+    "reproject_live_sessions",
     "resolve_credential_email",
     "stamp_sessions",
     "start_enrollment",
@@ -97,6 +98,8 @@ class EnrollmentResult:
     """True when a credential disagreed with the cache and the credential won (E2a)."""
     orphaned: int = 0
     stamped: int = 0
+    reprojected: int = 0
+    """Live tmux sessions that had no `sessions` row and got one re-projected here (E5b, #24)."""
     recovered_from_tmux: bool = False
     error: str | None = None
     """Why enrollment did not complete. Present *with* partial results, not instead of them."""
@@ -351,6 +354,99 @@ def reconcile_orphans(
 
 
 # --------------------------------------------------------------------------------------
+# E5b -- re-project live tmux sessions that lost their registry row
+# --------------------------------------------------------------------------------------
+def reproject_live_sessions(
+    registry: Registry,
+    adapter: TmuxAdapter,
+    *,
+    host_id: str,
+    owner_email: str,
+) -> int:
+    """Insert a `sessions` row for each live tmux session that has none. Returns how many.
+
+    This closes issue #24. On a cold host the first `shell_create` projects its `sessions`
+    row on the tool path, while the `hosts` row it references is written by this background
+    thread (E4). The session INSERT can win that race and fail its `sessions_host_id_fkey`;
+    the failure is swallowed and the row is lost forever. Running here, after E4 has landed the
+    `hosts` row, re-projects any live session that no longer has a row, so the row that lost the
+    race comes back with the true tmux timestamps rather than the enrollment clock.
+
+    NO SOCKET GUARD, unlike `reconcile_orphans`, and this is deliberate. E5b observes only its
+    own process's tmux server through ``adapter.list_sessions()`` and inserts under its own
+    ``host_id``, so it is structurally incapable of projecting another socket's sessions -- the
+    invariant that makes the guard unnecessary. (A second reason it could not fire anyway: E4
+    overwrites ``tmux_socket`` unconditionally on conflict, so on the after-E4 path the stored
+    socket already equals this process's, and `reconcile_orphans`' guard could never trip.) E5b
+    and E5 act on disjoint sets: E5 orphans rows whose tmux session is gone, E5b inserts rows for
+    live tmux sessions that have none. Neither touches a row the other one does.
+
+    Missing is detected by ``session_id`` membership, NOT by status: a terminal ``reaped`` or
+    ``orphaned`` row still has a row, so it is never resurrected here. Best-effort, like every
+    step in this module: it logs and continues rather than raising into `enroll`.
+    """
+    try:
+        live = adapter.list_sessions()
+    except Exception as exc:  # noqa: BLE001 -- enrollment may not raise
+        logger.warning(
+            "cannot enumerate live tmux sessions to re-project them (%s: %s); leaving the "
+            "registry untouched",
+            type(exc).__name__,
+            exc,
+        )
+        return 0
+
+    try:
+        existing = {row.session_id for row in registry.list_sessions_for_host(host_id)}
+    except Exception as exc:  # noqa: BLE001 -- enrollment may not raise
+        logger.warning("cannot list session rows to re-project live sessions: %s", exc)
+        return 0
+
+    count = 0
+    for session in live:
+        if session.foreign:  # `@shellbox_incarnation` is empty: shellbox cannot prove it owns it
+            continue
+        session_id = session_id_for(host_id, session.tmux_name)
+        if session_id in existing:  # a row is already present -- never touch it (that is E5's job)
+            continue
+        try:
+            registry.upsert_session(
+                SessionRecord(
+                    session_id=session_id,
+                    host_id=host_id,
+                    tmux_name=session.tmux_name,
+                    owner_email=owner_email,
+                    status="live",
+                    cwd=session.cwd,
+                    cols=session.cols,
+                    rows=session.rows,
+                    # tmux's real epoch timestamps, NOT now(): the row that lost the race
+                    # carried these, and stamping the enrollment clock would report a session
+                    # as freshly created or used when it was neither.
+                    created_at=datetime.fromtimestamp(session.created_at, tz=UTC),
+                    last_activity_at=datetime.fromtimestamp(session.last_activity_at, tz=UTC),
+                    last_read_at=None,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- best-effort, must not raise out of enroll()
+            logger.warning(
+                "could not re-project live session %s: %s", session_id, exc
+            )
+            continue
+        count += 1
+
+    if count:
+        logger.info(
+            "re-projected %d live session row(s) for host %s: their tmux sessions run, but no "
+            "registry row referenced them (issue #24 -- the create-path INSERT lost the race "
+            "with this host row)",
+            count,
+            host_id,
+        )
+    return count
+
+
+# --------------------------------------------------------------------------------------
 # E6 -- what the host can say about itself
 # --------------------------------------------------------------------------------------
 def tmux_description(tmux_bin: str, *, timeout: float = 5.0) -> str:
@@ -499,6 +595,15 @@ def enroll(
         owner_email=owner.owner_email,
         expected_socket=tmux_socket,
     )
+    # E5b, after E4 (the FK target must exist) and after E5 (which acts on the disjoint set of
+    # rows whose tmux is gone). No new guards: this line runs only past the E2d early-return and
+    # the E4 success path, so the owner is resolved and the `hosts` row is written.
+    reprojected = reproject_live_sessions(
+        registry,
+        adapter,
+        host_id=host_id,
+        owner_email=owner.owner_email,
+    )
     return EnrollmentResult(
         host_id=host_id,
         owner_email=owner.owner_email,
@@ -507,6 +612,7 @@ def enroll(
         reconciled_owner=owner.reconciled,
         orphaned=orphaned,
         stamped=stamped,
+        reprojected=reprojected,
     )
 
 

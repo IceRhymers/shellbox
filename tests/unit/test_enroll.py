@@ -12,18 +12,22 @@ Two properties dominate this file, and they are the two that review kept catchin
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from shellbox_mcp import enroll, identity
 from shellbox_mcp.enroll import (
+    OWNER_RESOLUTION_WINDOW_SECONDS,
     EnrollmentResult,
     Heartbeat,
+    _recover_enrollment,
     reconcile_orphans,
     recover_host_id,
     reproject_live_sessions,
+    session_id_for,
     stamp_sessions,
 )
 from shellbox_mcp.enroll import (
@@ -38,15 +42,25 @@ T1 = datetime(2026, 7, 31, 12, 5, tzinfo=UTC)
 class FakeRegistry:
     """Records what was written. Optionally fails, per method, to order the failure tests."""
 
-    def __init__(self, *, fail: set[str] | None = None) -> None:
+    def __init__(
+        self, *, fail: set[str] | None = None, fail_until: dict[str, int] | None = None
+    ) -> None:
         self.hosts: dict[str, HostRecord] = {}
         self.sessions: dict[str, SessionRecord] = {}
         self.fail = fail or set()
+        # `fail_until[method] = N`: the first N calls to `method` raise, the (N+1)th succeeds.
+        # This is how the #26 recovery tests order a registry that is down at boot and recovers
+        # later -- `fail` alone can only model a registry that is down forever.
+        self.fail_until = dict(fail_until or {})
+        self.calls: dict[str, int] = {}
         self.host_writes = 0
 
     def _maybe_fail(self, method: str) -> None:
+        self.calls[method] = self.calls.get(method, 0) + 1
         if method in self.fail:
             raise RuntimeError(f"{method} is unavailable")
+        if self.calls[method] <= self.fail_until.get(method, 0):
+            raise RuntimeError(f"{method} is unavailable (attempt {self.calls[method]})")
 
     def upsert_host(self, record: HostRecord) -> None:
         self._maybe_fail("upsert_host")
@@ -687,3 +701,260 @@ def test_the_tmux_description_survives_a_missing_binary() -> None:
     """E6 records this so "which tmux" is already answered when a host behaves oddly. A missing
     binary is a normal outcome and must not fail enrollment."""
     assert "at /nonexistent/tmux" in enroll.tmux_description("/nonexistent/tmux")
+
+
+# ------------------------------------------------------- #26: enrollment recovery loop
+# `_recover_enrollment` re-runs `enroll()` on the daemon thread until it succeeds or a regime
+# terminates it. These tests drive it with a no-op `sleep` (returns False, so it never waits and
+# never stops itself) and an injected clock, so the four regimes are reachable without real time.
+def _warming_credential(values: list[str | None]) -> Callable[[], str | None]:
+    """A `credential_email` callable that returns each value in turn, then repeats the last.
+
+    Models a credential that is absent at boot and appears on a later pass (the operator runs
+    `databricks auth login`), which is #26 case 1's cold-then-warm owner.
+    """
+    state = {"i": 0}
+
+    def _cred() -> str | None:
+        i = state["i"]
+        state["i"] = i + 1
+        return values[min(i, len(values) - 1)]
+
+    return _cred
+
+
+def _recover(
+    registry: object,
+    adapter: object,
+    tmp_path: Path,
+    **kwargs: object,
+) -> tuple[EnrollmentResult, dict[str, int]]:
+    """Drive `_recover_enrollment` the way `start_enrollment` does (identity resolved first).
+
+    Returns the result plus a call-count dict so a test can assert how many passes ran (each
+    pass builds one adapter via the factory).
+    """
+    identity.resolve_host_id(str(tmp_path))
+    counts = {"passes": 0}
+
+    def adapter_factory() -> object:
+        counts["passes"] += 1
+        return adapter
+
+    defaults: dict[str, object] = {
+        "state_dir": str(tmp_path),
+        "host_id": "h1",
+        "kind": "lakebox",
+        "tmux_socket": "/s.sock",
+        "tmux_bin": "tmux",
+        "credential_email": "creator@example.com",
+        "now": lambda: T0,
+        "sleep": lambda _interval: False,
+        "sdk_present": True,
+    }
+    defaults.update(kwargs)
+    result = _recover_enrollment(registry, adapter_factory, **defaults)  # type: ignore[arg-type]
+    return result, counts
+
+
+def test_a_warm_later_owner_recovers_the_first_session(tmp_path: Path) -> None:
+    """#26 case 1: the owner is unresolvable at boot, then resolves. The live session created
+    before it warmed had no row (E2d wrote nothing); once the owner resolves, E5b re-projects
+    it with tmux's real clocks."""
+    registry = FakeRegistry()
+    adapter = FakeAdapter({"s1": "h1"})  # one live, non-foreign session with no registry row
+    result, counts = _recover(
+        registry,
+        adapter,
+        tmp_path,
+        credential_email=_warming_credential([None, None, "creator@example.com"]),
+    )
+    assert result.enrolled and result.owner_email == "creator@example.com"
+    assert counts["passes"] == 3  # deferred twice, then enrolled
+    assert result.reprojected == 1
+    row = registry.get_session(session_id_for("h1", "s1"))
+    assert row is not None and row.status == "live"
+    assert row.created_at == datetime.fromtimestamp(_LIVE_CREATED_AT, tz=UTC)
+    assert row.last_activity_at == datetime.fromtimestamp(_LIVE_ACTIVITY_AT, tz=UTC)
+
+
+def test_a_registry_late_host_recovers_when_the_registry_returns(tmp_path: Path) -> None:
+    """#26 case 2: the owner resolves immediately, but `upsert_host` (E4) fails while the
+    registry is unreachable. Recovery stays patient and enrolls once the registry returns."""
+    registry = FakeRegistry(fail_until={"upsert_host": 2})
+    adapter = FakeAdapter()
+    result, counts = _recover(registry, adapter, tmp_path)
+    assert result.enrolled
+    assert counts["passes"] == 3  # E4 failed twice, landed on the third
+    assert "h1" in registry.hosts
+    assert registry.host_writes == 1  # only the successful write counts
+
+
+def test_the_autostop_warning_fires_once_across_patient_retries(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R1: `enroll()` re-runs each patient pass, and `warn_about_autostop` on a sandbox_id-None
+    host would otherwise emit a WARNING every retry for the process's life. The driver's latch
+    fires it exactly once."""
+    registry = FakeRegistry(fail_until={"upsert_host": 2})
+    adapter = FakeAdapter()
+    with caplog.at_level("WARNING"):
+        result, counts = _recover(registry, adapter, tmp_path)  # sandbox_id defaults to None
+    assert result.enrolled and counts["passes"] == 3
+    warnings = [r for r in caplog.records if "cannot evaluate" in r.message]
+    assert len(warnings) == 1, f"autostop WARNING fired {len(warnings)} times, expected once"
+
+
+def test_a_no_sdk_owner_defer_terminates_in_one_pass(tmp_path: Path) -> None:
+    """Regime 2: with no importable SDK the credential owner can never resolve and neither the
+    cache nor the env warms on its own, so recovery gives up after a single pass rather than
+    keeping a thread alive on a headless host for the process's life."""
+    registry = FakeRegistry()
+    adapter = FakeAdapter()
+    result, counts = _recover(
+        registry,
+        adapter,
+        tmp_path,
+        credential_email=lambda: None,
+        env_email=None,
+        sdk_present=False,
+    )
+    assert not result.enrolled and result.owner_email is None
+    assert counts["passes"] == 1
+    assert registry.hosts == {}
+
+
+def test_a_credential_error_defer_retries_then_promotes(tmp_path: Path) -> None:
+    """Regime 3: SDK present but no auth at boot (the common laptop/CI case). Recovery retries
+    within the window and promotes once the credential appears."""
+    registry = FakeRegistry()
+    adapter = FakeAdapter()
+    result, counts = _recover(
+        registry,
+        adapter,
+        tmp_path,
+        credential_email=_warming_credential([None, None, None, "creator@example.com"]),
+    )
+    assert result.enrolled and result.owner_email == "creator@example.com"
+    assert counts["passes"] == 4
+
+
+def test_a_credential_that_never_resolves_terminates_at_the_window(tmp_path: Path) -> None:
+    """Regime 3 give-up: the window is wall-clock, so a credential that never appears ends the
+    thread once the window elapses rather than retrying forever."""
+    registry = FakeRegistry()
+    adapter = FakeAdapter()
+    # start=T0; the first window check is under the window, the second is past it.
+    times = iter([T0, T0 + timedelta(seconds=1000), T0 + timedelta(seconds=2000)])
+    last = [T0]
+
+    def now() -> datetime:
+        try:
+            last[0] = next(times)
+        except StopIteration:
+            pass
+        return last[0]
+
+    result, counts = _recover(
+        registry,
+        adapter,
+        tmp_path,
+        credential_email=lambda: None,
+        now=now,
+        owner_window=OWNER_RESOLUTION_WINDOW_SECONDS,  # 1800s; crossed between the two checks
+    )
+    assert not result.enrolled and result.owner_email is None
+    assert counts["passes"] == 2  # retried once, gave up at the second window check
+    assert registry.hosts == {}
+
+
+def test_no_recovery_pass_raises_even_when_every_method_fails(tmp_path: Path) -> None:
+    """The whole-module invariant, at the recovery layer: a registry that fails every method
+    must leave `_recover_enrollment` returning a result, never raising. `sleep` stops the
+    otherwise-patient loop after a few tries."""
+    registry = FakeRegistry(
+        fail={"upsert_host", "upsert_session", "get_host", "get_session", "list_sessions_for_host"}
+    )
+    adapter = FakeAdapter()
+    tries = {"n": 0}
+
+    def sleep(_interval: float) -> bool:
+        tries["n"] += 1
+        return tries["n"] >= 3  # stop after three patient retries
+
+    result, counts = _recover(registry, adapter, tmp_path, sleep=sleep)
+    assert isinstance(result, EnrollmentResult)
+    assert not result.enrolled
+    assert counts["passes"] >= 1
+
+
+def test_a_successful_first_pass_returns_enrolled_after_one_attempt(tmp_path: Path) -> None:
+    """No added latency on the healthy path: an owner that resolves immediately and a reachable
+    registry enroll on the first pass, exactly as the pre-#26 single call did."""
+    registry = FakeRegistry()
+    adapter = FakeAdapter()
+    result, counts = _recover(registry, adapter, tmp_path)
+    assert result.enrolled and counts["passes"] == 1
+
+
+def test_a_warming_owner_then_a_flapping_registry_still_enrolls(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The regimes compose: owner deferred twice (regime 3), then the registry flaps on E4
+    (regime 4), then it lands. The autostop latch still fires exactly once across the whole
+    sequence."""
+    registry = FakeRegistry(fail_until={"upsert_host": 2})
+    adapter = FakeAdapter()
+    with caplog.at_level("WARNING"):
+        result, counts = _recover(
+            registry,
+            adapter,
+            tmp_path,
+            credential_email=_warming_credential([None, None, "creator@example.com"]),
+        )
+    assert result.enrolled
+    # two E2d defers + two E4 failures + one landing == five passes
+    assert counts["passes"] == 5
+    warnings = [r for r in caplog.records if "cannot evaluate" in r.message]
+    assert len(warnings) == 1
+
+
+def test_start_enrollment_starts_exactly_one_heartbeat_after_a_late_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cross-instance double-start guard: promoting once and returning is what stops a
+    second heartbeat. A late (registry-flap) success must still start exactly one. Retry
+    intervals are patched to zero so the real daemon thread finishes promptly, and each started
+    `Heartbeat` is captured so the assertion reads "one heartbeat started" directly (and can be
+    stopped, rather than leaking a daemon)."""
+    monkeypatch.setattr(enroll, "ENROLL_RETRY_INITIAL_SECONDS", 0.0)
+    monkeypatch.setattr(enroll, "ENROLL_RETRY_MAX_SECONDS", 0.0)
+    started: list[Heartbeat] = []
+    original_start = enroll.Heartbeat.start
+
+    def recording_start(self: Heartbeat) -> None:
+        started.append(self)
+        original_start(self)
+
+    monkeypatch.setattr(enroll.Heartbeat, "start", recording_start)
+
+    identity.resolve_host_id(str(tmp_path))
+    registry = FakeRegistry(fail_until={"upsert_host": 1})  # one E4 failure, then success
+    thread = enroll.start_enrollment(
+        registry,
+        FakeAdapter,  # a fresh FakeAdapter() per attempt
+        state_dir=str(tmp_path),
+        host_id="h1",
+        kind="lakebox",
+        tmux_socket="/s.sock",
+        tmux_bin="tmux",
+        env_email="creator@example.com",
+    )
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    try:
+        assert len(started) == 1, f"expected one heartbeat started, found {len(started)}"
+        assert "h1" in registry.hosts
+    finally:
+        for beat in started:
+            beat.stop(timeout=1.0)  # daemon cleanup so it does not leak into other tests

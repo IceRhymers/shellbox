@@ -34,12 +34,13 @@ principal rather than a placeholder.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import subprocess
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from shellbox_registry import HostRecord, Registry, SessionRecord
 
@@ -74,9 +75,22 @@ STATUS_REAPED = "reaped"
 # 32 processes heartbeating do not become a write load of their own.
 HEARTBEAT_SECONDS = 60.0
 
-# E5's debounce. Orphan reconciliation is a bulk status write over every session row for this
-# host; running it on every enrollment pass in a 32-process pool would be 32 identical sweeps.
-RECONCILE_DEBOUNCE_SECONDS = 30.0
+# Enrollment recovery (#26). `enroll()` is one-shot; `_recover_enrollment` re-invokes it on the
+# backgrounded daemon thread until it succeeds or a regime terminates it. The first retry waits
+# INITIAL and doubles up to MAX, so a briefly-unreachable registry or a not-yet-warm owner is
+# retried without hammering a down control plane.
+ENROLL_RETRY_INITIAL_SECONDS = 5.0
+ENROLL_RETRY_MAX_SECONDS = 60.0
+
+# How long recovery keeps retrying an owner that resolves to nothing (E2d) while the SDK *is*
+# importable -- long enough to catch an operator running `databricks auth login` a few minutes
+# after boot, bounded so a genuinely headless host (no credential, no one to log in) ends the
+# thread instead of retrying for the process's whole life. A mostly-sleeping daemon thread over
+# this window is nearly free; the cost asymmetry favours erring long (over-waiting on a headless
+# host is cheap, under-waiting silently misses a slow login), so operators can raise it via
+# SHELLBOX_OWNER_RESOLUTION_WINDOW_SECONDS. SDK-absent is handled separately (a stripped install
+# can never resolve a credential owner, so recovery there terminates after a single pass).
+OWNER_RESOLUTION_WINDOW_SECONDS = 1800.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,12 +525,18 @@ def enroll(
     env_email: str | None = None,
     credential_email: str | None | Callable[[], str | None] = resolve_credential_email,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    warn_autostop: bool = True,
 ) -> EnrollmentResult:
     """Run E2-E6 once. Never raises.
 
     ``credential_email`` is a callable by default so the network call happens *inside* this
     function, on the background thread, rather than in the caller that decides whether to spawn
     one. Tests pass a value or ``None`` directly.
+
+    ``warn_autostop`` gates E6's R8 autostop warning (default ``True``, so every existing caller
+    is unchanged). `_recover_enrollment` (#26) calls `enroll()` in a loop and sets this ``False``
+    on every pass after the first that resolves an owner, so a host with no ``sandbox_id`` gets
+    the WARNING once rather than once per retry for the process's life.
     """
     credential = credential_email() if callable(credential_email) else credential_email
 
@@ -539,7 +559,8 @@ def enroll(
         )
 
     stamped = stamp_sessions(adapter, host_id)
-    warn_about_autostop(sandbox_id)
+    if warn_autostop:
+        warn_about_autostop(sandbox_id)
     timestamp = now()
 
     # E4. `enrolled_at` is passed but preserved on conflict by the registry, so the first
@@ -685,6 +706,154 @@ class Heartbeat:
             self._thread = None
 
 
+# --------------------------------------------------------------------------------------
+# Recovery (#26) -- keep re-running enroll() until it succeeds or a regime terminates it
+# --------------------------------------------------------------------------------------
+def _databricks_sdk_present() -> bool:
+    """Whether ``databricks.sdk`` can be imported at all.
+
+    Defensive on purpose: ``find_spec`` does not merely return ``None`` for a missing module --
+    it *raises* ``ModuleNotFoundError`` when the parent ``databricks`` package is entirely
+    absent, which is precisely the stripped-install case this probe exists to catch. If that
+    exception escaped into `_recover_enrollment`'s loop-body guard it would be swallowed and the
+    host would retry-in-window (regime 3) instead of terminating in one pass (regime 2). So any
+    probe failure is treated as "absent".
+    """
+    try:
+        return importlib.util.find_spec("databricks.sdk") is not None
+    except (ImportError, ValueError):  # ModuleNotFoundError is an ImportError subclass
+        return False
+
+
+def _recover_enrollment(
+    registry: Registry,
+    adapter_factory: Callable[[], TmuxAdapter],
+    *,
+    state_dir: str,
+    host_id: str,
+    kind: str,
+    tmux_socket: str,
+    tmux_bin: str,
+    sandbox_id: str | None = None,
+    gateway_host: str | None = None,
+    env_email: str | None = None,
+    credential_email: str | None | Callable[[], str | None] = resolve_credential_email,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    sleep: Callable[[float], bool] | None = None,
+    owner_window: float = OWNER_RESOLUTION_WINDOW_SECONDS,
+    sdk_present: bool | None = None,
+) -> EnrollmentResult:
+    """Re-invoke `enroll()` until it succeeds or the outcome is terminal. Never raises.
+
+    `enroll()` is one-shot, but issue #26 has two states it cannot recover from on its own: an
+    owner that is unresolvable at boot but resolves later (a cache warms, an operator runs
+    `databricks auth login`), and a registry that is unreachable at boot but recovers later. In
+    both, `start_enrollment.run()` returns before starting the heartbeat, so nothing ever
+    re-runs enrollment. This driver, on the same daemon thread, keeps trying and classifies each
+    `EnrollmentResult` into one of four mutually-exclusive regimes:
+
+    * ``enrolled`` -> return; the caller promotes (Heartbeat + Reaper).
+    * owner ``None`` and the SDK is not importable -> terminate after one pass. A stripped
+      install has no credential path, and neither the cache nor the env warms on its own, so
+      this can never resolve; retrying would be the "forever thread on a headless host" #26
+      explicitly rejects.
+    * owner ``None`` and the SDK *is* importable -> the common laptop/CI case (SDK present, no
+      auth). Retry with backoff until ``owner_window`` wall-clock elapses, then terminate. Long
+      enough to catch a human logging in; bounded so a genuinely headless host still ends.
+    * owner set but ``error`` set (E4/`upsert_host` failed) -> registry-late. Retry at the
+      capped interval, unbounded in count, for the process's life: a resolved owner plus a
+      written intent is positive evidence the host belongs in inventory and only infra is down.
+
+    ``sleep(interval)`` returns ``True`` to stop (default wraps a never-set ``Event.wait``, so it
+    just sleeps and returns ``False``; tests inject a no-op). ``credential_email`` is re-invoked
+    every pass, which is how a warming credential is picked up. The SDK-present decision is
+    computed **once, before the loop**, so a `find_spec` probe failure can never be swallowed by
+    the loop-body guard.
+    """
+    if sdk_present is None:
+        sdk_present = _databricks_sdk_present()
+    if sleep is None:
+        sleep = threading.Event().wait  # never set here; daemon teardown ends the thread
+
+    start = now()
+    autostop_warned = False
+    # A valid result to return even if the very first pass somehow raises (it should not --
+    # `enroll()` never raises -- but the driver's own contract is never-None, never-raise).
+    result = EnrollmentResult(
+        host_id=host_id,
+        owner_email=None,
+        enrolled=False,
+        error="enrollment recovery made no completed pass",
+    )
+    owner_attempts = 0
+    while True:
+        try:
+            result = enroll(
+                registry,
+                adapter_factory(),
+                state_dir=state_dir,
+                host_id=host_id,
+                kind=kind,
+                tmux_socket=tmux_socket,
+                tmux_bin=tmux_bin,
+                sandbox_id=sandbox_id,
+                gateway_host=gateway_host,
+                env_email=env_email,
+                credential_email=credential_email,
+                now=now,
+                warn_autostop=not autostop_warned,
+            )
+        except Exception as exc:  # noqa: BLE001 -- recovery may not raise; enroll() already guards
+            logger.warning(
+                "enrollment recovery pass raised (%s: %s); retrying", type(exc).__name__, exc
+            )
+            if sleep(ENROLL_RETRY_MAX_SECONDS):
+                return result
+            continue
+
+        if result.owner_email is not None:
+            # Latch: the autostop WARNING (E6/R8) is a one-shot fact, not a per-pass one. Once an
+            # owner resolves, `enroll()` reaches `warn_about_autostop`; suppress it on every later
+            # pass so a registry-late host with no sandbox_id does not log it once per retry.
+            autostop_warned = True
+        if result.enrolled:
+            return result
+
+        if result.owner_email is None:
+            if not sdk_present:
+                logger.info(
+                    "databricks-sdk is not importable; the credential owner cannot resolve and "
+                    "enrollment stays deferred (host %s)",
+                    host_id,
+                )
+                return result
+            if now() - start >= timedelta(seconds=owner_window):
+                logger.info(
+                    "no owner_email resolved for host %s within %.0fs; enrollment stays "
+                    "deferred. Run `databricks auth login` (or set SHELLBOX_OWNER_EMAIL) and "
+                    "restart to enroll this host.",
+                    host_id,
+                    owner_window,
+                )
+                return result
+            owner_attempts += 1
+            interval = min(
+                ENROLL_RETRY_INITIAL_SECONDS * 2 ** (owner_attempts - 1),
+                ENROLL_RETRY_MAX_SECONDS,
+            )
+        else:
+            # Registry-late: owner resolved, but E4 could not write the hosts row. Patient.
+            logger.debug(
+                "registry unavailable for host %s (%s); retrying enrollment",
+                host_id,
+                result.error,
+            )
+            interval = ENROLL_RETRY_MAX_SECONDS
+
+        if sleep(interval):
+            return result
+
+
 def start_enrollment(
     registry: Registry,
     adapter_factory: Callable[[], TmuxAdapter],
@@ -701,6 +870,7 @@ def start_enrollment(
     reap_timeout_seconds: float | None = None,
     reap_interval_seconds: float | None = None,
     reaper_adapter_factory: Callable[[], TmuxAdapter] | None = None,
+    owner_resolution_window_seconds: float = OWNER_RESOLUTION_WINDOW_SECONDS,
 ) -> threading.Thread:
     """Run enrollment on a daemon thread and start the heartbeat if it succeeded.
 
@@ -723,15 +893,23 @@ def start_enrollment(
     tmux calls must be bounded (`ADR-37`/`R69`) while every other adapter this module builds
     stays unbounded -- `adapter_factory` is reused as a fallback only when the caller has no
     reason to tell the two apart (e.g. a test).
+
+    ``owner_resolution_window_seconds`` bounds how long recovery (#26) retries an owner that is
+    unresolvable at boot but whose SDK is present (the common laptop/CI case). See
+    `_recover_enrollment` and `OWNER_RESOLUTION_WINDOW_SECONDS`.
     """
 
     def run() -> None:
-        # A fresh adapter, because this thread runs concurrently with tool calls and
-        # `TmuxAdapter` is constructed per use everywhere else for the same reason.
-        adapter = adapter_factory()
-        result = enroll(
+        # `_recover_enrollment` (#26) re-runs `enroll()` until it succeeds or a regime
+        # terminates it, building a fresh adapter per attempt (this thread runs concurrently
+        # with tool calls and `TmuxAdapter` is constructed per use everywhere else for the same
+        # reason). `env_email` is captured ONCE here: exporting `SHELLBOX_OWNER_EMAIL` *after*
+        # the process starts does NOT warm this path, because it is a fixed value, not a
+        # callable. Only the credential path (`resolve_credential_email`, re-invoked each pass)
+        # picks up an owner that appears later -- which is the cold-then-warm avenue #26 targets.
+        result = _recover_enrollment(
             registry,
-            adapter,
+            adapter_factory,
             state_dir=state_dir,
             host_id=host_id,
             kind=kind,
@@ -740,9 +918,25 @@ def start_enrollment(
             sandbox_id=sandbox_id,
             gateway_host=gateway_host,
             env_email=env_email,
+            owner_window=owner_resolution_window_seconds,
         )
         if not (heartbeat and result.enrolled and result.owner_email):
             return
+        # DOUBLE-START GUARD (#26): promoting once and then falling off the end of `run()` (an
+        # implicit return) is the ONLY guard against a second heartbeat/reaper for this host from
+        # this process. `Heartbeat.start()`/`Reaper.start()` are idempotent per *instance*
+        # (they no-op if their own thread is already running), which does NOT stop a second
+        # `_recover_enrollment` from constructing a fresh instance and starting it. The driver
+        # returns exactly once on `enrolled=True` and `run()` never loops back here, so at most
+        # one of each is started. Do NOT add a loop around this block.
+        #
+        # RESIDUAL (#26): promotion gates on `enrolled=True` alone. If E5b's `upsert_session`
+        # lost a row to a *transient* failure (see `reproject_live_sessions`, above) inside an
+        # otherwise-successful late enroll, that one live session stays unprojected for the
+        # process's life -- the heartbeat only re-upserts the hosts row, it does not re-project.
+        # This is no regression versus pre-#24 (the same transient loss was equally permanent
+        # then); it is tracked on issue #26 and is closable later by a debounced reproject in
+        # `Heartbeat.beat()`.
         Heartbeat(
             registry=registry,
             host_id=host_id,

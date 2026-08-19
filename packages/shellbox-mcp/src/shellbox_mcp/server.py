@@ -840,6 +840,7 @@ def serve(settings: Settings | None = None) -> None:
             reaper_adapter_factory=lambda: TmuxAdapter(
                 resolved.tmux_config(timeout=TMUX_CALL_TIMEOUT_SECONDS)
             ),
+            owner_resolution_window_seconds=resolved.owner_resolution_window_seconds,
         )
 
     server.run()

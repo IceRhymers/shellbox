@@ -58,6 +58,7 @@ DEFAULTS = {
     "SHELLBOX_MAX_SEND_LINE_BYTES": 1000,
     "SHELLBOX_IDLE_TIMEOUT_SECONDS": 1800,
     "SHELLBOX_REAP_INTERVAL_SECONDS": 60,
+    "SHELLBOX_OWNER_RESOLUTION_WINDOW_SECONDS": 1800,
 }
 
 _LOG_LEVELS: frozenset[str] = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -87,6 +88,9 @@ class Settings:
     max_send_line_bytes: int
     idle_timeout_seconds: int
     reap_interval_seconds: int
+    owner_resolution_window_seconds: int
+    """How long enrollment recovery (#26) retries an SDK-present, owner-unresolvable host before
+    giving up. See ``enroll.OWNER_RESOLUTION_WINDOW_SECONDS``."""
     log_level: LogLevel
     database_dsn: str | None = None
     owner_email: str | None = None
@@ -126,6 +130,9 @@ class Settings:
             ),
             reap_interval_seconds=_bounded_int_env(
                 env, "SHELLBOX_REAP_INTERVAL_SECONDS", minimum=10, maximum=3600
+            ),
+            owner_resolution_window_seconds=_bounded_int_env(
+                env, "SHELLBOX_OWNER_RESOLUTION_WINDOW_SECONDS", minimum=60, maximum=86400
             ),
             log_level=log_level_from_env(env),
             # `dsn_from_env` reads the process environment itself (it also assembles a DSN

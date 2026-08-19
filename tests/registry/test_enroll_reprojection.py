@@ -12,9 +12,11 @@ row once the host row is present.
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 import pytest
-from shellbox_mcp.enroll import reproject_live_sessions, session_id_for
+from shellbox_mcp import identity
+from shellbox_mcp.enroll import _recover_enrollment, reproject_live_sessions, session_id_for
 from shellbox_registry import HostRecord, SessionRecord
 from sqlalchemy.exc import IntegrityError
 
@@ -98,3 +100,76 @@ def test_reprojection_lands_a_row_that_the_fk_first_rejects(registry) -> None:
     assert row.created_at == dt.datetime.fromtimestamp(CREATED_AT_EPOCH, tz=dt.UTC)
     assert row.last_activity_at == dt.datetime.fromtimestamp(ACTIVITY_AT_EPOCH, tz=dt.UTC)
     assert [r.session_id for r in registry.list_sessions_for_host(HOST_ID)] == [sid]
+
+
+class _ColdHostAdapter:
+    """A tmux adapter with exactly one live, non-foreign, unstamped session -- enough to drive
+    the full `enroll()` path (`stamp_sessions` + E5b), unlike `_OneLiveSession` which is only
+    ever handed to `reproject_live_sessions` directly."""
+
+    def list_sessions(self) -> list[object]:
+        return [
+            type(
+                "S",
+                (),
+                {
+                    "tmux_name": TMUX_NAME,
+                    "created_at": CREATED_AT_EPOCH,
+                    "last_activity_at": ACTIVITY_AT_EPOCH,
+                    "cols": 120,
+                    "rows": 40,
+                    "cwd": "/work",
+                    "incarnation": "inc-1",
+                    "foreign": False,
+                },
+            )()
+        ]
+
+    def read_host_stamp(self, name: str) -> str | None:
+        return None  # unstamped, so `stamp_sessions` stamps it
+
+    def stamp_host_id(self, name: str, host_id: str) -> bool:
+        return True
+
+
+def test_recovery_reprojects_the_first_session_when_the_owner_warms_late(
+    registry, tmp_path: Path
+) -> None:
+    """#26 case 1 end-to-end against the real FK: the owner is unresolvable at boot (so E2d
+    writes nothing and the first live session has no row), then resolves on a later pass.
+    `_recover_enrollment` re-runs `enroll()`, E4 lands the host row, and E5b re-projects the
+    session that never had one -- with tmux's real epoch clocks and a satisfied FK."""
+    host_id = "h-reproject-recover"
+    sid = session_id_for(host_id, TMUX_NAME)
+    identity.resolve_host_id(str(tmp_path))  # create host.json so the owner can be cached
+
+    # No host row and no session row exist yet: this is a cold host mid-boot.
+    assert registry.get_host(host_id) is None
+    assert registry.get_session(sid) is None
+
+    warming = iter([None, OWNER])  # deferred once, then the credential appears
+
+    result = _recover_enrollment(
+        registry,
+        _ColdHostAdapter,
+        state_dir=str(tmp_path),
+        host_id=host_id,
+        kind="lakebox",
+        tmux_socket="/s.sock",
+        tmux_bin="tmux",
+        credential_email=lambda: next(warming, OWNER),
+        now=lambda: NOW,
+        sleep=lambda _interval: False,  # never wait, never self-stop
+        sdk_present=True,
+    )
+
+    assert result.enrolled and result.owner_email == OWNER
+    assert result.reprojected == 1
+
+    row = registry.get_session(sid)
+    assert row is not None
+    assert (row.status, row.owner_email, row.host_id) == ("live", OWNER, host_id)
+    assert row.created_at == dt.datetime.fromtimestamp(CREATED_AT_EPOCH, tz=dt.UTC)
+    assert row.last_activity_at == dt.datetime.fromtimestamp(ACTIVITY_AT_EPOCH, tz=dt.UTC)
+    # The FK target the cold-host race could not satisfy is now present.
+    assert registry.get_host(host_id) is not None

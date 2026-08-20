@@ -199,6 +199,59 @@ def test_a_count_below_the_floor_fails_hosts(tmp_path: Path) -> None:
     assert f"floor of {MIN_ARTIFACT_COUNT}" in result.stderr
 
 
+def test_a_first_party_file_url_is_allowed(tmp_path: Path) -> None:
+    """OQ-7, measured: the workspace wheels R9 builds locally are recorded as `file://` URLs with
+    no host. They are first-party and carry no external provenance, so `--assert-hosts` allows them
+    by SCHEME while still requiring every remote URL to be on the one public host."""
+    document = _lock(max(MIN_ARTIFACT_COUNT, 3))
+    document["locked_resolves"][0]["locked_requirements"].append(
+        {
+            "project_name": "shellbox-mcp",
+            "version": "0.1.0",
+            "artifacts": [
+                {
+                    "url": "file:///tmp/build/wheels/shellbox_mcp-0.1.0-py3-none-any.whl",
+                    "hash": "sha256:" + "a" * 64,
+                    "algorithm": "sha256",
+                }
+            ],
+        }
+    )
+    path = _write(tmp_path / "shellbox.lock", document)
+    result = _run("--assert-hosts", str(path))
+    assert result.returncode == 0, result.stderr
+    assert "first-party" in result.stdout
+
+
+def test_a_lock_of_only_file_urls_fails_the_floor(tmp_path: Path) -> None:
+    """The floor counts the THIRD-PARTY set: a lock holding only first-party file:// wheels and no
+    remote dependencies is a broken resolve, and the file:// wheels must not paper over it."""
+    document = {
+        "pex_version": "2.100.4",
+        "locked_resolves": [
+            {
+                "locked_requirements": [
+                    {
+                        "project_name": "shellbox-mcp",
+                        "version": "0.1.0",
+                        "artifacts": [
+                            {
+                                "url": "file:///tmp/build/wheels/shellbox_mcp-0.1.0-py3-none-any.whl",
+                                "hash": "sha256:" + "a" * 64,
+                                "algorithm": "sha256",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ],
+    }
+    path = _write(tmp_path / "shellbox.lock", document)
+    result = _run("--assert-hosts", str(path))
+    assert result.returncode != 0
+    assert "floor" in result.stderr
+
+
 # --- --assert-hashes-unchanged ----------------------------------------------------------------
 
 

@@ -341,6 +341,26 @@ def test_a_mirror_url_fails_hosts(tmp_path: Path) -> None:
     assert MIRROR_HOST in result.stderr
 
 
+def test_a_first_party_file_url_is_allowed_hosts(tmp_path: Path) -> None:
+    """The three workspace wheels (R9) are recorded with `file://` URLs; they are first-party and
+    allowed by scheme, while every remote dist must still be on the one public host. See OQ-7 in
+    check_pex_lock.py."""
+    manifest = _manifest()
+    manifest["distributions"].append(
+        {
+            "name": "shellbox-mcp",
+            "version": "0.1.0",
+            "tag": "py3-none-any",
+            "hash": "sha256:" + "9" * 64,
+            "url": "file:///tmp/build/wheels/shellbox_mcp-0.1.0-py3-none-any.whl",
+        }
+    )
+    artifact = _make_artifact(tmp_path, manifest=manifest)
+    result = _run("--assert-hosts", str(artifact))
+    assert result.returncode == 0, result.stderr
+    assert "first-party" in result.stdout
+
+
 def test_a_host_that_merely_contains_the_allowed_host_fails(tmp_path: Path) -> None:
     manifest = _manifest()
     manifest["distributions"][0]["url"] = (

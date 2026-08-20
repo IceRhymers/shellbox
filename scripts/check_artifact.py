@@ -330,8 +330,15 @@ def assert_hosts(path: Path) -> int:
                 f"{MANIFEST_NAME} records no distribution URLs at all, so their provenance cannot "
                 f"be checked. build_artifact.sh must record the resolved URL per distribution."
             )
+        # A `file://` URL is a FIRST-PARTY workspace wheel (shellbox-mcp/-registry/-transport),
+        # built locally from this repo and handed to pex via --find-links (R9); it carries no
+        # external provenance beyond the git sha the MANIFEST already records. Allowed by SCHEME,
+        # so a third-party mirror-resolved wheel (always http(s)) cannot pass as hostless. This
+        # mirrors check_pex_lock.py's rule; see OQ-7 there.
+        remote = [(name, url) for name, url in urls if urlsplit(url).scheme != "file"]
+        first_party = len(urls) - len(remote)
         offenders = []
-        for name, url in urls:
+        for name, url in remote:
             host = urlsplit(url).hostname or ""
             if host != ALLOWED_HOST:
                 offenders.append((name, host or "(no host)", url))
@@ -340,12 +347,15 @@ def assert_hosts(path: Path) -> int:
                 print(f"  {name}: host {host!r} in {url}", file=sys.stderr)
             hosts = sorted({host for _, host, _ in offenders})
             return _fail(
-                f"{len(offenders)} of {len(urls)} distribution URLs name a host other than "
-                f"{ALLOWED_HOST}: {', '.join(hosts)}. The artifact was built from a lock resolved "
-                f"through another index; the mirror→public rewrite (build_artifact.sh) did not run "
-                f"or did not reach every URL."
+                f"{len(offenders)} of {len(remote)} remote distribution URLs name a host other "
+                f"than {ALLOWED_HOST}: {', '.join(hosts)}. The artifact was built from a lock "
+                f"resolved through another index; the mirror→public rewrite (build_artifact.sh) "
+                f"did not run or did not reach every URL."
             )
-    print(f"OK: all {len(urls)} distribution URLs are on {ALLOWED_HOST}.")
+    print(
+        f"OK: all {len(remote)} remote distribution URLs are on {ALLOWED_HOST} "
+        f"(+{first_party} first-party file:// workspace wheels)."
+    )
     return 0
 
 
@@ -482,7 +492,8 @@ def assert_platform(path: Path) -> int:
             f"{ARTIFACT_PLATFORM_SIDECAR} 'platform_tag_aliases' must be a list of tag strings, "
             f"not {type(aliases).__name__}."
         )
-    allowed = {build_tag, *(str(a) for a in aliases), "py3-none-any", "none-any", "py2.py3-none-any"}
+    pure_python = ("py3-none-any", "none-any", "py2.py3-none-any")
+    allowed = {build_tag, *(str(a) for a in aliases), *pure_python}
 
     archive = _open_zip(path)
     if isinstance(archive, int):
@@ -505,11 +516,11 @@ def assert_platform(path: Path) -> int:
             return _fail(
                 f"{len(offenders)} of {len(dists)} distributions carry a tag that is neither the "
                 f"build tag {build_tag!r}, a declared alias {sorted(str(a) for a in aliases)}, nor "
-                f"a pure-Python tag. The resolve produced a different platform than Step 0 measured "
+                f"a pure-Python tag. The resolve produced a different platform than Step 0 saw "
                 f"(a foreign arch, a musllinux wheel, or a manylinux minor above the build floor), "
                 f"or a dist changed its wheel matrix upstream."
             )
-    print(f"OK: all {len(dists)} distributions carry {build_tag!r}, an alias, or a pure-Python tag.")
+    print(f"OK: all {len(dists)} dists carry {build_tag!r}, an alias, or a pure-Python tag.")
     return 0
 
 

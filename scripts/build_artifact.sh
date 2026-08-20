@@ -101,6 +101,18 @@ done
 # THE REWRITE IS REQUIRED, NOT DEFENSIVE -- see the header and `Makefile:224-234`. `pex3 lock`
 # records the mirror hosts it resolved through; the artifact must resolve for everyone, so the
 # hosts are rewritten to public and the rewrite is proven to have touched only hosts.
+#
+# `--no-build` (wheels only, never compile) and a STRICT single-platform resolve against the Step 0
+# `--complete-platform` are the load-bearing pair here, and both are proven by Step 0's own
+# measurement: `uv pip install --python-platform x86_64-manylinux2014 --only-binary :all:` resolved
+# all 45 dists (19 .so, 81 MB) at the manylinux_2_17 floor. Without `--no-build` pex resolved
+# greenlet to its sdist and tried to compile it (`x86_64-linux-gnu-g++` not found -- there is no C++
+# toolchain in the build container, nor should there be): a release artifact must ship the exact
+# manylinux wheels, and a genuinely missing wheel must be a loud error, not a silent local compile.
+# `--style universal` was leftover fat-multi-platform thinking: this artifact ships ONE platform, so
+# a strict resolve for the single complete-platform is both correct and what the Step 0 measurement
+# proved satisfiable -- a universal lock would instead try to satisfy every platform and can pull an
+# sdist for one we never ship.
 LOCK="$BUILD_DIR/shellbox.lock"
 INDEX="${SHELLBOX_BUILD_INDEX:-https://pypi-proxy.dev.databricks.com/simple}"
 
@@ -108,7 +120,7 @@ pex3 lock create \
   --index "$INDEX" \
   --find-links "$WHEELS_DIR" \
   --complete-platform "$COMPLETE_PLATFORM_FILE" \
-  --style universal \
+  --no-build \
   shellbox-mcp \
   --indent 2 \
   -o "$LOCK"
@@ -187,6 +199,7 @@ pex \
   --lock "$LOCK" \
   --find-links "$WHEELS_DIR" \
   --complete-platform "$COMPLETE_PLATFORM_FILE" \
+  --no-build \
   --sources-directory "$ENTRY_DIR" \
   --entry-point _shellbox_entry:main \
   --python-shebang "#!/usr/bin/env python3" \

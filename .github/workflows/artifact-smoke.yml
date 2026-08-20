@@ -51,6 +51,15 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Mark the workspace safe for git
+        run: |
+          # The build stamps the artifact MANIFEST with `git rev-parse HEAD`. Inside this
+          # container the checkout tree is owned by a different UID than the step's user, so git
+          # refuses it as "dubious ownership" and exits 128 before the build starts. actions/checkout
+          # adds this exception for its OWN post-cleanup, not for a later `run:` step's git call, so
+          # the build needs its own. $GITHUB_WORKSPACE is /__w/shellbox/shellbox in a container job.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Assert the pinned tmux version
         run: |
           # A silent tmux bump is what this guards; fail loudly rather than smoke against a

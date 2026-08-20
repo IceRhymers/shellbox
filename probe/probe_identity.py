@@ -22,10 +22,12 @@ output of this script is committed to the repo.
 
 import json
 import os
+import platform
 import re
 import socket
 import subprocess
 import sys
+import sysconfig
 import time
 
 SANDBOX_ID = os.environ.get("PROBE_SANDBOX_ID", "")
@@ -337,6 +339,87 @@ def boot_hooks():
     )
 
 
+# --------------------------------------------------- CPU architecture + glibc (shellbox#21, F6)
+def architecture():
+    """The sandbox's CPU architecture and glibc floor -- measured NOWHERE in this repo before now.
+
+    shellbox#21 F6: a grep of `docs/sandbox-environment.md` and all of `probe/` for `x86_64`,
+    `aarch64`, `uname` or `machine` returned nothing, yet the release artifact
+    (`scripts/build_artifact.sh`) is platform-pinned, so this fact is load-bearing for it. This
+    lane is what makes it a measurement rather than a guess. Two consumers read what this produces:
+
+    * `scripts/build_artifact.sh` passes `pex --complete-platform <file>`, so the build resolves
+      wheels for THIS sandbox rather than for the CI runner it happens to run on.
+    * `scripts/check_artifact.py` reads the committed `probe/artifact-platform.json` for its
+      `--assert-platform` (the single build tag it allows) and `--assert-glibc-ceiling` (this
+      sandbox's glibc is the CEILING: no bundled `.so` may require a newer one).
+
+    SCOPE, written next to the number as this document requires: every row here is measured on ONE
+    sandbox in ONE region (see `docs/sandbox-environment.md` §0), so the glibc it records is a
+    ceiling for that host, not a proven fleet fact. `docs/sandbox-environment.md:5` -- "three
+    earlier design premises were wrong until they were measured" -- is why the artifact builds for
+    a floor (`manylinux_2_17`) at or below whatever this measures, rather than for this exact glibc.
+
+    Standard-library only for the measurement, so it runs on a bare sandbox. The complete-platform
+    file is emitted best-effort: if `pex3` is present it is captured verbatim (that IS pex's
+    format); otherwise this lane records the raw material and the file is generated in CI from an
+    interpreter matching these facts.
+    """
+    machine = platform.machine()
+    libc_name, libc_version = platform.libc_ver()
+    rec(
+        "architecture",
+        machine=machine,
+        libc=[libc_name, libc_version],
+        platform_tag_hint=sysconfig.get_platform(),  # e.g. linux-x86_64; NOT a wheel tag
+        implementation=sys.implementation.name,
+        python_version=platform.python_version(),
+        # `ldd --version` is the authoritative glibc report; `platform.libc_ver()` reads the
+        # executable's strings and can under-report. Recorded together so a disagreement is
+        # visible rather than silently resolved.
+        ldd_version=run("bash", "-lc", "ldd --version 2>&1 | head -1"),
+        getconf_gnu=run("bash", "-lc", "getconf GNU_LIBC_VERSION 2>&1"),
+    )
+
+    # OQ-8 (Option F): does plain `psycopg` (no `[binary]`) find `libpq.so.5` here? One line,
+    # and it decides whether a future artifact can drop the sole cause of the aarch64 tag
+    # asymmetry (shellbox#29). Not blocking #21; measured now because the probe is already here.
+    rec("libpq_present", run=run("bash", "-lc", "ldconfig -p | grep -i libpq || echo absent"))
+
+    # The complete-platform description, best-effort. `pex3 interpreter inspect --markers --tags`
+    # IS the format `pex --complete-platform` consumes; capturing it verbatim avoids reconstructing
+    # it by hand. Written to $HOME so it survives the run and can be copied back and committed as
+    # `probe/complete-platform-<machine>.json`.
+    out_path = os.path.expanduser(f"~/complete-platform-{machine}.json")
+    inspect = run("pex3", "interpreter", "inspect", "--markers", "--tags", timeout=120)
+    if inspect["rc"] == 0 and inspect["out"]:
+        try:
+            with open(out_path, "w", encoding="utf-8") as handle:
+                handle.write(inspect["out"])
+            wrote = out_path
+        except OSError as exc:
+            wrote = f"<{exc.__class__.__name__}: {exc}>"
+    else:
+        wrote = None
+    rec(
+        "complete_platform",
+        pex3_inspect=inspect,
+        wrote_file=wrote,
+        # The fallback material, always recorded: `packaging.tags` if present gives the ordered
+        # wheel tags this interpreter accepts, whose first manylinux entry is the build tag.
+        packaging_tags=run(
+            "python3",
+            "-c",
+            "import json\n"
+            "try:\n"
+            "    from packaging import tags\n"
+            "    print(json.dumps([str(t) for t in list(tags.sys_tags())[:40]]))\n"
+            "except Exception as exc:\n"
+            "    print(json.dumps({'error': f'{type(exc).__name__}: {exc}'}))",
+        ),
+    )
+
+
 # ------------------------------------------------------------------------- riders
 def riders():
     rec("tmux", version=run("tmux", "-V"), which=run("bash", "-lc", "command -v tmux"))
@@ -365,6 +448,7 @@ if __name__ == "__main__":
         credential_shapes,
         identity,
         boot_hooks,
+        architecture,
         riders,
     ):
         try:

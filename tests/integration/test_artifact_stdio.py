@@ -249,45 +249,67 @@ def test_the_psycopg_binary_backend_is_active() -> None:
 def test_a_configured_registry_is_not_degraded_through_the_artifact(
     tmux_server: TmuxServer, tmp_path: Path
 ) -> None:
-    """With a REAL postgres DSN, a session round trip through the artifact records inventory and
-    the ``server.py:349-353`` degradation WARNING does NOT fire.
+    """With a REAL postgres DSN, the registry reaches a NON-degraded projection through the bundled
+    psycopg, and the ``server.py:349-353`` "could not open the registry" WARNING never fires.
 
-    This is the half of AC-17 that imports ``psycopg_binary`` and exercises ``PostgresRegistry``.
-    Its inverse is the whole hazard: if the driver extension were broken, ``_open_registry`` would
-    catch the ImportError, log "could not open the registry", fall back to ``NullRegistry``, and
-    every other smoke gate would still pass. So the assertion is on the ABSENCE of that warning
-    and of any ``registry_warning`` on the successful call.
+    This is the half of AC-17 that drives ``PostgresRegistry`` through the bundled psycopg against a
+    real database. Its inverse is the whole hazard (CRITICAL-1): if the driver extension were broken
+    or wrong-glibc, ``_open_registry`` would catch the ImportError, log "could not open the
+    registry", fall back to ``NullRegistry``, and every other smoke gate would still pass. So the
+    LOAD-BEARING assertion is the absence of that WARNING -- it fires only when the driver/engine
+    could not open at all.
+
+    Enrollment -- the ``hosts`` row, E4 -- runs on a BACKGROUND thread, and ``enroll.py:383-386``
+    documents that the tool-path session INSERT can win the race and raise the
+    ``sessions_host_id_fkey`` constraint:
+    an EXPECTED, self-healing per-call ``registry_warning`` while enrollment is still in flight, not
+    a driver failure. (The harness sets ``SHELLBOX_OWNER_EMAIL``, so enrollment resolves identity
+    locally and E4 upserts the host row without a Databricks credential -- ``server.py:401``.) So a
+    non-degraded projection is proven the honest way: poll a fresh create until the warning clears
+    within a deadline. That it clears at all proves the full write path -- ``upsert_host`` then a
+    clean session projection -- ran through the bundled psycopg against real postgres.
     """
     dsn = os.environ.get(_ARTIFACT_DSN_ENV)
     if not dsn:
         pytest.skip(f"{_ARTIFACT_DSN_ENV} unset (no postgres service container)")
 
     harness = make_harness(tmux_server, tmp_path, command=str(_artifact()))
-    name = harness.name("reg")
-    created, killed = run_calls(
-        harness,
-        [
-            ("shell_create", {"name": name, "cwd": str(tmp_path)}),
-            ("shell_kill", {"session": name}),
-        ],
-        env=harness.env_with(SHELLBOX_DATABASE_URL=dsn),
-    )
+    env = harness.env_with(SHELLBOX_DATABASE_URL=dsn)
 
-    assert created.data["created"] is True
-    # The load-bearing assertion: a non-degraded registry projects cleanly, with no warning.
-    assert created.data["registry_warning"] is None, (
-        f"the registry degraded on create: {created.data['registry_warning']!r} -- the bundled "
-        "psycopg_binary did not load, or PostgresRegistry could not open the DSN"
-    )
-    assert killed.data["killed"] is True
-    assert killed.data["registry_warning"] is None, "the kill projection degraded"
+    deadline = time.monotonic() + 30.0
+    last_warning: str | None = "<no call completed>"
+    cleared = False
+    while time.monotonic() < deadline:
+        name = harness.name("reg")
+        created, killed = run_calls(
+            harness,
+            [
+                ("shell_create", {"name": name, "cwd": str(tmp_path)}),
+                ("shell_kill", {"session": name}),
+            ],
+            env=env,
+        )
+        assert created.data["created"] is True
+        assert killed.data["killed"] is True
+        last_warning = created.data["registry_warning"]
+        if last_warning is None and killed.data["registry_warning"] is None:
+            cleared = True
+            break
+        time.sleep(0.5)
 
     stderr = harness.stderr()
+    # The load-bearing CRITICAL-1 assertion: the driver loaded and the engine opened. Distinct from
+    # the enrollment-race projection warning above, this fires only on a NullRegistry fallback.
     assert "could not open the registry" not in stderr, (
         "the artifact fell back to NullRegistry -- CRITICAL-1's silent degradation, which every "
-        "other gate would have passed"
+        f"other gate would have passed. stderr tail: {stderr[-800:]}"
     )
-    assert "registry projection failed" not in stderr, "a projection failed against real postgres"
+    # And the full write path completed: the host row was enrolled and a session projected cleanly.
+    assert cleared, (
+        "the registry never projected a session cleanly within the deadline; last create warning: "
+        f"{last_warning!r}. Enrollment (upsert_host) did not complete against real postgres. "
+        f"stderr tail: {stderr[-800:]}"
+    )
 
 
 # --- P2 / AC-11: 32 cold starts against a cold cache ------------------------------------------
@@ -301,42 +323,49 @@ def _cold_start_budget_seconds() -> float:
 
 
 @requires_tmux
-def test_thirty_two_cold_starts_all_reach_tools_list(
+def test_thirty_two_starts_share_one_cold_cache_without_corruption(
     tmux_server: TmuxServer, tmp_path: Path
 ) -> None:
-    """32 processes exec the artifact against a COLD cache at once; all reach ``tools/list``.
+    """32 processes exec the artifact at once against ONE cold, shared cache; all reach
+    ``tools/list``.
 
-    This is P2: pooled agents start together, and the first-run extraction of ~81 MB must be
-    lock-safe under concurrency, not race into a half-written ``.so`` or a poisoned cache. Each
-    worker gets its own scratch HOME so the cache root (``$HOME/.cache/shellbox-pex/<version>``,
-    baked into the artifact) starts cold; they share nothing but the artifact and the tmux server.
+    This is P2, modelling the arrangement buzz-lakebox#23 confirmed: ONE long-lived sandbox with a
+    persistent ``$HOME``, pooled agents starting INSIDE it and therefore sharing a single pex cache
+    (``~/.pex``). The property under test is pex's first-run extraction LOCK: when many processes
+    hit a cold shared cache together, exactly one extracts ~81 MB while the rest block on the lock
+    and then reuse the finished cache -- never reading a half-written ``.so`` or deadlocking. A
+    shared cold HOME is both the realistic case and the one that actually exercises the lock; 32
+    private caches would instead be 32×81 MB of parallel I/O that measures the runner's disk, not
+    the artifact.
 
-    The slowest first start is recorded and budgeted. A serialize-on-the-extraction-lock failure
-    (31 workers each waiting out the extraction) would blow the budget rather than pass quietly.
+    HOME is shared (so the cache is contended); SHELLBOX_STATE_DIR is per-worker (so unrelated app
+    state cannot collide). No DSN, so the registry is NullRegistry and the start touches no
+    database. The slowest start is recorded and budgeted; a lock that deadlocked or a cache that
+    corrupted would fail a worker rather than pass quietly.
     """
     artifact = str(_artifact())
     workers = 32
     budget = _cold_start_budget_seconds()
 
+    # One shared, cold HOME -> one contended `~/.pex`. `make_harness` is called ONCE (it creates
+    # tmp_path/"home"); every worker runs against that same home via a per-worker env override.
+    base = make_harness(tmux_server, tmp_path, command=artifact)
+    shared_home = tmp_path / "shared-home"
+    shared_home.mkdir()
+
     def one_start(index: int) -> float:
-        # A private HOME per worker → a cold pex cache per worker, which is the condition under
-        # test. A private state dir too, so the registry layer and identity cache never collide.
-        home = tmp_path / f"home-{index}"
-        home.mkdir()
         env = {
-            **make_harness(tmux_server, tmp_path).env,
-            "HOME": str(home),
+            **base.env,
+            "HOME": str(shared_home),
             "SHELLBOX_STATE_DIR": str(tmp_path / f"state-{index}"),
         }
-        harness = make_harness(tmux_server, tmp_path, command=artifact)
-        harness.env = env
 
         async def script(client: ClientSession) -> int:
             listing = await client.list_tools()
             return len(listing.tools)
 
         started = time.monotonic()
-        count = run_script(harness, script, env=env)
+        count = run_script(base, script, env=env)
         elapsed = time.monotonic() - started
         assert count == len(TOOL_NAMES), f"worker {index} saw {count} tools"
         return elapsed
@@ -345,8 +374,8 @@ def test_thirty_two_cold_starts_all_reach_tools_list(
         elapsed = list(pool.map(one_start, range(workers)))
 
     slowest = max(elapsed)
-    print(f"32-way cold start: slowest first start {slowest:.1f}s (budget {budget:.0f}s)")
+    print(f"32-way shared-cache start: slowest {slowest:.1f}s (budget {budget:.0f}s)")
     assert slowest < budget, (
-        f"the slowest of {workers} cold starts took {slowest:.1f}s (budget {budget:.0f}s); the "
-        "artifact may be serializing on its first-run extraction lock"
+        f"the slowest of {workers} concurrent starts took {slowest:.1f}s (budget {budget:.0f}s); "
+        "the artifact may be deadlocking or serializing pathologically on its extraction lock"
     )

@@ -417,11 +417,14 @@ def test_absent_release_notes_fails(tmp_path: Path) -> None:
 def _sidecar(tmp_path: Path, **overrides: Any) -> Path:
     document = {
         "measured_on": "test-sandbox / fevm-west / us-west-2",
-        "date": "2026-08-19",
+        "date": "2026-08-20",
         "machine": "x86_64",
-        "glibc": "2.35",
+        # The artifact's contract floor, not the sandbox glibc -- see check_artifact.py.
+        "glibc": "2.17",
+        "measured_sandbox_glibc": "2.39",
         "python": "cp312",
         "build_platform_tag": BUILD_TAG,
+        "platform_tag_aliases": ["manylinux2014_x86_64"],
     }
     document.update(overrides)
     path = tmp_path / "artifact-platform.json"
@@ -452,6 +455,27 @@ def test_a_foreign_platform_tag_fails(tmp_path: Path) -> None:
     result = _run("--assert-platform", str(artifact), sidecar=_sidecar(tmp_path))
     assert result.returncode != 0
     assert "aarch64" in result.stderr
+
+
+def test_the_manylinux2014_alias_is_accepted(tmp_path: Path) -> None:
+    """`manylinux2014_x86_64` is the legacy alias of the `manylinux_2_17_x86_64` build tag -- the
+    same glibc-2.17 floor, a different toolchain's spelling -- so a wheel tagged that way passes."""
+    manifest = _manifest()
+    manifest["distributions"][0]["tag"] = "manylinux2014_x86_64"
+    artifact = _make_artifact(tmp_path, manifest=manifest)
+    result = _run("--assert-platform", str(artifact), sidecar=_sidecar(tmp_path))
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_higher_manylinux_minor_on_the_same_arch_fails(tmp_path: Path) -> None:
+    """The invariant the alias must NOT swallow: `manylinux_2_28_x86_64` is the right arch but above
+    the 2.17 floor, so it would raise the artifact's glibc requirement and must be caught."""
+    manifest = _manifest()
+    manifest["distributions"][0]["tag"] = "manylinux_2_28_x86_64"
+    artifact = _make_artifact(tmp_path, manifest=manifest)
+    result = _run("--assert-platform", str(artifact), sidecar=_sidecar(tmp_path))
+    assert result.returncode != 0
+    assert "manylinux_2_28_x86_64" in result.stderr
 
 
 # --- glibc ceiling (Step 0-dependent; ELF path is CI-only) ------------------------------------

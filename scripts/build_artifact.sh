@@ -130,8 +130,14 @@ rm -f "$LOCK.bak"
 # this, a wrong-arch artifact fails at `import pydantic_core` -- the illegible failure P1 exists to
 # prevent. This tiny module runs AFTER pex extraction but BEFORE any extension import (because
 # `cli.py` defers `server`, hence `pydantic_core`, out of module scope), checks the baked machine
-# and glibc, writes ONE line to STDERR and exits non-zero on mismatch, then delegates to
+# and glibc FLOOR, writes ONE line to STDERR and exits non-zero on mismatch, then delegates to
 # `shellbox_mcp.cli:main`. stdout stays untouched -- it is the JSON-RPC wire.
+#
+# $GLIBC is the artifact's contract FLOOR (2.17 for the manylinux_2_17 build), read from the Step 0
+# sidecar's `glibc` -- NOT the build sandbox's own glibc (2.39, recorded as `measured_sandbox_glibc`
+# headroom). The artifact's wheels require glibc >= the floor, so the host check refuses anything
+# below the floor. Baking the sandbox's 2.39 here would wrongly refuse a glibc-2.30 host that the
+# 2.17 wheels run on perfectly.
 ENTRY_DIR="$BUILD_DIR/entry"
 mkdir -p "$ENTRY_DIR"
 cat > "$ENTRY_DIR/_shellbox_entry.py" <<PY
@@ -140,7 +146,7 @@ import platform
 import sys
 
 _EXPECTED_MACHINE = "$MACHINE"
-_GLIBC_CEILING = tuple(int(p) for p in "$GLIBC".split(".")[:2])
+_GLIBC_FLOOR = tuple(int(p) for p in "$GLIBC".split(".")[:2])
 
 
 def main() -> None:
@@ -155,10 +161,10 @@ def main() -> None:
         raise SystemExit(70)
     _, libc = platform.libc_ver()
     have = tuple(int(p) for p in libc.split(".")[:2]) if libc else ()
-    if have and have < _GLIBC_CEILING:
+    if have and have < _GLIBC_FLOOR:
         print(
             f"shellbox: this artifact needs glibc >= "
-            f"{_GLIBC_CEILING[0]}.{_GLIBC_CEILING[1]}, but the host reports {libc}.",
+            f"{_GLIBC_FLOOR[0]}.{_GLIBC_FLOOR[1]}, but the host reports {libc}.",
             file=sys.stderr,
         )
         raise SystemExit(70)

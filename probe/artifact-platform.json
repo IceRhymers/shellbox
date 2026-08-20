@@ -1,0 +1,21 @@
+{
+  "_comment": "Step 0 sidecar for shellbox#21. The single source of truth that scripts/build_artifact.sh and scripts/check_artifact.py both read for the artifact's platform contract. Produced from the live-sandbox probe (probe/probe_identity.py 'architecture' lane) run against gratifying-sablefish-6272 on fevm-west/us-west-2, 2026-08-20. Raw run: probe/artifact-platform-probe-results.jsonl.",
+
+  "measured_on": "gratifying-sablefish-6272 / fevm-west / us-west-2",
+  "date": "2026-08-20",
+  "machine": "x86_64",
+  "python": "3.12.3",
+
+  "build_platform_tag": "manylinux_2_17_x86_64",
+  "platform_tag_aliases": ["manylinux2014_x86_64"],
+
+  "glibc": "2.17",
+  "_glibc_note": "This is the artifact's glibc CONTRACT, not the sandbox's glibc. Per the shellbox#21 build-floor decision the artifact is built at the manylinux_2_17 floor, so: every bundled wheel requires glibc >= 2.17 (the runtime floor scripts/build_artifact.sh bakes into the arch-check entry point), and no bundled .so may reference a symbol newer than glibc 2.17 (the ELF ceiling scripts/check_artifact.py --assert-glibc-ceiling asserts). One number, both roles.",
+  "measured_sandbox_glibc": "2.39",
+  "_measured_sandbox_glibc_note": "The deploy target's actual glibc (ldd + getconf + platform.libc_ver all agree: Ubuntu GLIBC 2.39). Headroom only -- 2.39 comfortably clears the 2.17 contract, which is why building thin at the floor is safe against a future image change. Recorded so the margin is visible, read by no tool.",
+
+  "complete_platform_file": "probe/complete-platform-x86_64.json",
+
+  "libpq_present": true,
+  "_libpq_note": "libpq.so.5 is present at /lib/x86_64-linux-gnu/libpq.so.5 (OQ-8 / Option F). So plain psycopg (no [binary]) could resolve against the host libpq -- relevant only to shellbox#29; Decision 1 keeps psycopg[binary] here."
+}

@@ -457,11 +457,18 @@ def _load_sidecar() -> dict[str, Any] | int:
 
 
 def assert_platform(path: Path) -> int:
-    """Every bundled distribution's wheel tag is the single allowed build tag or a pure-Python tag.
+    """Every bundled distribution's wheel tag is the build tag, a known alias of it, or pure-Python.
 
     AC-10(a). A count of distributions is NOT the load-bearing check -- a resolve that silently
     produced a pure-Python-only set clears any count. The exact-tag allowlist is what catches a
-    resolve that produced a different platform than the one Step 0 measured.
+    resolve that produced a different platform than the one Step 0 measured (a foreign arch, a
+    musllinux wheel, a manylinux minor above the build floor).
+
+    The allowlist is exact strings, not a substring or family test -- but it admits the sidecar's
+    declared aliases alongside the build tag, because `manylinux_2_17_x86_64` (PEP 600) and
+    `manylinux2014_x86_64` (the legacy alias) name the SAME glibc-2.17 floor and different packaging
+    toolchains emit one or the other. The aliases are DATA in the sidecar, not a family rule in the
+    code: a `manylinux_2_28_x86_64` tag is not an alias of the 2.17 floor and must still be caught.
     """
     sidecar = _load_sidecar()
     if isinstance(sidecar, int):
@@ -469,7 +476,13 @@ def assert_platform(path: Path) -> int:
     build_tag = str(sidecar.get("build_platform_tag", "")).strip()
     if not build_tag:
         return _fail(f"{ARTIFACT_PLATFORM_SIDECAR} names no 'build_platform_tag'.")
-    allowed = {build_tag, "py3-none-any", "none-any", "py2.py3-none-any"}
+    aliases = sidecar.get("platform_tag_aliases", [])
+    if not isinstance(aliases, list):
+        return _fail(
+            f"{ARTIFACT_PLATFORM_SIDECAR} 'platform_tag_aliases' must be a list of tag strings, "
+            f"not {type(aliases).__name__}."
+        )
+    allowed = {build_tag, *(str(a) for a in aliases), "py3-none-any", "none-any", "py2.py3-none-any"}
 
     archive = _open_zip(path)
     if isinstance(archive, int):
@@ -491,10 +504,12 @@ def assert_platform(path: Path) -> int:
                 print(f"  {name}: tag {tag!r}", file=sys.stderr)
             return _fail(
                 f"{len(offenders)} of {len(dists)} distributions carry a tag that is neither the "
-                f"build tag {build_tag!r} nor a pure-Python tag. The resolve produced a different "
-                f"platform than Step 0 measured, or a dist changed its wheel matrix upstream."
+                f"build tag {build_tag!r}, a declared alias {sorted(str(a) for a in aliases)}, nor "
+                f"a pure-Python tag. The resolve produced a different platform than Step 0 measured "
+                f"(a foreign arch, a musllinux wheel, or a manylinux minor above the build floor), "
+                f"or a dist changed its wheel matrix upstream."
             )
-    print(f"OK: all {len(dists)} distributions carry {build_tag!r} or a pure-Python tag.")
+    print(f"OK: all {len(dists)} distributions carry {build_tag!r}, an alias, or a pure-Python tag.")
     return 0
 
 
@@ -502,15 +517,20 @@ _GLIBC_SYMBOL = re.compile(rb"GLIBC_(\d+)\.(\d+)")
 
 
 def assert_glibc_ceiling(path: Path) -> int:
-    """No bundled `.so` requires a glibc newer than the ceiling Step 0 measured on the sandbox.
+    """No bundled `.so` requires a glibc newer than the artifact's contract floor.
 
     AC-10(b). The invariant that actually protects the install, measured at the ELF level rather
-    than derived from a wheel tag (a mis-tagged wheel would pass a tag check and fail here). Needs
+    than derived from a wheel tag (a mis-tagged wheel would pass the tag check and fail here). Needs
     `objdump`; extraction is to a temp dir and cleaned up.
 
-    SCOPE, per Step 0's own note: the ceiling is measured on ONE sandbox in ONE region. The build
-    targets a floor at or below it precisely so a single-host measurement is not load-bearing for
-    portability -- this check only asserts the build honored that floor.
+    The bound is the artifact's glibc CONTRACT, recorded in the sidecar's `glibc` (2.17 for the
+    manylinux_2_17 floor, per shellbox#21's build-floor decision), NOT the sandbox's own glibc. That
+    is deliberate and is stronger than checking against the sandbox: the artifact promises to run on
+    any host with glibc >= the floor, so a bundled `.so` referencing a symbol newer than the floor
+    breaks that promise even though it would run on the (newer) build sandbox. Checking against the
+    floor catches a wheel mis-tagged at the floor that actually needs more; checking against the
+    sandbox's 2.39 would let it through. The sandbox's real glibc is recorded separately in the
+    sidecar (`measured_sandbox_glibc`) as headroom, and is read by no check.
     """
     sidecar = _load_sidecar()
     if isinstance(sidecar, int):
@@ -520,7 +540,7 @@ def assert_glibc_ceiling(path: Path) -> int:
     if len(ceiling) < 2:
         return _fail(
             f"{ARTIFACT_PLATFORM_SIDECAR} 'glibc' value {ceiling_text!r} is not an x.y version. "
-            f"Step 0 records the sandbox's platform.libc_ver() there."
+            f"It is the artifact's glibc contract floor (e.g. '2.17'), the bound this check uses."
         )
     ceiling = ceiling[:2]
 
@@ -558,14 +578,15 @@ def assert_glibc_ceiling(path: Path) -> int:
         if worst > ceiling:
             return _fail(
                 f"a bundled extension requires glibc {worst[0]}.{worst[1]} "
-                f"({worst_where}), newer than the sandbox's measured ceiling "
-                f"{ceiling[0]}.{ceiling[1]}. This artifact would fail at import on the target with "
-                f"a 'version GLIBCXYZ not found' error -- the illegible failure the build tag "
-                f"exists to prevent."
+                f"({worst_where}), newer than the artifact's contract floor "
+                f"{ceiling[0]}.{ceiling[1]}. The artifact promises to run on glibc >= "
+                f"{ceiling[0]}.{ceiling[1]}, so this would fail at import on a host at the floor "
+                f"with a 'version GLIBCXYZ not found' error -- the illegible failure the build "
+                f"floor exists to prevent."
             )
     print(
         f"OK: the highest glibc any bundled .so requires is {worst[0]}.{worst[1]}, "
-        f"at or below the measured ceiling {ceiling[0]}.{ceiling[1]}."
+        f"at or below the contract floor {ceiling[0]}.{ceiling[1]}."
     )
     return 0
 

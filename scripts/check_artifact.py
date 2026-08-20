@@ -466,19 +466,39 @@ def _load_sidecar() -> dict[str, Any] | int:
     return document
 
 
+def _platform_tags(wheel_tag: str) -> set[str]:
+    """The individual platform tags a wheel tag declares compatibility with.
+
+    A wheel tag is `{interpreter}-{abi}-{platform}` and the platform field is a PEP 425 COMPRESSED
+    TAG SET: dot-joined platform tags the one wheel is compatible with, e.g.
+    `cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64` is one wheel that
+    is valid on all three. Platform tags contain `_` but never `-`, so the platform field is the
+    part after the last `-`; splitting it on `.` recovers the set. A bare platform tag
+    (`manylinux_2_17_x86_64`, no interpreter/abi) has no `-` and is returned as itself.
+    """
+    if not wheel_tag:
+        return set()
+    platform_field = wheel_tag.rsplit("-", 1)[-1]
+    return set(platform_field.split("."))
+
+
 def assert_platform(path: Path) -> int:
-    """Every bundled distribution's wheel tag is the build tag, a known alias of it, or pure-Python.
+    """Every bundled distribution declares compatibility with the build floor, or is pure-Python.
 
     AC-10(a). A count of distributions is NOT the load-bearing check -- a resolve that silently
-    produced a pure-Python-only set clears any count. The exact-tag allowlist is what catches a
-    resolve that produced a different platform than the one Step 0 measured (a foreign arch, a
-    musllinux wheel, a manylinux minor above the build floor).
+    produced a pure-Python-only set clears any count. This is what catches a resolve that produced a
+    different platform than Step 0 measured (a foreign arch, a musllinux wheel, a manylinux minor
+    ABOVE the build floor with the floor tag absent).
 
-    The allowlist is exact strings, not a substring or family test -- but it admits the sidecar's
-    declared aliases alongside the build tag, because `manylinux_2_17_x86_64` (PEP 600) and
-    `manylinux2014_x86_64` (the legacy alias) name the SAME glibc-2.17 floor and different packaging
-    toolchains emit one or the other. The aliases are DATA in the sidecar, not a family rule in the
-    code: a `manylinux_2_28_x86_64` tag is not an alias of the 2.17 floor and must still be caught.
+    A wheel's platform field is a COMPRESSED TAG SET (see `_platform_tags`). auditwheel tags a wheel
+    at its true glibc floor and lists that floor plus any higher tags it is also valid on, so the
+    presence of the build tag (or its alias) in the set is the reliable signal that the wheel meets
+    the 2.17 floor; extra higher tags in the same set are additional compatibility, not a raised
+    floor. So a wheel passes iff its set CONTAINS the build tag or a declared alias -- an exact-tag
+    membership test, not a substring or family match: `manylinux_2_28_x86_64` alone is not the
+    floor and is still caught. `manylinux_2_17_x86_64` (PEP 600) and `manylinux2014_x86_64` (the
+    legacy alias) name the SAME floor and are both accepted; the aliases are DATA in the sidecar.
+    The real symbol-level guard is `--assert-glibc-ceiling` (objdump), which this precedes.
     """
     sidecar = _load_sidecar()
     if isinstance(sidecar, int):
@@ -492,8 +512,9 @@ def assert_platform(path: Path) -> int:
             f"{ARTIFACT_PLATFORM_SIDECAR} 'platform_tag_aliases' must be a list of tag strings, "
             f"not {type(aliases).__name__}."
         )
-    pure_python = ("py3-none-any", "none-any", "py2.py3-none-any")
-    allowed = {build_tag, *(str(a) for a in aliases), *pure_python}
+    floor_tags = {build_tag, *(str(a) for a in aliases)}
+    # A pure-Python wheel's platform field is `any` (from `none-any` / `py3-none-any`).
+    pure_python = {"any"}
 
     archive = _open_zip(path)
     if isinstance(archive, int):
@@ -505,22 +526,26 @@ def assert_platform(path: Path) -> int:
         dists = _distributions(manifest)
         if isinstance(dists, int):
             return dists
-        offenders = [
-            (entry.get("name", "?"), str(entry.get("tag", "")))
-            for entry in dists
-            if str(entry.get("tag", "")) not in allowed
-        ]
+        offenders = []
+        for entry in dists:
+            tags = _platform_tags(str(entry.get("tag", "")))
+            if tags <= pure_python:  # pure-Python: {'any'} (or empty)
+                continue
+            if floor_tags & tags:  # declares compatibility with our floor
+                continue
+            offenders.append((entry.get("name", "?"), str(entry.get("tag", ""))))
         if offenders:
             for name, tag in offenders[:10]:
                 print(f"  {name}: tag {tag!r}", file=sys.stderr)
             return _fail(
-                f"{len(offenders)} of {len(dists)} distributions carry a tag that is neither the "
-                f"build tag {build_tag!r}, a declared alias {sorted(str(a) for a in aliases)}, nor "
-                f"a pure-Python tag. The resolve produced a different platform than Step 0 saw "
-                f"(a foreign arch, a musllinux wheel, or a manylinux minor above the build floor), "
-                f"or a dist changed its wheel matrix upstream."
+                f"{len(offenders)} of {len(dists)} distributions carry a platform tag set that "
+                f"contains neither the build tag {build_tag!r} nor a declared alias "
+                f"{sorted(str(a) for a in aliases)}, and is not pure-Python. The resolve saw a "
+                f"different platform than Step 0 saw (a foreign arch, a musllinux wheel, or a "
+                f"manylinux minor above the build floor with the floor tag absent), or a dist "
+                f"changed its wheel matrix upstream."
             )
-    print(f"OK: all {len(dists)} dists carry {build_tag!r}, an alias, or a pure-Python tag.")
+    print(f"OK: all {len(dists)} dists declare the {build_tag!r} floor (or an alias) or are pure.")
     return 0
 
 

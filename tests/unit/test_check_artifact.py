@@ -498,6 +498,43 @@ def test_a_higher_manylinux_minor_on_the_same_arch_fails(tmp_path: Path) -> None
     assert "manylinux_2_28_x86_64" in result.stderr
 
 
+def test_a_full_compound_wheel_tag_containing_the_floor_passes(tmp_path: Path) -> None:
+    """The real form pip/auditwheel emit and the one that first broke CI: a full
+    `{interp}-{abi}-{platform-set}` wheel tag whose dot-joined platform set lists the 2.17 floor
+    alongside higher tags. The floor's presence is what matters; the extra tags are additional
+    compatibility, not a raised floor."""
+    manifest = _manifest()
+    manifest["distributions"][0]["tag"] = (
+        "cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64"
+    )
+    # An abi3 wheel with a compound set including the floor, as cryptography ships.
+    manifest["distributions"].append(
+        {
+            "name": "cryptography",
+            "version": "44.0.0",
+            "tag": "cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64",
+            "hash": "sha256:" + "c" * 64,
+            "url": f"https://{ALLOWED_HOST}/packages/ee/ff/cryptography-44.0.0-cp311-abi3.whl",
+        }
+    )
+    artifact = _make_artifact(tmp_path, manifest=manifest)
+    result = _run("--assert-platform", str(artifact), sidecar=_sidecar(tmp_path))
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_compound_tag_all_above_the_floor_fails(tmp_path: Path) -> None:
+    """A compound platform set that lists only tags ABOVE the floor -- the floor tag absent -- is a
+    genuine floor violation and must be caught even though it is a compound set."""
+    manifest = _manifest()
+    manifest["distributions"][0]["tag"] = (
+        "cp312-cp312-manylinux_2_28_x86_64.manylinux_2_34_x86_64"
+    )
+    artifact = _make_artifact(tmp_path, manifest=manifest)
+    result = _run("--assert-platform", str(artifact), sidecar=_sidecar(tmp_path))
+    assert result.returncode != 0
+    assert "manylinux_2_28_x86_64" in result.stderr
+
+
 # --- glibc ceiling (Step 0-dependent; ELF path is CI-only) ------------------------------------
 
 

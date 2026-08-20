@@ -77,7 +77,6 @@ print(tomllib.load(open("packages/shellbox-mcp/pyproject.toml", "rb"))["project"
 PY
 )"
 GIT_SHA="$(git rev-parse HEAD)"
-PEX_ROOT="\$HOME/.cache/shellbox-pex/$VERSION"  # literal $HOME, resolved at runtime, baked by pex
 
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
@@ -191,9 +190,15 @@ PY
 
 # ---- 4. Build the pex ---------------------------------------------------------------------
 # `--no-emit-warnings` keeps pex's own diagnostics off every stream at startup (Principle 4).
-# `--runtime-pex-root` bakes the cache location so no PEX_*/SHELLBOX_* variable need be set -- the
-# artifact must start with none set (AC-5). The root is under $HOME because `docs/sandbox-environment.md`
-# measures $HOME persists across stop/start, so extraction is paid once per version, not per boot.
+#
+# NO `--runtime-pex-root`. pex bakes that value LITERALLY -- it does not expand `$HOME` or env vars
+# -- so a baked `$HOME/.cache/...` created a directory literally named `$HOME` under the process
+# cwd (MEASURED by the spike's q_reexec: the venv python resolved under `.../shellbox/$HOME/.cache/
+# shellbox-pex/...`). That defeats the whole "extract once into persistent $HOME" intent. pex's
+# DEFAULT root is `~/.pex`, which pex resolves with `os.path.expanduser` at RUNTIME to the real
+# home -- persistent across stop/start (`docs/sandbox-environment.md`), per-version isolated because
+# pex keys the cache by the pex's own content hash, and requiring no PEX_*/SHELLBOX_* variable set
+# (AC-5). So the correct choice is to set no root and let the default apply.
 RAW_PEX="$BUILD_DIR/shellbox.raw"
 pex \
   --lock "$LOCK" \
@@ -203,7 +208,6 @@ pex \
   --sources-directory "$ENTRY_DIR" \
   --entry-point _shellbox_entry:main \
   --python-shebang "#!/usr/bin/env python3" \
-  --runtime-pex-root "$PEX_ROOT" \
   --no-emit-warnings \
   --venv prepend \
   -o "$RAW_PEX"

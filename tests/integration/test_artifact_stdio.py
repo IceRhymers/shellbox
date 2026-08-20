@@ -70,10 +70,15 @@ TOOL_NAMES = {
 # guards the MANIFEST's recorded ``extension_modules`` list. If the dependency set changes, a
 # resolve change reddens ``--assert-platform`` and the spike's enumeration moves, so this list
 # cannot silently fall behind the bundle.
+#
+# ``psycopg_binary`` is deliberately NOT here: psycopg's binary package refuses a direct
+# ``import psycopg_binary`` ("the psycopg package should be imported before psycopg_binary"), so
+# its compiled backend is proven separately, by importing ``psycopg`` and asserting the active pq
+# implementation is the bundled ``binary`` one rather than the pure-Python fallback CRITICAL-1
+# warns about -- see ``test_the_psycopg_binary_backend_is_active``.
 NO_FALLBACK_EXTENSIONS = (
     "pydantic_core._pydantic_core",
     "rpds.rpds",
-    "psycopg_binary",
     "greenlet._greenlet",
     "_cffi_backend",
     "cryptography.hazmat.bindings._rust",
@@ -186,9 +191,9 @@ def test_all_six_tools_and_a_live_round_trip_over_the_artifact(
 def test_the_no_fallback_extensions_load_inside_the_artifact() -> None:
     """Every extension with no pure-Python fallback imports from inside the artifact.
 
-    This is the gate CRITICAL-1 demands: a wrong-glibc or truncated ``psycopg_binary`` /
-    ``cryptography`` extension is never touched by ``initialize`` or a shell round trip, so only
-    a direct import catches it. Run inside the pex environment so the import path is the server's.
+    This is the gate CRITICAL-1 demands: a wrong-glibc or truncated ``cryptography`` extension is
+    never touched by ``initialize`` or a shell round trip, so only a direct import catches it. Run
+    inside the pex environment so the import path is the server's.
     """
     artifact = _artifact()
     modules = list(NO_FALLBACK_EXTENSIONS)
@@ -215,6 +220,25 @@ def test_the_no_fallback_extensions_load_inside_the_artifact() -> None:
     extension_modules = manifest.get("extension_modules")
     assert isinstance(extension_modules, list) and extension_modules, (
         "the MANIFEST records no extension_modules; the bundle is not what this tree resolves to"
+    )
+
+
+def test_the_psycopg_binary_backend_is_active() -> None:
+    """The bundled psycopg compiled backend loads and is the one in use, not a silent fallback.
+
+    ``psycopg_binary`` refuses a direct import by design, so the meaningful CRITICAL-1 proof is to
+    import ``psycopg`` and read the active pq implementation. ``binary`` is our bundled
+    psycopg[binary]; ``python`` is the pure fallback that degrades the registry silently; ``c``
+    would mean a system-libpq path we did not bundle. Only ``binary`` proves the shipped extension
+    loaded, so assert exactly that.
+    """
+    artifact = _artifact()
+    impl = _pex_interpreter(
+        artifact, "import psycopg; print(psycopg.pq.__impl__)"
+    ).strip()
+    assert impl == "binary", (
+        f"psycopg is using the {impl!r} pq backend, not the bundled 'binary' one -- the shipped "
+        "psycopg_binary extension did not load, which is exactly CRITICAL-1's silent degradation"
     )
 
 

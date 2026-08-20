@@ -49,17 +49,29 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# The six extensions with no pure-Python fallback -- the load proof that matters (CRITICAL-1).
-# Kept in step with ``tests/integration/test_artifact_stdio.py``; if the dependency set changes,
-# a resolve change reddens ``check_artifact.py --assert-platform`` and this list is revisited.
+# The extensions with no pure-Python fallback -- the load proof that matters (CRITICAL-1). These
+# five are safe to import directly, which forces their `.so` to load. Kept in step with
+# ``tests/integration/test_artifact_stdio.py``; if the dependency set changes, a resolve change
+# reddens ``check_artifact.py --assert-platform`` and this list is revisited.
+#
+# `psycopg_binary` is NOT in this list and must not be: psycopg's binary package refuses a direct
+# `import psycopg_binary` by design ("the psycopg package should be imported before psycopg_binary"
+# -- MEASURED by an earlier spike run). The compiled backend is proven loaded a truer way, by
+# importing `psycopg` and asserting the active pq implementation is the compiled one (not the pure
+# `python` fallback) -- see `_PSYCOPG_PROOF`, which is exactly CRITICAL-1's "did it degrade" check.
 NO_FALLBACK_EXTENSIONS = (
     "pydantic_core._pydantic_core",
     "rpds.rpds",
-    "psycopg_binary",
     "greenlet._greenlet",
     "_cffi_backend",
     "cryptography.hazmat.bindings._rust",
 )
+
+# The psycopg backend proof. `psycopg.pq.__impl__` is 'binary' (our bundled psycopg[binary]), 'c'
+# (system libpq via a C extension we did not bundle), or 'python' (the pure-Python fallback that
+# CRITICAL-1 is about). Anything other than 'binary' means the bundled compiled backend did not
+# load -- a silent-degradation defect.
+_PSYCOPG_PROOF = "import psycopg; print('psycopg.pq.__impl__=' + psycopg.pq.__impl__)"
 
 # An LSP-framed JSON-RPC initialize request. The property under test at boot is what reaches
 # stdout BEFORE the first frame, so the request is kept minimal.
@@ -137,7 +149,11 @@ def q_boot(artifact: Path) -> bool:
 
 
 def q_exts(artifact: Path) -> bool:
-    """Q-EXTS: every no-fallback extension imports from inside the pex (CRITICAL-1's load proof)."""
+    """Q-EXTS: every no-fallback extension loads from inside the pex (CRITICAL-1's load proof).
+
+    The five directly-importable extensions are imported by name; psycopg's compiled backend is
+    proven by importing `psycopg` and reading the active pq implementation (see `_PSYCOPG_PROOF`).
+    """
     script = (
         "import json, importlib\n"
         f"mods = {list(NO_FALLBACK_EXTENSIONS)!r}\n"
@@ -147,6 +163,12 @@ def q_exts(artifact: Path) -> bool:
         "        importlib.import_module(name); out[name] = 'ok'\n"
         "    except Exception as exc:\n"
         "        out[name] = f'{type(exc).__name__}: {exc}'\n"
+        "try:\n"
+        "    import psycopg\n"
+        "    impl = psycopg.pq.__impl__\n"
+        "    out['psycopg(binary)'] = 'ok' if impl == 'binary' else f'degraded: impl={impl}'\n"
+        "except Exception as exc:\n"
+        "    out['psycopg(binary)'] = f'{type(exc).__name__}: {exc}'\n"
         "print(json.dumps(out))\n"
     )
     result = _pex_interpreter(artifact, script)

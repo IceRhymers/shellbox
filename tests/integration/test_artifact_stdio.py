@@ -331,18 +331,26 @@ def test_concurrent_warm_starts_do_not_re_extract_and_stay_fast(
 
     This is the property that actually matters for pooled agents (buzz-lakebox#23): ONE long-lived
     sandbox with a persistent ``$HOME``, agents starting INSIDE it over time and sharing a single
-    pex cache (``~/.pex``). The ~81 MB extraction is paid ONCE per sandbox lifetime; every
-    subsequent start reuses the warm cache. So the gate is: after the cache is warm, concurrent
-    starts are fast (AC-11) and do not re-extract (AC-12).
+    pex cache. The ~81 MB extraction is paid ONCE per sandbox lifetime; every subsequent start
+    reuses the warm cache. So the gate is: after the cache is warm, concurrent starts are fast
+    (AC-11) and do not re-extract (AC-12).
 
     A cold 32-way thundering herd -- 32 simultaneous first-ever starts serialising on the extraction
     lock -- is a worst case the field does not hit (agents do not all start at the instant of a cold
     cache), and its timing measures the runner's disk under contention rather than the artifact. The
     warm path is measured instead; the cold extraction is still exercised, once, by the warm-up.
 
-    HOME is shared (one contended ``~/.pex``); SHELLBOX_STATE_DIR is per-worker so unrelated app
-    state cannot collide. No DSN, so the registry is NullRegistry and the start touches no database.
-    A lock that deadlocked or a cache that corrupted would fail a worker rather than pass quietly.
+    The cache root is PINNED via ``PEX_ROOT`` rather than discovered. pex's default root is
+    ``$HOME/.cache/pex`` (measured by the spike's ``q_reexec``), not ``$HOME/.pex``; guessing that
+    layout is what a first version of this test got wrong. Setting ``PEX_ROOT`` to a directory the
+    test owns removes the guess entirely -- the property under test (warm reuse, no re-extract,
+    lock under contention) is identical wherever the cache lands, and the test can always find it.
+    ``PEX_ROOT`` is a ``PEX_*`` variable, not ``SHELLBOX_*``, so it does not touch AC-5's
+    "no ``SHELLBOX_*`` set" gate; the field uses the baked default under its persistent ``$HOME``.
+
+    HOME is shared (one contended cache); SHELLBOX_STATE_DIR is per-worker so unrelated app state
+    cannot collide. No DSN, so the registry is NullRegistry and the start touches no database. A
+    lock that deadlocked or a cache that corrupted would fail a worker rather than pass quietly.
     """
     artifact = str(_artifact())
     workers = 32
@@ -351,11 +359,15 @@ def test_concurrent_warm_starts_do_not_re_extract_and_stay_fast(
     base = make_harness(tmux_server, tmp_path, command=artifact)
     shared_home = tmp_path / "shared-home"
     shared_home.mkdir()
+    # The cache root the test owns. Every worker shares it, so exactly one extracts and the rest
+    # reuse -- and the test knows precisely where to look for the before/after comparison.
+    pex_root = tmp_path / "pexroot"
 
     def start(index: int) -> float:
         env = {
             **base.env,
             "HOME": str(shared_home),
+            "PEX_ROOT": str(pex_root),
             "SHELLBOX_STATE_DIR": str(tmp_path / f"state-{index}"),
         }
 
@@ -372,10 +384,9 @@ def test_concurrent_warm_starts_do_not_re_extract_and_stay_fast(
     # Warm-up: one start pays the ~81 MB extraction into the shared cache, and records the cache's
     # contents so the concurrent starts below can be shown NOT to re-extract.
     cold_elapsed = start(-1)
-    pex_root = shared_home / ".pex"
     assert pex_root.is_dir(), (
-        f"the warm-up start did not create {pex_root}; the artifact's cache root is not under "
-        f"$HOME/.pex as assumed. cold start took {cold_elapsed:.1f}s"
+        f"the warm-up start did not create {pex_root}; the artifact did not honor PEX_ROOT, so it "
+        f"is not a pex that respects the cache-root env var. cold start took {cold_elapsed:.1f}s"
     )
     # The whole cache tree, layout-independent: every path relative to the root. Comparing this
     # before/after catches a re-extraction wherever pex places it, and does not assume a particular

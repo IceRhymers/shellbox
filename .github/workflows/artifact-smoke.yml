@@ -150,7 +150,17 @@ jobs:
           # what eventually leaks a real one.
           set -eu
           export SHELLBOX_ARTIFACT_DATABASE_URL="postgresql://${SHELLBOX_PG_USER}:${SHELLBOX_PG_PASSWORD}@${SHELLBOX_PG_HOST}:${SHELLBOX_PG_PORT}/${SHELLBOX_PG_DB}"
-          uv run pytest tests/integration/test_artifact_stdio.py -v -rs 2>&1 | tee /tmp/artifact.txt
+          # CAPTURE pytest's real exit status, do NOT pipe it. `pytest ... | tee` makes the
+          # pipeline's status `tee`'s (0), so a failing suite reads as success -- which it did:
+          # a run with "1 failed, 5 passed" went green here because the only result check below
+          # was `grep '[0-9]+ passed'`, and "5 passed" matches. A redirect plus an explicit
+          # status check is shell-agnostic (no pipefail/PIPESTATUS needed under sh or bash) and
+          # makes a real failure red. The skip and vacuity guards stay: a suite that SKIPPED, or
+          # ran nothing, must also redden even on a zero exit.
+          status=0
+          uv run pytest tests/integration/test_artifact_stdio.py -v -rs > /tmp/artifact.txt 2>&1 \
+            || status=$?
+          cat /tmp/artifact.txt
           if grep -qE 'SHELLBOX_ARTIFACT_PATH unset|no built artifact' /tmp/artifact.txt; then
             echo "::error::the artifact suite SKIPPED -- SHELLBOX_ARTIFACT_PATH was not seen."
             exit 1
@@ -162,4 +172,8 @@ jobs:
           if ! grep -qE '[0-9]+ passed' /tmp/artifact.txt; then
             echo "::error::the artifact suite ran no tests at all."
             exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the artifact suite failed (pytest exit $status)."
+            exit "$status"
           fi

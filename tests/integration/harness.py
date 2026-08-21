@@ -133,12 +133,23 @@ class Outcome:
 
 @dataclass
 class Harness:
-    """A tmux server, a scratch state directory, and the child environment for both."""
+    """A tmux server, a scratch state directory, and the child environment for both.
+
+    ``command``/``args`` are how the same suites run against the built release artifact
+    (shellbox#21). They default to ``python -m shellbox_mcp`` -- the freshness invariant
+    below -- and the artifact lane overrides them to spawn the ``dist/shellbox`` pex by path.
+    """
 
     tmux: TmuxServer
     env: dict[str, str]
     stderr_path: Path
     tmp_path: Path
+    # How the server is spawned. The default is the interpreter running the suite, so a test
+    # cannot silently exercise a stale installed copy (see run_script's docstring). Overridden
+    # ONLY by the artifact lane, which restores that guarantee a different way -- by asserting
+    # the artifact's MANIFEST git sha equals $GITHUB_SHA before it runs (shellbox#21 Step 4).
+    command: str = sys.executable
+    args: list[str] = field(default_factory=lambda: ["-m", "shellbox_mcp"])
     _sequence: list[int] = field(default_factory=lambda: [0])
 
     def env_with(self, **overrides: str | None) -> dict[str, str]:
@@ -164,12 +175,23 @@ class Harness:
         return f"{prefix}{self._sequence[0]}"
 
 
-def make_harness(tmux_server: TmuxServer, tmp_path: Path) -> Harness:
+def make_harness(
+    tmux_server: TmuxServer,
+    tmp_path: Path,
+    *,
+    command: str | None = None,
+    args: list[str] | None = None,
+) -> Harness:
     """One tmux server, one scratch home, and an environment built from scratch.
 
     ``HOME`` points into ``tmp_path``: the server passes ``HOME`` through to the tmux
     client, and a test must not be able to touch the developer's real one. ``PATH`` is
     inherited because the pane needs a shell; the tmux binary itself is passed explicitly.
+
+    ``command``/``args`` default to ``python -m shellbox_mcp``; the artifact lane
+    (shellbox#21) passes the built ``dist/shellbox`` pex and an empty ``args`` so the SAME
+    suites exercise the shipped bytes. Everything else about the child is identical, which is
+    the point: the artifact must behave exactly as the module does.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -186,9 +208,13 @@ def make_harness(tmux_server: TmuxServer, tmp_path: Path) -> Harness:
         "SHELLBOX_OWNER_EMAIL": "itest@example.com",
         "SHELLBOX_LOG_LEVEL": "INFO",
     }
-    return Harness(
+    harness = Harness(
         tmux=tmux_server, env=env, stderr_path=tmp_path / "server-stderr.log", tmp_path=tmp_path
     )
+    if command is not None:
+        harness.command = command
+        harness.args = args if args is not None else []
+    return harness
 
 
 def run_script[T](
@@ -202,7 +228,10 @@ def run_script[T](
 
     ``python -m shellbox_mcp`` rather than the console script: it is the same entrypoint
     (``__main__`` calls ``cli.main``) and it is guaranteed to be the interpreter the test
-    suite is running under, so the test cannot silently exercise a stale installed copy.
+    suite is running under, so the test cannot silently exercise a stale installed copy. The
+    artifact lane (shellbox#21) is the one exception: it overrides ``harness.command`` to spawn
+    the built ``dist/shellbox`` pex, and restores the anti-staleness guarantee a different way
+    -- by asserting the artifact's MANIFEST git sha equals ``$GITHUB_SHA`` before the lane runs.
 
     The child's stderr is redirected to a file rather than inherited, which is what makes
     "logging goes to stderr" assertable at all -- and keeps a passing run quiet.
@@ -210,8 +239,8 @@ def run_script[T](
 
     async def main() -> T:
         params = StdioServerParameters(
-            command=sys.executable,
-            args=["-m", "shellbox_mcp"],
+            command=harness.command,
+            args=harness.args,
             env=harness.env if env is None else env,
         )
         with harness.stderr_path.open("a", encoding="utf-8") as errlog:
@@ -304,7 +333,7 @@ def raw_session(
     buffer with nobody reading it would block the process mid-session -- a hang that looks
     like a protocol bug and is not one.
     """
-    argv = [sys.executable, "-m", "shellbox_mcp"]
+    argv = [harness.command, *harness.args]
     lines: list[str] = []
     with harness.stderr_path.open("a", encoding="utf-8") as errlog:
         process = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell

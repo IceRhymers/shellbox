@@ -1,0 +1,179 @@
+name: artifact-smoke
+
+# The reusable artifact lane (shellbox#21, Step 4). ONE definition, called by ci.yml on every
+# push/PR and later by release.yml on a tag, so the release copy cannot drift from the tested one
+# (R8). It builds the artifact, runs every check_artifact assertion, the committed pex spike, and
+# the artifact integration suite (AC-17 both halves) against a real postgres. It does NOT publish.
+#
+# Build, checksum and smoke are ONE job on purpose (ci.yml's lockfile-lane reasoning): emitting in
+# one job and asserting in another would assert on an uploaded artifact rather than on what the
+# build produced. The release lane consumes the same definition, so what ships is what was smoked.
+on:
+  workflow_call: {}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # The sandbox image: tmux 3.4 and Python 3.12.3 in one place, and the artifact is invoked
+    # through /usr/bin/python3 here, so "starts on the target's 3.12" is proven, not assumed.
+    container: ubuntu:24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: shellbox
+          POSTGRES_PASSWORD: shellbox
+          POSTGRES_DB: shellbox
+        options: >-
+          --health-cmd "pg_isready -U shellbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Resolve the build through PUBLIC PyPI in CI. The mirror build_artifact.sh defaults to is
+      # only reachable inside Databricks; with the index already public the mirror->public rewrite
+      # is a no-op and check_pex_lock --assert-hosts confirms every URL is files.pythonhosted.org.
+      SHELLBOX_BUILD_INDEX: https://pypi.org/simple
+      # alembic env.py composes the DSN from these (the registry job's shape). Inside a job
+      # container a service is reached by its LABEL host (postgres), not localhost.
+      SHELLBOX_PG_USER: shellbox
+      SHELLBOX_PG_PASSWORD: shellbox
+      SHELLBOX_PG_HOST: postgres
+      SHELLBOX_PG_PORT: "5432"
+      SHELLBOX_PG_DB: shellbox
+    steps:
+      - name: Install tmux, Python, git and binutils
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            tmux python3 python3-venv curl make git binutils ca-certificates
+          tmux -V
+
+      - uses: actions/checkout@v4
+
+      - name: Mark the workspace safe for git
+        run: |
+          # The build stamps the artifact MANIFEST with `git rev-parse HEAD`. Inside this
+          # container the checkout tree is owned by a different UID than the step's user, so git
+          # refuses it as "dubious ownership" and exits 128 before the build starts. actions/checkout
+          # adds this exception for its OWN post-cleanup, not for a later `run:` step's git call, so
+          # the build needs its own. $GITHUB_WORKSPACE is /__w/shellbox/shellbox in a container job.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Assert the pinned tmux version
+        run: |
+          # A silent tmux bump is what this guards; fail loudly rather than smoke against a
+          # version nobody chose (the tmux-3-4 job's wording).
+          set -eu
+          got="$(tmux -V)"
+          case "$got" in
+            "tmux 3.4") echo "tmux version as expected: $got" ;;
+            *) echo "::error::expected 'tmux 3.4' (the sandbox image), got '$got'."; exit 1 ;;
+          esac
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - run: uv sync
+
+      # Build-time only. Into /usr/local/bin (already on PATH in the container) so build_artifact.sh
+      # finds bare `pex` and `pex3`. pex is never a runtime dependency of the server.
+      - name: Install pex
+        run: UV_TOOL_BIN_DIR=/usr/local/bin uv tool install pex
+
+      - name: Build the artifact
+        run: make artifact
+
+      - name: Record the sha256
+        run: |
+          set -eu
+          sha="$(cut -d' ' -f1 dist/shellbox.sha256)"
+          echo "artifact sha256: $sha"
+          {
+            echo "### shellbox release artifact"
+            echo ""
+            echo "\`$sha\`  dist/shellbox"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: check_artifact — every static assertion
+        run: |
+          set -eu
+          for mode in --assert-shebang --assert-executable --assert-sha256 --assert-manifest \
+                      --assert-websockets-pin --assert-platform --assert-glibc-ceiling \
+                      --assert-hosts --assert-no-resolver --assert-release-notes \
+                      --assert-silent-start; do
+            echo ">> check_artifact $mode"
+            python3 scripts/check_artifact.py "$mode" dist/shellbox
+          done
+
+      - name: pex spike — the committed oracle
+        env:
+          SHELLBOX_ARTIFACT_PATH: ${{ github.workspace }}/dist/shellbox
+        run: python3 spike/pex_spike.py
+
+      - name: AC-18 — a wrong architecture is refused legibly, stdout clean
+        run: |
+          # Exercises the generated entry point directly, inside the pex, with platform.machine
+          # faked: the arch check must exit non-zero and write NOTHING to stdout (stdout is the
+          # wire). Reliable regardless of whether pex re-execs (the spike records that).
+          PEX_INTERPRETER=1 dist/shellbox -c '
+          import platform, io, contextlib, sys
+          platform.machine = lambda: "aarch64"
+          import _shellbox_entry
+          buf = io.StringIO()
+          try:
+              with contextlib.redirect_stdout(buf):
+                  _shellbox_entry.main()
+          except SystemExit as exc:
+              assert exc.code not in (0, None), f"expected non-zero exit, got {exc.code!r}"
+          else:
+              raise SystemExit("the entry point did not refuse a wrong architecture")
+          assert buf.getvalue() == "", f"wrote to stdout on refusal: {buf.getvalue()!r}"
+          print("AC-18 ok: wrong-arch refused, stdout clean", file=sys.stderr)
+          '
+
+      - name: Migrate the registry schema
+        run: uv run alembic -c alembic.ini upgrade head
+
+      - name: Artifact integration suite — AC-3/4, AC-17 both halves, 32-way cold start
+        env:
+          SHELLBOX_ARTIFACT_PATH: ${{ github.workspace }}/dist/shellbox
+        run: |
+          # -rs prints skip reasons. A skip here is a FAILURE, not a pass: the artifact and the
+          # postgres DSN are both provided, so a skip means the lane is misconfigured and would
+          # otherwise be green while proving nothing (the make test-tmux discipline).
+          #
+          # The DSN is COMPOSED from the SHELLBOX_PG_* components here rather than written as a
+          # literal, exactly as the `registry` job and `shellbox_registry.dsn.dsn_from_env` do: a
+          # complete credential-bearing URL in the repo trips the secret scanner, and the habit is
+          # what eventually leaks a real one.
+          set -eu
+          export SHELLBOX_ARTIFACT_DATABASE_URL="postgresql://${SHELLBOX_PG_USER}:${SHELLBOX_PG_PASSWORD}@${SHELLBOX_PG_HOST}:${SHELLBOX_PG_PORT}/${SHELLBOX_PG_DB}"
+          # CAPTURE pytest's real exit status, do NOT pipe it. `pytest ... | tee` makes the
+          # pipeline's status `tee`'s (0), so a failing suite reads as success -- which it did:
+          # a run with "1 failed, 5 passed" went green here because the only result check below
+          # was `grep '[0-9]+ passed'`, and "5 passed" matches. A redirect plus an explicit
+          # status check is shell-agnostic (no pipefail/PIPESTATUS needed under sh or bash) and
+          # makes a real failure red. The skip and vacuity guards stay: a suite that SKIPPED, or
+          # ran nothing, must also redden even on a zero exit.
+          status=0
+          uv run pytest tests/integration/test_artifact_stdio.py -v -rs > /tmp/artifact.txt 2>&1 \
+            || status=$?
+          cat /tmp/artifact.txt
+          if grep -qE 'SHELLBOX_ARTIFACT_PATH unset|no built artifact' /tmp/artifact.txt; then
+            echo "::error::the artifact suite SKIPPED -- SHELLBOX_ARTIFACT_PATH was not seen."
+            exit 1
+          fi
+          if grep -q 'no postgres service container' /tmp/artifact.txt; then
+            echo "::error::the registry round trip SKIPPED -- the postgres DSN was not seen."
+            exit 1
+          fi
+          if ! grep -qE '[0-9]+ passed' /tmp/artifact.txt; then
+            echo "::error::the artifact suite ran no tests at all."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the artifact suite failed (pytest exit $status)."
+            exit "$status"
+          fi

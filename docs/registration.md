@@ -275,6 +275,90 @@ for browser/computer-use/node_repl, a Databricks model provider, and an internal
 config change. A stock open-source Codex CLI may behave differently for both the
 tool-call approval gate and the stderr question above.)
 
+## Installing the release artifact (buzz-lakebox `extra_binaries`)
+
+The sections above register a `shellbox-mcp` that is already on the host — a `pip`
+install or a checkout. This section covers the other case: a host where nothing is
+installed yet. That is how the Lakebox sandbox starts
+([`docs/sandbox-environment.md`](sandbox-environment.md)).
+
+The install vehicle is buzz-lakebox `provider_config.extra_binaries`
+(`IceRhymers/buzz-lakebox#15`). It fetches one file over https and verifies one sha256,
+and it refuses anything unpinned. `shellbox-mcp` publishes exactly that: a single file
+named `shellbox` and a sibling `shellbox.sha256`.
+
+### What the host needs
+
+- **Python 3.12 or newer.** `shellbox-mcp` sets `requires-python = ">=3.12"`. The Lakebox
+  image ships Python 3.12.3 at `/usr/bin/python3` (measured,
+  [`docs/sandbox-environment.md`](sandbox-environment.md)). The artifact carries its Python
+  dependencies but not an interpreter.
+- **`tmux` 3.4** at `/usr/bin/tmux`, which the same image ships.
+
+Nothing else. The artifact bundles every Python dependency, including the compiled ones
+(`pydantic_core`, `cryptography`, `psycopg`), so the host needs no package index and no
+network beyond the one fetch.
+
+### The provider config
+
+Use this on the `claude` runtime, with shellbox as the only MCP server. That path is the
+one `IceRhymers/buzz-lakebox#14` confirmed:
+
+```json
+{
+  "provider_config": {
+    "extra_binaries": [
+      { "url": "https://.../shellbox", "sha256": "<hash>", "bin": "shellbox" }
+    ],
+    "mcp_servers": ["shellbox"]
+  }
+}
+```
+
+Two keys do two separate jobs (read from `IceRhymers/buzz-lakebox` at `main`, with the
+`#15` and `#14` work merged):
+
+- **`extra_binaries`** places the file. buzz-lakebox writes it to
+  `$HOME/.buzz-backend/extra-bin/shellbox`, marks it executable, and appends that directory
+  to `PATH`. The on-disk name is the `bin` value, used verbatim. It is not derived from the
+  URL.
+- **`mcp_servers`** registers the server. Placing the file does not register anything;
+  registration is a separate provider action. The single entry points
+  `BUZZ_ACP_MCP_COMMAND` at the installed file.
+
+### The file name is the tool prefix (claude runtime)
+
+`buzz-acp` spawns the file by path with no arguments, and it derives the MCP server name
+from the file stem. So `bin: "shellbox"` names the server `shellbox`, and its six tools
+reach the model under that prefix:
+
+- `mcp__shellbox__shell_create`
+- `mcp__shellbox__shell_send`
+- `mcp__shellbox__shell_read`
+- `mcp__shellbox__shell_list`
+- `mcp__shellbox__shell_resize`
+- `mcp__shellbox__shell_kill`
+
+This prefix holds only when shellbox is the one MCP server, on the `claude` runtime. On
+`buzz-agent` and `codex` the slot already holds `buzz-dev-mcp`, so shellbox runs behind a
+multiplexer whose stem becomes the prefix instead. That case needs
+`IceRhymers/buzz-lakebox#16` and is out of scope for the single-file install. See
+[the per-runtime slot decision](#adr-38-the-slot-decision-is-per-runtime-not-global).
+
+### Extraction cost, paid once per sandbox
+
+On first run the artifact extracts its bundled dependencies into a `pex` cache under
+`$HOME` (about 81 MB unzipped, measured). Two facts make this a one-time cost:
+
+- `$HOME` persists across a sandbox stop and start (measured,
+  [`docs/sandbox-environment.md`](sandbox-environment.md)).
+- buzz-lakebox runs one long-lived sandbox per user, not one per session
+  (`IceRhymers/buzz-lakebox#23`).
+
+So the extraction is paid once per sandbox lifetime, not once per agent and not once per
+boot. The installer also skips the download and the extraction when the pinned version
+already matches.
+
 ## Zero-args / env-only: the Buzz constraint (#6)
 
 `shellbox-mcp`'s CLI (`cli.py`) accepts exactly one subcommand, `serve`, which is

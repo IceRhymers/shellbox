@@ -11,6 +11,8 @@ Sessions are created by agents, attached to by humans, and reaped on inactivity.
 
 Work in progress. Design and phased plan: [epic #9](https://github.com/IceRhymers/shellbox/issues/9).
 Registering `shellbox-mcp` with a harness (Claude Code, Codex): [`docs/registration.md`](docs/registration.md).
+Installing the sha256-pinned release artifact on a host (buzz-lakebox `extra_binaries`):
+[`docs/registration.md`](docs/registration.md#installing-the-release-artifact-buzz-lakebox-extra_binaries).
 
 Docs in this repo follow a writing standard adapted from ASD-STE100 (Simplified Technical
 English). Read it before you write docs, comments, or a PR description:

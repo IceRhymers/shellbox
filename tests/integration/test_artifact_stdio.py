@@ -401,10 +401,26 @@ def test_concurrent_warm_starts_do_not_re_extract_and_stay_fast(
         f"the warm-up start did not create {pex_root}; the artifact did not honor PEX_ROOT, so it "
         f"is not a pex that respects the cache-root env var. cold start took {cold_elapsed:.1f}s"
     )
-    # The whole cache tree, layout-independent: every path relative to the root. Comparing this
-    # before/after catches a re-extraction wherever pex places it, and does not assume a particular
-    # subdirectory name.
-    contents_before = {str(p.relative_to(pex_root)) for p in pex_root.rglob("*")}
+    # The extracted WHEEL PAYLOAD, layout-independent: every path under the root, EXCLUDING
+    # `__pycache__` / `.pyc`. Comparing this before/after catches a re-extraction wherever pex
+    # places it, without assuming a subdirectory name.
+    #
+    # Why exclude bytecode (measured, CI run 32769546398): a warm start imports modules the single
+    # cold warm-up did not finish importing (the SDK/enrollment path -- `databricks_sdk`,
+    # `requests`, `urllib3`), and CPython writes their `.pyc` into `__pycache__` on first
+    # import. Those `.pyc` files land INSIDE already-extracted wheel dirs and are derived artifacts,
+    # not re-extracted payload -- the `.py`/`.so` they compile from is unchanged. Counting them as
+    # a "re-extraction" is a false positive: it is normal lazy bytecode compilation every Python
+    # program does. A genuine re-extraction unpacks a wheel's `.py`/`.so`/`.dist-info` again, which
+    # this comparison still sees. So the filter narrows the check to the property that matters.
+    def _payload(root: Path) -> set[str]:
+        return {
+            str(p.relative_to(root))
+            for p in root.rglob("*")
+            if "__pycache__" not in p.parts and p.suffix != ".pyc"
+        }
+
+    contents_before = _payload(pex_root)
     # A non-vacuity guard: the warm-up MUST have populated the cache. If it did not, the comparison
     # below would be {} == {} and pass while proving nothing -- the "check that cannot fail" this
     # repo has shipped before. A near-empty tree means either the extraction did not land here or
@@ -424,11 +440,11 @@ def test_concurrent_warm_starts_do_not_re_extract_and_stay_fast(
           f"(budget {budget:.0f}s)")
 
     # AC-12 FIRST -- it is the load-bearing property. The warm starts reused the cache rather than
-    # re-extracting into it: the cache tree is byte-for-path identical before and after, so nothing
-    # was unpacked a second time. Asserted before the latency guard so a re-extraction is reported
-    # as the re-extraction it is, not as a slow start -- and so this cannot be skipped by a latency
-    # failure aborting the test first (which is exactly what masked it in run 32503386016).
-    contents_after = {str(p.relative_to(pex_root)) for p in pex_root.rglob("*")}
+    # re-extracting into it: the wheel payload (excluding bytecode) is identical before and after,
+    # so nothing was unpacked a second time. Asserted before the latency guard so a re-extraction is
+    # reported as the re-extraction it is, not as a slow start -- and so this cannot be skipped by a
+    # latency failure aborting the test first (which is exactly what masked it in run 32503386016).
+    contents_after = _payload(pex_root)
     added = contents_after - contents_before
     assert not added, (
         "the pex cache grew during the warm starts, so the artifact re-extracted rather than "

@@ -1,0 +1,237 @@
+name: release
+
+# Publish the single-file, sha256-pinned release artifact for `shellbox-mcp` (shellbox#21, Step 5).
+#
+# The shape is draft -> verify -> promote, and the order is the safety property: the release is
+# created as a DRAFT (whose assets are not anonymously downloadable), the PUBLISHED bytes are then
+# fetched back, checksum-verified, and driven over real stdio, and only a green verify promotes the
+# draft to a public release. Unverified bytes are never public, and because the verify runs against
+# the bytes that were actually uploaded, byte-reproducibility of the build is not required (FU-3):
+# what is proven is what ships, not a second build of the same commit.
+#
+# TRIGGERS. A namespaced tag is the real release path; this workspace holds four packages plus a
+# Databricks App, so a bare `v*` would claim the tag space for all of them. `workflow_dispatch` is
+# a DRY RUN -- it builds, smokes and generates the notes + checksum without creating a release, so
+# the lane itself can be exercised without publishing anything.
+on:
+  push:
+    tags:
+      - "shellbox-mcp-v*"
+  workflow_dispatch: {}
+
+# contents: write is the whole grant, and nothing wider. It is what `gh release` needs to create,
+# upload, download and promote; the artifact publishes to this repo's releases and touches nothing
+# else.
+permissions:
+  contents: write
+
+jobs:
+  # The gate. The SAME reusable definition ci.yml runs on every push, so a tag cannot ship an
+  # artifact that would not have passed the smoke lane -- the build, all eleven check_artifact
+  # assertions, the pex spike, AC-18, and AC-17 both halves against real postgres (R8).
+  smoke:
+    uses: ./.github/workflows/artifact-smoke.yml
+
+  publish:
+    needs: smoke
+    runs-on: ubuntu-latest
+    # The sandbox image, so the verify round trip runs against tmux 3.4 and /usr/bin/python3 3.12 --
+    # the same target the artifact is built for, not the runner's own toolchain.
+    container: ubuntu:24.04
+    env:
+      # Public PyPI, as the smoke lane uses: the mirror build_artifact.sh defaults to is only
+      # reachable inside Databricks, and with the index already public the mirror->public rewrite is
+      # a no-op that check_pex_lock still proves.
+      SHELLBOX_BUILD_INDEX: https://pypi.org/simple
+      # gh reads the token from GH_TOKEN. The default GITHUB_TOKEN carries the contents:write grant
+      # above and nothing more.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install tmux, Python, git, gh and build tools
+        run: |
+          set -eu
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            tmux python3 python3-venv curl make git ca-certificates
+          tmux -V
+          # gh is not in Ubuntu's own repos, and this job runs inside a container rather than on a
+          # runner image that ships it, so add GitHub's apt source and install it. Used for the
+          # create/upload/download/promote steps; a hand-rolled curl against the REST API would be
+          # several times the length with none of the retry handling gh already has.
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh
+          gh --version
+
+      - uses: actions/checkout@v4
+
+      - name: Mark the workspace safe for git
+        run: |
+          # The build stamps the MANIFEST with `git rev-parse HEAD`; inside the container the
+          # checkout is owned by a different UID, so git refuses it without this (see
+          # artifact-smoke.yml for the full note).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Assert the pinned tmux version
+        run: |
+          set -eu
+          got="$(tmux -V)"
+          case "$got" in
+            "tmux 3.4") echo "tmux version as expected: $got" ;;
+            *) echo "::error::expected 'tmux 3.4' (the sandbox image), got '$got'."; exit 1 ;;
+          esac
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - run: uv sync
+
+      - name: Install pex
+        run: UV_TOOL_BIN_DIR=/usr/local/bin uv tool install pex
+
+      - name: Build the artifact
+        run: make artifact
+
+      - name: Read the MANIFEST, generate release notes, record the sha256
+        run: |
+          set -eu
+          sha="$(cut -d' ' -f1 dist/shellbox.sha256)"
+          echo "artifact sha256: $sha"
+          # Notes are GENERATED from the artifact's own embedded MANIFEST, so they cannot drift from
+          # the file they describe -- check_artifact --assert-release-notes proved the MANIFEST's
+          # notes fields agree with its build fields in the smoke lane. This reads them out for the
+          # human-facing release body.
+          python3 - dist/shellbox "$sha" > /tmp/notes.md <<'PY'
+          import json, sys, zipfile
+
+          artifact, sha = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(artifact) as archive:
+              m = json.loads(archive.read("SHELLBOX-MANIFEST.json"))
+
+          print(f"Single-file, sha256-pinned release artifact for `shellbox-mcp` {m['version']}.")
+          print()
+          print("| field | value |")
+          print("|---|---|")
+          print(f"| sha256 | `{sha}` |")
+          print(f"| Python floor | `{m['python_floor']}` |")
+          print(f"| websockets | `{m['websockets']}` |")
+          print(f"| platform tag | `{m['build_platform_tag']}` |")
+          print(f"| glibc floor | `{m['release_notes'].get('glibc_ceiling', '')}` |")
+          print(f"| built from | `{m['git_sha']}` |")
+          print()
+          print("Install (buzz-lakebox `provider_config.extra_binaries`, single-server `claude`):")
+          print()
+          print("```json")
+          print('{ "extra_binaries": [ { "url": "<this asset\'s URL>", '
+                f'"sha256": "{sha}", "bin": "shellbox" }} ], "mcp_servers": ["shellbox"] }}')
+          print("```")
+          print()
+          print("See `docs/registration.md` for the full install and the tool-prefix mechanics.")
+
+          # The tag must name the version the artifact actually carries, or the release is
+          # mislabelled. Emit the MANIFEST version for the tag-consistency check below.
+          with open("/tmp/manifest-version", "w") as handle:
+              handle.write(m["version"])
+          PY
+          echo "manifest_version=$(cat /tmp/manifest-version)" >> "$GITHUB_ENV"
+          {
+            echo "### shellbox-mcp release artifact"
+            echo ""
+            echo "\`$sha\`  shellbox"
+            echo ""
+            cat /tmp/notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run (workflow_dispatch) — notes and checksum only, no release
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -eu
+          echo "::notice::dry run: built shellbox ${manifest_version}, notes and checksum above; no release created."
+          echo "--- generated notes ---"
+          cat /tmp/notes.md
+
+      - name: The tag names the built version
+        if: github.event_name == 'push'
+        run: |
+          set -eu
+          # tag `shellbox-mcp-v0.1.0` -> `0.1.0`, which must equal the MANIFEST's version. A tag
+          # that names a version the artifact does not carry is a mislabelled release; fail before
+          # anything is created.
+          tag="${GITHUB_REF_NAME}"
+          tag_version="${tag#shellbox-mcp-v}"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag ${tag} names version ${tag_version}, but the artifact carries ${manifest_version}."
+            exit 1
+          fi
+          echo "tag ${tag} matches the built version ${manifest_version}."
+
+      - name: Create the release as a draft
+        if: github.event_name == 'push'
+        run: |
+          set -eu
+          # A DRAFT, deliberately: a draft release's assets are not anonymously downloadable, so the
+          # bytes are not public until the verify below promotes it. --sha256 sidecar ships beside
+          # the artifact in the `sha256sum -c` format the consumer expects.
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
+            --title "shellbox-mcp ${manifest_version}" \
+            --notes-file /tmp/notes.md \
+            dist/shellbox dist/shellbox.sha256
+
+      - name: Fetch the published bytes and verify the checksum
+        if: github.event_name == 'push'
+        run: |
+          set -eu
+          # Fetch what was actually uploaded -- not the local dist/ copy -- so the verify covers the
+          # upload round trip too. `gh release download` reaches a draft's assets with the token.
+          rm -rf verify && mkdir verify
+          gh release download "${GITHUB_REF_NAME}" --dir verify --pattern 'shellbox' --pattern 'shellbox.sha256'
+          cd verify
+          # `sha256sum -c` reads the `<hash>␣␣shellbox` line the build wrote; a mismatch or a
+          # truncated upload fails here, before any bytes go public.
+          sha256sum -c shellbox.sha256
+          chmod +x shellbox
+
+      - name: Verify the downloaded artifact over real stdio (AC-16)
+        if: github.event_name == 'push'
+        env:
+          SHELLBOX_ARTIFACT_PATH: ${{ github.workspace }}/verify/shellbox
+        run: |
+          set -eu
+          # AC-16: initialize + tools/list naming the six tools + one live tools/call round trip,
+          # against the DOWNLOADED bytes. Reuses the exact test the smoke lane runs against the
+          # freshly built artifact, pointed at the published file -- so "the release works" is the
+          # same assertion as "the build works", not a weaker hand-rolled one. This test needs no
+          # postgres (AC-17's registry halves ran in the smoke gate); a skip means the path was not
+          # seen and must redden, not pass (the make test-tmux discipline).
+          status=0
+          uv run pytest tests/integration/test_artifact_stdio.py -v \
+            -k test_all_six_tools_and_a_live_round_trip_over_the_artifact \
+            > /tmp/verify.txt 2>&1 || status=$?
+          cat /tmp/verify.txt
+          if grep -qE 'SHELLBOX_ARTIFACT_PATH unset|no built artifact' /tmp/verify.txt; then
+            echo "::error::the verify round trip SKIPPED -- SHELLBOX_ARTIFACT_PATH was not seen."
+            exit 1
+          fi
+          if ! grep -qE '[0-9]+ passed' /tmp/verify.txt; then
+            echo "::error::the verify round trip ran no tests at all."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the downloaded artifact failed its stdio round trip (pytest exit $status)."
+            exit "$status"
+          fi
+
+      - name: Promote the draft to a published release
+        if: github.event_name == 'push'
+        run: |
+          set -eu
+          # Only reached when the download, the checksum and the stdio round trip all passed. This
+          # is the single step that makes the bytes public.
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          echo "::notice::promoted ${GITHUB_REF_NAME} to a published release."

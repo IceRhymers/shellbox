@@ -139,17 +139,21 @@ jobs:
           # half). The build baked `--interpreter-constraint CPython==3.12.*`, so pex must refuse a
           # 3.11 interpreter rather than fail later inside a cp312 wheel.
           #
-          # pex re-execs into a COMPATIBLE interpreter if the launching one does not match, and this
-          # container has a 3.12 on PATH, so simply invoking under 3.11 would silently re-exec into
-          # 3.12 and prove nothing. PEX_PYTHON_PATH restricts the interpreters pex may consider to
-          # ONLY the 3.11 binary, so pex finds nothing compatible and fails legibly. PEX_PYTHON_PATH
-          # is a PEX_* var, not SHELLBOX_*, so AC-5's "no SHELLBOX_* set" gate is untouched.
+          # Two things are needed to actually exercise refusal, and both matter:
+          #   1. LAUNCH pex under 3.11 (not via the shebang, which resolves to the container's 3.12
+          #      -- and a 3.12 launch SATISFIES the constraint, so pex would just boot and prove
+          #      nothing).
+          #   2. Restrict PEX_PYTHON_PATH to ONLY the 3.11 binary, so pex cannot re-exec into the
+          #      3.12 that is also on PATH. With no compatible interpreter to find, pex fails
+          #      legibly on stderr instead.
+          # PEX_PYTHON_PATH is a PEX_* var, not SHELLBOX_*, so AC-5's "no SHELLBOX_* set" gate is
+          # untouched.
           set -eu
           uv python install 3.11
           py311="$(uv python find 3.11)"
-          echo "restricting pex to $py311"
+          echo "launching pex under, and restricting it to, $py311"
           set +e
-          PEX_PYTHON_PATH="$py311" dist/shellbox >/tmp/ac9.out 2>/tmp/ac9.err </dev/null
+          PEX_PYTHON_PATH="$py311" "$py311" dist/shellbox >/tmp/ac9.out 2>/tmp/ac9.err </dev/null
           rc=$?
           set -e
           echo "exit=$rc"; echo "--- stdout ---"; cat /tmp/ac9.out; echo "--- stderr ---"; cat /tmp/ac9.err

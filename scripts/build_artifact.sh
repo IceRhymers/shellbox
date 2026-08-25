@@ -191,6 +191,17 @@ PY
 # ---- 4. Build the pex ---------------------------------------------------------------------
 # `--no-emit-warnings` keeps pex's own diagnostics off every stream at startup (Principle 4).
 #
+# `--interpreter-constraint CPython==3.12.*` is the Python-version half of AC-9, and it is a
+# DIFFERENT layer from the arch/glibc check in the generated entry point (P1 / AC-18). This one is
+# enforced by pex's OWN bootstrap, before any shellbox code runs: pex will re-exec into a
+# compatible interpreter if the launching one does not match, and if none is discoverable it fails
+# with a legible "no compatible interpreter" error on STDERR and a non-zero exit -- never the
+# obscure SyntaxError/ImportError a sub-3.12 interpreter would otherwise hit deep in a dependency.
+# The floor is 3.12 because `requires-python` is `>=3.12` and the bundled wheels are cp312-tagged
+# (they will not load on 3.11 or 3.13), so the artifact is genuinely CPython-3.12-only; the
+# constraint makes that refusal loud instead of latent. AC-9's CI step proves it by restricting pex
+# to a 3.11 interpreter via PEX_PYTHON_PATH and asserting the refusal.
+#
 # NO `--runtime-pex-root`. pex bakes that value LITERALLY -- it does not expand `$HOME` or env vars
 # -- so a baked `$HOME/.cache/...` created a directory literally named `$HOME` under the process
 # cwd (MEASURED by the spike's q_reexec: the venv python resolved under `.../shellbox/$HOME/.cache/
@@ -205,6 +216,7 @@ pex \
   --find-links "$WHEELS_DIR" \
   --complete-platform "$COMPLETE_PLATFORM_FILE" \
   --no-build \
+  --interpreter-constraint "CPython==3.12.*" \
   --sources-directory "$ENTRY_DIR" \
   --entry-point _shellbox_entry:main \
   --python-shebang "#!/usr/bin/env python3" \

@@ -93,6 +93,13 @@ WEBSOCKETS_MAX_EXCLUSIVE = (16,)
 # for an index at run time, which is exactly Principle 5's failure ("the install must not resolve").
 FORBIDDEN_DISTS = ("pip", "setuptools", "wheel")
 
+# The interpreter constraint the build bakes into PEX-INFO (AC-9), matching the
+# `--interpreter-constraint` in build_artifact.sh. The floor is 3.12 because `requires-python` is
+# `>=3.12` and the bundled wheels are cp312-tagged. This is the STATIC half of AC-9: a deterministic
+# check that the refusal machinery is present in the artifact. The runtime half (the smoke lane's
+# 3.11 step) proves the refusal actually fires. If the build's constraint changes, this changes too.
+EXPECTED_INTERPRETER_CONSTRAINT = "CPython==3.12.*"
+
 # The Step 0 sidecar. Its absence is what makes the two platform modes fail with a legible message.
 # The path is overridable by env only so the mutation test can point at a synthetic sidecar without
 # writing into the repo; the build and CI use the committed default.
@@ -407,6 +414,44 @@ def assert_no_resolver(path: Path) -> int:
     return 0
 
 
+def assert_interpreter_constraint(path: Path) -> int:
+    """PEX-INFO carries the expected interpreter constraint (AC-9, static half).
+
+    The build bakes `--interpreter-constraint CPython==3.12.*`, which is what makes pex refuse a
+    sub-3.12 interpreter with a legible stderr error instead of failing later as an obscure
+    SyntaxError/ImportError deep in a cp312 wheel. This asserts the constraint is present in the
+    artifact -- a deterministic check that the refusal machinery is baked in. The smoke lane's
+    3.11 step is the runtime companion that proves the refusal actually fires.
+    """
+    archive = _open_zip(path)
+    if isinstance(archive, int):
+        return archive
+    with archive:
+        raw = _read_member(archive, PEX_INFO_NAME)
+        if raw is None:
+            return _fail(f"the artifact holds no {PEX_INFO_NAME}, so it is not a pex.")
+        try:
+            pex_info = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            return _fail(f"{PEX_INFO_NAME} is not valid JSON: {error}")
+
+        constraints = pex_info.get("interpreter_constraints")
+        if not isinstance(constraints, list) or not constraints:
+            return _fail(
+                f"{PEX_INFO_NAME} records no interpreter_constraints, so the artifact would boot "
+                f"on any interpreter pex can find and fail later inside a cp312 wheel. The build "
+                f"must pass --interpreter-constraint {EXPECTED_INTERPRETER_CONSTRAINT!r} (AC-9)."
+            )
+        if EXPECTED_INTERPRETER_CONSTRAINT not in constraints:
+            return _fail(
+                f"{PEX_INFO_NAME} interpreter_constraints is {constraints!r}, which does not "
+                f"include {EXPECTED_INTERPRETER_CONSTRAINT!r}. The floor is 3.12 (requires-python "
+                f">=3.12; cp312 wheels), so the constraint must pin it."
+            )
+    print(f"OK: {PEX_INFO_NAME} pins interpreter_constraints {EXPECTED_INTERPRETER_CONSTRAINT!r}.")
+    return 0
+
+
 def assert_release_notes(path: Path) -> int:
     """The generated release notes agree field-by-field with the manifest.
 
@@ -694,6 +739,7 @@ _MODES = {
     "--assert-websockets-pin": assert_websockets_pin,
     "--assert-hosts": assert_hosts,
     "--assert-no-resolver": assert_no_resolver,
+    "--assert-interpreter-constraint": assert_interpreter_constraint,
     "--assert-release-notes": assert_release_notes,
     "--assert-platform": assert_platform,
     "--assert-glibc-ceiling": assert_glibc_ceiling,

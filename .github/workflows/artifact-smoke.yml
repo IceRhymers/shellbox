@@ -101,8 +101,8 @@ jobs:
           set -eu
           for mode in --assert-shebang --assert-executable --assert-sha256 --assert-manifest \
                       --assert-websockets-pin --assert-platform --assert-glibc-ceiling \
-                      --assert-hosts --assert-no-resolver --assert-release-notes \
-                      --assert-silent-start; do
+                      --assert-hosts --assert-no-resolver --assert-interpreter-constraint \
+                      --assert-release-notes --assert-silent-start; do
             echo ">> check_artifact $mode"
             python3 scripts/check_artifact.py "$mode" dist/shellbox
           done
@@ -132,6 +132,37 @@ jobs:
           assert buf.getvalue() == "", f"wrote to stdout on refusal: {buf.getvalue()!r}"
           print("AC-18 ok: wrong-arch refused, stdout clean", file=sys.stderr)
           '
+
+      - name: AC-9 — a sub-3.12 interpreter is refused, stdout clean
+        run: |
+          # The RUNTIME half of AC-9 (check_artifact --assert-interpreter-constraint is the static
+          # half). The build baked `--interpreter-constraint CPython==3.12.*`, so pex must refuse a
+          # 3.11 interpreter rather than fail later inside a cp312 wheel.
+          #
+          # pex re-execs into a COMPATIBLE interpreter if the launching one does not match, and this
+          # container has a 3.12 on PATH, so simply invoking under 3.11 would silently re-exec into
+          # 3.12 and prove nothing. PEX_PYTHON_PATH restricts the interpreters pex may consider to
+          # ONLY the 3.11 binary, so pex finds nothing compatible and fails legibly. PEX_PYTHON_PATH
+          # is a PEX_* var, not SHELLBOX_*, so AC-5's "no SHELLBOX_* set" gate is untouched.
+          set -eu
+          uv python install 3.11
+          py311="$(uv python find 3.11)"
+          echo "restricting pex to $py311"
+          set +e
+          PEX_PYTHON_PATH="$py311" dist/shellbox >/tmp/ac9.out 2>/tmp/ac9.err </dev/null
+          rc=$?
+          set -e
+          echo "exit=$rc"; echo "--- stdout ---"; cat /tmp/ac9.out; echo "--- stderr ---"; cat /tmp/ac9.err
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::the artifact did not refuse a 3.11 interpreter (exit 0)."; exit 1
+          fi
+          if [ -s /tmp/ac9.out ]; then
+            echo "::error::the artifact wrote to stdout while refusing 3.11 (stdout is the wire)."; exit 1
+          fi
+          if ! grep -qiE '3\.12|interpreter|constraint|compatible' /tmp/ac9.err; then
+            echo "::error::the refusal did not name the interpreter constraint on stderr."; exit 1
+          fi
+          echo "AC-9 ok: 3.11 refused, stdout clean, stderr names the constraint."
 
       - name: Migrate the registry schema
         run: uv run alembic -c alembic.ini upgrade head

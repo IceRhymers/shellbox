@@ -43,6 +43,7 @@ SHEBANG: str = _checker.SHEBANG
 MANIFEST_NAME: str = _checker.MANIFEST_NAME
 PEX_INFO_NAME: str = _checker.PEX_INFO_NAME
 ALLOWED_HOST: str = _checker.ALLOWED_HOST
+EXPECTED_INTERPRETER_CONSTRAINT: str = _checker.EXPECTED_INTERPRETER_CONSTRAINT
 
 MIRROR_HOST = "pypi-proxy.dev.databricks.com"
 BUILD_TAG = "manylinux_2_17_x86_64"
@@ -92,6 +93,7 @@ def _pex_info(**overrides: Any) -> dict[str, Any]:
     document: dict[str, Any] = {
         "pex_version": "2.100.4",
         "inherit_path": "false",
+        "interpreter_constraints": [EXPECTED_INTERPRETER_CONSTRAINT],
         "distributions": {
             "pydantic_core-2.46.4-cp312-cp312-manylinux_2_17_x86_64.whl": "hashhashhash",
             "mcp-1.29.0-py3-none-any.whl": "hashhashhash",
@@ -402,6 +404,45 @@ def test_a_missing_pex_info_fails_no_resolver(tmp_path: Path) -> None:
     result = _run("--assert-no-resolver", str(artifact))
     assert result.returncode != 0
     assert PEX_INFO_NAME in result.stderr
+
+
+# --- interpreter constraint (AC-9, static half) -----------------------------------------------
+
+
+def test_a_clean_artifact_passes_interpreter_constraint(tmp_path: Path) -> None:
+    artifact = _make_artifact(tmp_path)
+    result = _run("--assert-interpreter-constraint", str(artifact))
+    assert result.returncode == 0, result.stderr
+    assert EXPECTED_INTERPRETER_CONSTRAINT in result.stdout
+
+
+def test_absent_interpreter_constraint_fails(tmp_path: Path) -> None:
+    """A pex built without --interpreter-constraint would boot on any interpreter pex finds and
+    fail later inside a cp312 wheel; the artifact must carry the constraint (AC-9)."""
+    pex_info = _pex_info()
+    del pex_info["interpreter_constraints"]
+    artifact = _make_artifact(tmp_path, pex_info=pex_info)
+    result = _run("--assert-interpreter-constraint", str(artifact))
+    assert result.returncode != 0
+    assert "no interpreter_constraints" in result.stderr
+
+
+def test_an_empty_interpreter_constraint_list_fails(tmp_path: Path) -> None:
+    artifact = _make_artifact(tmp_path, pex_info=_pex_info(interpreter_constraints=[]))
+    result = _run("--assert-interpreter-constraint", str(artifact))
+    assert result.returncode != 0
+    assert "no interpreter_constraints" in result.stderr
+
+
+def test_a_wrong_interpreter_constraint_fails(tmp_path: Path) -> None:
+    """A constraint that does not pin the 3.12 floor is caught -- e.g. a stale 3.11 pin, which
+    would let the artifact boot on an interpreter its wheels cannot load."""
+    artifact = _make_artifact(
+        tmp_path, pex_info=_pex_info(interpreter_constraints=["CPython==3.11.*"])
+    )
+    result = _run("--assert-interpreter-constraint", str(artifact))
+    assert result.returncode != 0
+    assert "CPython==3.11.*" in result.stderr
 
 
 # --- release notes ----------------------------------------------------------------------------

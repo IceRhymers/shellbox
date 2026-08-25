@@ -65,3 +65,31 @@ def test_shell_send_docstring_names_no_environment_key() -> None:
 
     assert "SHELLBOX_IDLE_TIMEOUT_SECONDS" not in doc
     assert "SHELLBOX_MAX_SEND_LINE_BYTES" in doc
+
+
+def _tool_names() -> set[str]:
+    """Every `shell_*` tool function `server.py` defines, from its AST.
+
+    Derived rather than restated so the install-doc check below cannot drift from the code:
+    the tool functions are the nested `shell_*` defs inside `build_server`. A helper is named
+    `_shell_*` (leading underscore) or otherwise, so the `shell_` prefix selects the tools."""
+    names = {
+        node.name
+        for node in ast.walk(_TREE)
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("shell_")
+    }
+    assert names, "no shell_* tool functions found in server.py"
+    return names
+
+
+def test_the_install_doc_names_every_tool_server_defines() -> None:
+    """Step 6 gate (shellbox#21): the install section in `docs/registration.md` documents the
+    tool prefix the model sees, and it must name every tool `server.py` exposes. If a tool is
+    added or renamed and the doc is not updated, this reddens rather than shipping a doc that
+    lies about the model-visible surface. It asserts the DOC covers the CODE, not the reverse,
+    so unrelated prose in the doc does not constrain the code."""
+    doc = (Path(__file__).resolve().parents[2] / "docs" / "registration.md").read_text(
+        encoding="utf-8"
+    )
+    missing = sorted(name for name in _tool_names() if name not in doc)
+    assert not missing, f"docs/registration.md does not name these server tools: {missing}"

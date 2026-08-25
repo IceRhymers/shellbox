@@ -84,8 +84,16 @@ __all__ = [
 # MEASURED in this repo's environment, not read from the documentation:
 # `websockets` 15.0.1 defaults are `ping_interval=20`, `ping_timeout=20`, `open_timeout=10`,
 # `close_timeout=10`, `max_size=1048576`. The sandbox image ships 14.2 (probe findings), so the
-# dependency range spans both and every value this module depends on is passed EXPLICITLY. A
-# default that changes between those two versions must not change this transport's behavior.
+# dependency range spans both.
+#
+# The four timeout/keepalive values are passed EXPLICITLY at the dial (`_dial_once`), so a
+# default that moves between those two versions cannot move this transport's behavior. `max_size`
+# is the one exception, and this comment used to claim otherwise. It is NOT passed at the dial, so
+# the module relies on whatever `max_size` the resolved `websockets` defaults to -- 1 MiB on both
+# 14.2 and 15.0.1, but that equality is the library's to keep, not this module's. `bridge.py`'s
+# ring is sized to 1 MiB, so this is a boundary the module depends on and should pin. Making it
+# explicit is a behavior change with a live opt-out caller (`scripts/live_acceptance.py` dials
+# `max_size=None`), so it is tracked as its own issue (#28) rather than fixed here.
 _DEFAULT_PING_INTERVAL = 20.0
 _DEFAULT_PING_TIMEOUT = 20.0
 

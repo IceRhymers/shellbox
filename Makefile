@@ -1,5 +1,5 @@
 .PHONY: install sync fmt lint test test-tmux test-registry test-integration migrate migration \
-	migrate-roundtrip deploy app-lock grant require-pg-host require-deploy-principal
+	migrate-roundtrip deploy app-lock grant require-pg-host require-deploy-principal artifact
 
 # The workspace, and the target inside the bundle. Both overridable on the command line:
 #
@@ -232,6 +232,27 @@ app-lock:
 		$(APP_DEPLOY_ROOT)/uv.lock --baseline $(APP_DEPLOY_ROOT)/uv.lock.bak
 	python3 scripts/check_deploy_lock.py --assert-hosts $(APP_DEPLOY_ROOT)/uv.lock
 	rm -f $(APP_DEPLOY_ROOT)/uv.lock.bak
+
+# The single-file, sha256-pinned release artifact for `shellbox-mcp` (shellbox#21). Consumed by
+# buzz-lakebox `provider_config.extra_binaries`, which fetches one URL and verifies one sha256.
+#
+# CI-ONLY IN PRACTICE, and NOT in `make lint` for the same measured reason `app-lock` gives: pex
+# runs its vendored pip `--isolated` so it ignores the mirror config, and `pypi.org` is blackholed
+# on the author's box, so a local run is connection-refused. `scripts/build_artifact.sh`'s header
+# carries the measurements. This target exists so CI invokes a make target (Principle 3: a lane CI
+# does not invoke is a comment with a Makefile around it) and so the build has one documented name.
+#
+# UV_LOCKED := 0, as `app-lock` sets it and for the same reason plus one: `uv.lock` is gitignored so
+# a fresh checkout has none, AND the build resolves for a target platform that is not the build
+# host (via pex `--complete-platform`), which is a resolution rather than an install. The build
+# records the resolved set and per-artifact hashes into the artifact's own MANIFEST, so the pin
+# lives in the artifact rather than in a file this repo cannot commit.
+#
+# Depends on Step 0's committed probe outputs (`probe/artifact-platform.json`,
+# `probe/complete-platform-<arch>.json`); the script fails with a clear message if they are absent.
+artifact: UV_LOCKED := 0
+artifact:
+	scripts/build_artifact.sh
 
 # The second guard on this path, and it guards the IDENTITY rather than the destination.
 #

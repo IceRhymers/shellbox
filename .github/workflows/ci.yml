@@ -195,3 +195,11 @@ jobs:
       # installs the pinned set rather than re-resolving, so it cannot flake that way.
       - name: Install from the emitted lockfile
         run: uv sync --locked
+
+  # The release artifact's build + smoke lane (shellbox#21, Step 4). Factored into a reusable
+  # workflow so release.yml can call the SAME definition on a tag and the published bytes are the
+  # smoked bytes (R8). It builds dist/shellbox, runs every check_artifact assertion, the committed
+  # pex spike, and the artifact integration suite (AC-17) against a postgres service. It does not
+  # publish. CI-only in practice: the build resolves wheels, which make lint/test cannot do.
+  artifact:
+    uses: ./.github/workflows/artifact-smoke.yml

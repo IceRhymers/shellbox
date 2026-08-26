@@ -170,6 +170,14 @@ async def run_subscriber(
                 ping_interval=20,
                 ping_timeout=20,
                 open_timeout=15,
+                # No cap, and deliberately UNLIKE the publisher's 1 MiB
+                # (`WSTransportConfig.max_size`). This subscriber is measurement apparatus: its
+                # whole job is to observe the real stream across a real edge kill. A frame over any
+                # cap would tear this socket down with a 1009 close that reads, in the journal,
+                # exactly like the edge kill it exists to catch -- so a cap would let the harness
+                # manufacture the very teardown it is here to measure. The publisher caps because
+                # it ships and receives only tiny control frames inbound; this reads the pty output
+                # stream, where it must observe rather than bound.
                 max_size=None,
             ) as socket:
                 seen.sockets += 1

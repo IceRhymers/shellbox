@@ -66,6 +66,7 @@ from shellbox_transport.codec import (
     decode_frame,
     encode_frame,
 )
+from shellbox_transport.seq import DEFAULT_RING_BYTES
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidMessage, InvalidStatus, InvalidURI
 
@@ -81,21 +82,32 @@ __all__ = [
     "classify_failure",
 ]
 
-# MEASURED in this repo's environment, not read from the documentation:
-# `websockets` 15.0.1 defaults are `ping_interval=20`, `ping_timeout=20`, `open_timeout=10`,
-# `close_timeout=10`, `max_size=1048576`. The sandbox image ships 14.2 (probe findings), so the
-# dependency range spans both.
+# MEASURED in this repo's environment on 2026-08-25, not read from the documentation:
+# `websockets` 15.0.1's dial defaults are `ping_interval=20`, `ping_timeout=20`,
+# `open_timeout=10`, `close_timeout=10`, `max_size=1048576` (1 MiB). The sandbox image ships 14.2
+# (probe findings), and the dependency range (`>=14.2,<16`) spans both.
 #
-# The four timeout/keepalive values are passed EXPLICITLY at the dial (`_dial_once`), so a
-# default that moves between those two versions cannot move this transport's behavior. `max_size`
-# is the one exception, and this comment used to claim otherwise. It is NOT passed at the dial, so
-# the module relies on whatever `max_size` the resolved `websockets` defaults to -- 1 MiB on both
-# 14.2 and 15.0.1, but that equality is the library's to keep, not this module's. `bridge.py`'s
-# ring is sized to 1 MiB, so this is a boundary the module depends on and should pin. Making it
-# explicit is a behavior change with a live opt-out caller (`scripts/live_acceptance.py` dials
-# `max_size=None`), so it is tracked as its own issue (#28) rather than fixed here.
+# So EVERY value this transport's behavior depends on is passed EXPLICITLY at the dial
+# (`_dial_once`): a default that moves between those two versions then cannot move this
+# transport. `max_size` earns that treatment for a reason of its own -- it is pinned to the
+# publisher's ring size (`DEFAULT_RING_BYTES`, 1 MiB). The ring bounds the bytes this side sends;
+# the cap bounds the largest single frame it will accept back. They are one boundary seen from
+# the two ends of the socket, so they are one constant here rather than two free to drift on a
+# library default nobody chose.
+#
+# This transport receives only tiny control frames inbound (input, resize), so the cap is a
+# DEFENSIVE bound, not a working size: an inbound frame over it is a peer sending what this
+# protocol never sends. `websockets` fails that socket with a 1009 (message too big) close, which
+# reaches `classify_failure` as a `ConnectionClosed` -- so it is TRANSIENT, the socket dies, and
+# the loop re-dials, exactly as it does for the edge kill.
+#
+# It is a config field, so a caller that must receive larger frames can raise it or opt out with
+# `None`. The subscriber in `scripts/live_acceptance.py` opts out, for the reason spelled out
+# there: it is measurement apparatus, and a cap would let it manufacture the teardown it exists
+# to observe.
 _DEFAULT_PING_INTERVAL = 20.0
 _DEFAULT_PING_TIMEOUT = 20.0
+_DEFAULT_MAX_SIZE = DEFAULT_RING_BYTES
 
 # The detector decision, which the plan left to this work item to make and to state.
 #
@@ -206,6 +218,17 @@ class WSTransportConfig:
 
     Short rather than zero because a graceful close is still worth attempting: it is what
     makes the App release the binding in the same millisecond instead of waiting on TCP."""
+
+    max_size: int | None = _DEFAULT_MAX_SIZE
+    """The largest inbound frame this socket will accept, passed EXPLICITLY at the dial.
+
+    Pinned to the ring size (`DEFAULT_RING_BYTES`, 1 MiB): the cap and the ring are one boundary
+    seen from the two ends of the socket, so they cannot drift apart on a `websockets` default
+    nobody here chose. This publisher receives only control frames inbound, so the cap is a
+    defensive bound rather than a working size -- an inbound frame over it is a peer speaking a
+    protocol this one does not, and `websockets` tears the socket down with a 1009 that
+    ``classify_failure`` reads as a transient close. ``None`` opts out entirely; see the module
+    comment on ``_DEFAULT_MAX_SIZE`` and the subscriber in ``scripts/live_acceptance.py``."""
 
     hello_deadline: float = 5.0
     """How long a 101 has to become a ``hello``. Bounded rather than absent: a server that
@@ -465,6 +488,9 @@ class WSTransport:
             ping_interval=self._config.ping_interval,
             ping_timeout=self._config.ping_timeout,
             close_timeout=self._config.close_timeout,
+            # Pinned to the ring size and passed for the same reason as the values above -- a
+            # library default must not decide the frame boundary. See `_DEFAULT_MAX_SIZE`.
+            max_size=self._config.max_size,
         )
         try:
             hello = await self._await_hello(connection)

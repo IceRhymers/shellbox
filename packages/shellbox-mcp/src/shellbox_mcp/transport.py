@@ -100,8 +100,9 @@ __all__ = [
 # Inbound is control frames only (input, resize), so 1 MiB is generous headroom rather than a
 # working size -- a DEFENSIVE ceiling, not a promise about every inbound frame. A >1 MiB `input`
 # frame (a very large paste) is in-protocol and WOULD trip it: it is torn down here rather than
-# refused per-line at the pty (`SHELLBOX_MAX_SEND_BYTES`), which is accepted because such input
-# cannot reach a canonical-mode pty anyway, and is unchanged from the library default this pins.
+# refused as an over-size payload at the pty (`SHELLBOX_MAX_SEND_BYTES`, the total-payload
+# ceiling), which is accepted because such input cannot reach a canonical-mode pty anyway, and is
+# unchanged from the library default this pins.
 # `websockets` fails an over-cap socket with a 1009 (message too big) close; on a live socket that
 # surfaces as a `ConnectionClosed` on the `receive` path -- the SAME shape and handling as the
 # edge kill: the receive loop ends and the publisher re-dials. (`classify_failure` maps that shape

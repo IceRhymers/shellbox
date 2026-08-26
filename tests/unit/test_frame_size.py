@@ -9,7 +9,7 @@ get and for the same reason (`tests/unit/test_no_keepalive.py`).
 
 Three claims, and the third is measured against the real library rather than a double:
 
-1. the cap defaults to the ring size, so the two boundaries are one constant;
+1. the cap defaults to the ring size, so the two are sized from one constant;
 2. that value reaches the library on EVERY dial, not merely the first -- asserted on what the
    dial received, in `test_no_keepalive.py`'s shape;
 3. a real inbound frame OVER the cap tears the socket down with a 1009 close that both carries
@@ -58,7 +58,7 @@ def data_frame(size: int) -> bytes:
 
 
 # --------------------------------------------------------------------------------------
-# 1. The cap and the ring are one boundary
+# 1. The cap and the ring are sized from one constant
 # --------------------------------------------------------------------------------------
 
 

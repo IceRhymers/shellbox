@@ -89,17 +89,24 @@ __all__ = [
 #
 # So EVERY value this transport's behavior depends on is passed EXPLICITLY at the dial
 # (`_dial_once`): a default that moves between those two versions then cannot move this
-# transport. `max_size` earns that treatment for a reason of its own -- it is pinned to the
-# publisher's ring size (`DEFAULT_RING_BYTES`, 1 MiB). The ring bounds the bytes this side sends;
-# the cap bounds the largest single frame it will accept back. They are one boundary seen from
-# the two ends of the socket, so they are one constant here rather than two free to drift on a
-# library default nobody chose.
+# transport. `max_size` earns that treatment for a reason of its own. It is an explicit 1 MiB
+# inbound cap, taken from `DEFAULT_RING_BYTES` so this module carries a single 1 MiB figure rather
+# than a second bare literal. The two are NOT the same boundary and should not be read as one: the
+# ring is an aggregate buffer of the bytes this side SENDS, sized to the reconnect gap; the cap is
+# a per-message ceiling on the largest single frame it will ACCEPT. They share only the constant,
+# so raising `DEFAULT_RING_BYTES` raises this cap as a side effect -- reconsider the inbound side
+# if you ever do, or give the cap its own literal.
 #
-# This transport receives only tiny control frames inbound (input, resize), so the cap is a
-# DEFENSIVE bound, not a working size: an inbound frame over it is a peer sending what this
-# protocol never sends. `websockets` fails that socket with a 1009 (message too big) close, which
-# reaches `classify_failure` as a `ConnectionClosed` -- so it is TRANSIENT, the socket dies, and
-# the loop re-dials, exactly as it does for the edge kill.
+# Inbound is control frames only (input, resize), so 1 MiB is generous headroom rather than a
+# working size -- a DEFENSIVE ceiling, not a promise about every inbound frame. A >1 MiB `input`
+# frame (a very large paste) is in-protocol and WOULD trip it: it is torn down here rather than
+# refused per-line at the pty (`SHELLBOX_MAX_SEND_BYTES`), which is accepted because such input
+# cannot reach a canonical-mode pty anyway, and is unchanged from the library default this pins.
+# `websockets` fails an over-cap socket with a 1009 (message too big) close; on a live socket that
+# surfaces as a `ConnectionClosed` on the `receive` path -- the SAME shape and handling as the
+# edge kill: the receive loop ends and the publisher re-dials. (`classify_failure` maps that shape
+# to TRANSIENT and governs the DIAL; on a live socket neither this close nor the edge kill routes
+# through it. The reconnect is identical either way.)
 #
 # It is a config field, so a caller that must receive larger frames can raise it or opt out with
 # `None`. The subscriber in `scripts/live_acceptance.py` opts out, for the reason spelled out
@@ -222,13 +229,13 @@ class WSTransportConfig:
     max_size: int | None = _DEFAULT_MAX_SIZE
     """The largest inbound frame this socket will accept, passed EXPLICITLY at the dial.
 
-    Pinned to the ring size (`DEFAULT_RING_BYTES`, 1 MiB): the cap and the ring are one boundary
-    seen from the two ends of the socket, so they cannot drift apart on a `websockets` default
-    nobody here chose. This publisher receives only control frames inbound, so the cap is a
-    defensive bound rather than a working size -- an inbound frame over it is a peer speaking a
-    protocol this one does not, and `websockets` tears the socket down with a 1009 that
-    ``classify_failure`` reads as a transient close. ``None`` opts out entirely; see the module
-    comment on ``_DEFAULT_MAX_SIZE`` and the subscriber in ``scripts/live_acceptance.py``."""
+    An explicit 1 MiB ceiling, taken from `DEFAULT_RING_BYTES` to avoid a second bare literal --
+    NOT the same boundary as the ring (the module comment on ``_DEFAULT_MAX_SIZE`` spells out the
+    difference and the footgun). Inbound is control frames only, so 1 MiB is a defensive ceiling
+    rather than a working size; an over-cap frame makes `websockets` tear the socket down with a
+    1009 close, which the publisher then handles exactly as it handles the edge kill -- the
+    receive loop ends and it re-dials. ``None`` opts out entirely; see also the subscriber in
+    ``scripts/live_acceptance.py``."""
 
     hello_deadline: float = 5.0
     """How long a 101 has to become a ``hello``. Bounded rather than absent: a server that

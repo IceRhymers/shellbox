@@ -12,9 +12,9 @@ Three claims, and the third is measured against the real library rather than a d
 1. the cap defaults to the ring size, so the two boundaries are one constant;
 2. that value reaches the library on EVERY dial, not merely the first -- asserted on what the
    dial received, in `test_no_keepalive.py`'s shape;
-3. a real inbound frame OVER the cap tears the socket down with a 1009 that `classify_failure`
-   reads as transient, and a substantial frame UNDER it is delivered intact -- so the teardown
-   is the cap firing and not some other close.
+3. a real inbound frame OVER the cap tears the socket down with a 1009 close that both carries
+   that code and classifies transient, and a substantial frame UNDER it is delivered intact --
+   so the teardown is the cap firing and not some other close.
 
 The last pair runs a real `websockets` server on the loopback and dials it with the module's own
 default `connect` (`_NoRedirect`), because a hand-built `ConnectionClosedError` would assert the
@@ -47,7 +47,7 @@ _TEST_CAP = 4096
 
 def config(**overrides: object) -> WSTransportConfig:
     base = {"url": "wss://app.example/publish", "session_id": SESSION_ID, "epoch": EPOCH}
-    return WSTransportConfig(**{**base, **overrides})  # type: ignore[arg-type]
+    return WSTransportConfig(**{**base, **overrides})
 
 
 def data_frame(size: int) -> bytes:
@@ -70,7 +70,7 @@ def test_the_cap_defaults_to_the_ring_size() -> None:
     tuned and the other is forgotten -- so this is an equality, not two independent literals.
     """
     assert config().max_size == DEFAULT_RING_BYTES
-    assert config().max_size == 1 << 20, "the measured websockets 15.0.1 default, held explicitly"
+    assert config().max_size == 1 << 20, "an explicit 1 MiB, taken from the ring's constant"
 
 
 # --------------------------------------------------------------------------------------
@@ -136,7 +136,7 @@ async def _live_socket(
             pass
 
     async with serve(handler, "127.0.0.1", 0) as server:
-        host, port = server.sockets[0].getsockname()[:2]
+        host, port = next(iter(server.sockets)).getsockname()[:2]
         transport = WSTransport(config(url=f"ws://{host}:{port}/publish", max_size=cap))
         stream = transport.connect_forever()
         connected = await stream.__anext__()
@@ -149,12 +149,13 @@ async def _live_socket(
 def test_an_inbound_frame_over_the_cap_is_a_transient_teardown() -> None:
     """T-FRAME-SIZE. The frame driven OVER the cap, and the classification it produces.
 
-    An inbound frame larger than the cap is a peer sending what this protocol never sends -- this
-    publisher receives only control frames inbound. `websockets` fails the socket with a 1009
-    (message too big) close rather than buffering it, and that surfaces as `ConnectionClosed`, so
-    `classify_failure` treats it as `TRANSIENT`: the socket dies and the loop re-dials, exactly
-    as it does for the edge kill. The 1009 is asserted too, so the teardown is provably the cap
-    and not an unrelated close.
+    An inbound frame larger than the cap is one a peer should not send in normal operation -- this
+    publisher receives only small control frames inbound. `websockets` fails the socket with a
+    1009 (message too big) close rather than buffering it, surfacing as `ConnectionClosed`. This
+    test recv's on the connection directly and asserts two things: the close carries the 1009 (so
+    the teardown is provably the CAP and not an unrelated close), and `classify_failure` maps it
+    to `TRANSIENT` -- the same disposition it gives the edge kill, so a live socket re-dials. It
+    does NOT drive the re-dial loop itself; the fakes-based tests above cover that.
     """
     over = data_frame(_TEST_CAP * 2)
 

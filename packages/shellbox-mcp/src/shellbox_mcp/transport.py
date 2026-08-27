@@ -66,6 +66,7 @@ from shellbox_transport.codec import (
     decode_frame,
     encode_frame,
 )
+from shellbox_transport.seq import DEFAULT_RING_BYTES
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidMessage, InvalidStatus, InvalidURI
 
@@ -81,21 +82,40 @@ __all__ = [
     "classify_failure",
 ]
 
-# MEASURED in this repo's environment, not read from the documentation:
-# `websockets` 15.0.1 defaults are `ping_interval=20`, `ping_timeout=20`, `open_timeout=10`,
-# `close_timeout=10`, `max_size=1048576`. The sandbox image ships 14.2 (probe findings), so the
-# dependency range spans both.
+# MEASURED in this repo's environment on 2026-08-25, not read from the documentation:
+# `websockets` 15.0.1's dial defaults are `ping_interval=20`, `ping_timeout=20`,
+# `open_timeout=10`, `close_timeout=10`, `max_size=1048576` (1 MiB). The sandbox image ships 14.2
+# (probe findings), and the dependency range (`>=14.2,<16`) spans both.
 #
-# The four timeout/keepalive values are passed EXPLICITLY at the dial (`_dial_once`), so a
-# default that moves between those two versions cannot move this transport's behavior. `max_size`
-# is the one exception, and this comment used to claim otherwise. It is NOT passed at the dial, so
-# the module relies on whatever `max_size` the resolved `websockets` defaults to -- 1 MiB on both
-# 14.2 and 15.0.1, but that equality is the library's to keep, not this module's. `bridge.py`'s
-# ring is sized to 1 MiB, so this is a boundary the module depends on and should pin. Making it
-# explicit is a behavior change with a live opt-out caller (`scripts/live_acceptance.py` dials
-# `max_size=None`), so it is tracked as its own issue (#28) rather than fixed here.
+# So EVERY value this transport's behavior depends on is passed EXPLICITLY at the dial
+# (`_dial_once`): a default that moves between those two versions then cannot move this
+# transport. `max_size` earns that treatment for a reason of its own. It is an explicit 1 MiB
+# inbound cap, taken from `DEFAULT_RING_BYTES` so this module carries a single 1 MiB figure rather
+# than a second bare literal. The two are NOT the same boundary and should not be read as one: the
+# ring is an aggregate buffer of the bytes this side SENDS, sized to the reconnect gap; the cap is
+# a per-message ceiling on the largest single frame it will ACCEPT. They share only the constant,
+# so raising `DEFAULT_RING_BYTES` raises this cap as a side effect -- reconsider the inbound side
+# if you ever do, or give the cap its own literal.
+#
+# Inbound is control frames only (input, resize), so 1 MiB is generous headroom rather than a
+# working size -- a DEFENSIVE ceiling, not a promise about every inbound frame. A >1 MiB `input`
+# frame (a very large paste) is in-protocol and WOULD trip it: it is torn down here rather than
+# refused as an over-size payload at the pty (`SHELLBOX_MAX_SEND_BYTES`, the total-payload
+# ceiling), which is accepted because such input cannot reach a canonical-mode pty anyway, and is
+# unchanged from the library default this pins.
+# `websockets` fails an over-cap socket with a 1009 (message too big) close; on a live socket that
+# surfaces as a `ConnectionClosed` on the `receive` path -- the SAME shape and handling as the
+# edge kill: the receive loop ends and the publisher re-dials. (`classify_failure` maps that shape
+# to TRANSIENT and governs the DIAL; on a live socket neither this close nor the edge kill routes
+# through it. The reconnect is identical either way.)
+#
+# It is a config field, so a caller that must receive larger frames can raise it or opt out with
+# `None`. The subscriber in `scripts/live_acceptance.py` opts out, for the reason spelled out
+# there: it is measurement apparatus, and a cap would let it manufacture the teardown it exists
+# to observe.
 _DEFAULT_PING_INTERVAL = 20.0
 _DEFAULT_PING_TIMEOUT = 20.0
+_DEFAULT_MAX_SIZE = DEFAULT_RING_BYTES
 
 # The detector decision, which the plan left to this work item to make and to state.
 #
@@ -206,6 +226,17 @@ class WSTransportConfig:
 
     Short rather than zero because a graceful close is still worth attempting: it is what
     makes the App release the binding in the same millisecond instead of waiting on TCP."""
+
+    max_size: int | None = _DEFAULT_MAX_SIZE
+    """The largest inbound frame this socket will accept, passed EXPLICITLY at the dial.
+
+    An explicit 1 MiB ceiling, taken from `DEFAULT_RING_BYTES` to avoid a second bare literal --
+    NOT the same boundary as the ring (the module comment on ``_DEFAULT_MAX_SIZE`` spells out the
+    difference and the footgun). Inbound is control frames only, so 1 MiB is a defensive ceiling
+    rather than a working size; an over-cap frame makes `websockets` tear the socket down with a
+    1009 close, which the publisher then handles exactly as it handles the edge kill -- the
+    receive loop ends and it re-dials. ``None`` opts out entirely; see also the subscriber in
+    ``scripts/live_acceptance.py``."""
 
     hello_deadline: float = 5.0
     """How long a 101 has to become a ``hello``. Bounded rather than absent: a server that
@@ -465,6 +496,9 @@ class WSTransport:
             ping_interval=self._config.ping_interval,
             ping_timeout=self._config.ping_timeout,
             close_timeout=self._config.close_timeout,
+            # Pinned to the ring size and passed for the same reason as the values above -- a
+            # library default must not decide the frame boundary. See `_DEFAULT_MAX_SIZE`.
+            max_size=self._config.max_size,
         )
         try:
             hello = await self._await_hello(connection)
